@@ -1,0 +1,43 @@
+# The UR5 cell: robot, cameras, control, safety, logging. Both arms of an A/B share this file;
+# the policy comes from a separate one:
+#
+#   ur5vla run -c configs/cell.yaml -p configs/policy/openpi.yaml --prompt "..."
+
+robot:
+  ip: 192.168.10.125          # CB3 UR5. No External Control URCap program may be running.
+  rate_hz: 125                # CB3 RTDE maximum
+  servoj: {lookahead: 0.1, gain: 300}
+  start_q_deg: null           # teach and set before A/B runs: every trial starts here
+  move_speed_deg_s: 20
+  move_accel_deg_s2: 40
+
+# Which camera takes which role is still open (design doc); this follows the design's example.
+cameras:
+  base:  {type: oak, device_id: null, width: 640, height: 480, fps: 30}
+  wrist: {type: realsense, serial: null, width: 640, height: 480, fps: 30}
+
+control:
+  refill_fraction: 0.5        # ask for a chunk when half the last one is left
+  crossfade_steps: 5
+  max_episode_s: 120
+
+safety:
+  max_step_rad: 0.02          # per 8 ms tick
+  ft_limit_n: 30              # CB3: on the controller's joint-current wrench ESTIMATE, tared per episode
+  # Hold if no chunk lands for this long. Needs (1 - refill_fraction) * chunk duration + latency
+  # below it, or the arm holds every cycle (the loop warns once if not).
+  watchdog_s: 1.0
+  max_frame_age_s: 0.1
+  # SET PER TASK before running on the arm. These defaults are the UR5's own range and a loose box.
+  joint_min_deg: [-360, -360, -360, -360, -360, -360]
+  joint_max_deg: [360, 360, 360, 360, 360, 360]
+  workspace_min_m: [-0.9, -0.9, -0.05]   # UR base frame, as the pendant shows it
+  workspace_max_m: [0.9, 0.9, 1.0]
+  tcp_offset_m: [0, 0, 0]               # flange -> fingertip once a gripper is mounted
+
+logging:
+  root: runs
+  image_format: jpg
+  jpeg_quality: 95
+
+prompt: ""

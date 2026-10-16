@@ -1,0 +1,13 @@
+# Everything simulated -- no robot, no cameras -- to try the loop and the recorder anywhere:
+#
+#   ur5vla run -c configs/dry_run.yaml -p configs/policy/replay_sine.yaml -y --max-seconds 10
+
+robot:
+  dry_run: true
+
+cameras:
+  base:  {type: synthetic, width: 640, height: 480, fps: 30}
+  wrist: {type: synthetic, width: 640, height: 480, fps: 30}
+
+control:
+  max_episode_s: 30

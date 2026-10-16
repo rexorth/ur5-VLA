@@ -1,0 +1,45 @@
+[project]
+name = "ur5vla"
+version = "0.1.0"
+description = "One control loop for a CB3 UR5 under an openpi or LeRobot VLA policy, for A/B comparison"
+readme = "README.md"
+# ur_rtde ships Linux wheels only up to cp312.
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+    "pillow>=10.0",
+    "ur_rtde>=1.6",
+]
+
+[project.optional-dependencies]
+cameras = [
+    "pyrealsense2>=2.55",
+    "depthai>=3.0",
+    "opencv-python-headless>=4.9",
+]
+# The two policy clients pin incompatible numpy majors (openpi-client <2, lerobot >=2), so each
+# gets its own venv. See README "Install".
+# openpi-client imports typing_extensions without declaring it.
+openpi = ["openpi-client", "typing-extensions"]
+lerobot = ["lerobot[async]>=0.6,<0.7"]
+
+[project.scripts]
+ur5vla = "ur5vla.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+conflicts = [[{ extra = "openpi" }, { extra = "lerobot" }]]
+
+[tool.uv.sources]
+# The PyPI "openpi-client" has no listed maintainer; take it from Physical Intelligence's repo.
+openpi-client = { git = "https://github.com/Physical-Intelligence/openpi.git", subdirectory = "packages/openpi-client" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

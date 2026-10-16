@@ -1,0 +1,19 @@
+# LeRobot async-inference server, e.g.:
+#   python -m lerobot.async_inference.policy_server --host=0.0.0.0 --port=8080 --fps=15
+# (--fps only stamps the actions; ours come from action_hz, with a warning if they disagree.)
+backend: lerobot
+host: localhost
+port: 8080
+policy_type: pi05
+pretrained_name_or_path: "<hf-repo-or-checkpoint-dir>"
+policy_device: cuda           # where the server runs the policy
+actions_per_chunk: 50
+action_hz: 15                 # the training dataset's fps
+camera_map: {base: base, wrist: wrist}   # logical -> observation.images.<name>
+image_size: null              # null = send native; the server resizes to the checkpoint's shape
+include_gripper_state: true   # observation.state = 6 joints + gripper
+rename_map: {}
+action_mode: absolute
+gripper_open: 0.0
+gripper_closed: 1.0
+gripper_index: 6

@@ -1,0 +1,20 @@
+# openpi policy server, run from the openpi checkout, e.g.:
+#   uv run scripts/serve_policy.py policy:checkpoint --policy.config=<config> --policy.dir=<checkpoint>
+#
+# Keys must match what the checkpoint's training config repacks from. The values below are the
+# DROID convention; a UR5 fine-tune defines its own.
+backend: openpi
+host: localhost
+port: 8000
+action_hz: 15                 # the training dataset's fps
+camera_map: {base: exterior_image_1_left, wrist: wrist_image_left}   # logical -> policy name
+image_key: "observation/{name}"
+state_key: observation/joint_position
+gripper_key: observation/gripper_position
+image_size: [224, 224]        # resize_with_pad, as openpi's own clients do
+state_dim: null               # zero-pad the 6 joints if the config expects more
+chunk_len: null               # use only the first N actions
+action_mode: absolute         # openpi's output transforms normally return absolute joints
+gripper_open: 0.0
+gripper_closed: 1.0
+gripper_index: 6

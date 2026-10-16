@@ -1,0 +1,10 @@
+# No policy server: a slow sine on wrist 3 around wherever the arm starts (milestone 1).
+# Peak speed = 2*pi*amplitude/period, ~8 deg/s with these values.
+backend: replay
+sine_joint: 5
+sine_amplitude_deg: 5
+sine_period_s: 4
+action_hz: 15
+chunk_len: 15                 # 1 s: half a chunk + latency stays inside the 1 s watchdog
+latency_s: 0.1                # pretend inference takes this long, to exercise the async path
+camera_map: {}                # cameras that must be fresh; none, so it runs with no cameras
