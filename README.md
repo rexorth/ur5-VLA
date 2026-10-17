@@ -1,8 +1,10 @@
 # ur5-VLA
 
-One control loop drives a CB3 UR5 under either an **openpi** or a **LeRobot** π₀.₅ policy, chosen by
-a config file. Robot I/O, safety, cameras, chunk handling and logging are shared code, so an A/B
-difference comes from the policy stack and not from the plumbing. The design is in
+One control loop drives a CB3 UR5 from a policy served by either **openpi** (Physical
+Intelligence's π models) or **LeRobot** (any policy its async server supports: ACT, Diffusion,
+SmolVLA, π₀, π₀.₅, GR00T, ...). Which one is chosen per run by a config file. Robot I/O, safety,
+cameras, chunk handling and logging are shared code, so a difference between openpi and LeRobot
+runs comes from the policy stack and not from the plumbing. The design is in
 [docs/design.md](docs/design.md).
 
 ```
@@ -66,9 +68,15 @@ program is playing, because ur_rtde uploads its own control script.
 
 ## A/B runs
 
-A run is a cell config plus a policy file. `-p` replaces only the `policy:` block, so both arms
-share the cell file and can differ in nothing else. Interleave trials by alternating `-p` between
-`configs/policy/openpi.yaml` and `configs/policy/lerobot.yaml`, each from its own venv.
+There is one robot, and each run talks to one policy server. A run is a cell config plus a policy
+file. `-p` replaces only the `policy:` block, so openpi and LeRobot runs share the cell file and
+can differ in nothing else. To compare them, alternate runs between
+`configs/policy/openpi.yaml` and `configs/policy/lerobot.yaml`, each from its own venv
+(A, B, B, A, ... as in the design doc).
+
+On LeRobot, the model is chosen by `policy_type` and `pretrained_name_or_path` in the policy file.
+The server loads whatever a run asks for, so trying another LeRobot model takes a new policy file,
+not a server restart. The checkpoint must output joint positions in this robot's joint order.
 
 ## Behaviour worth knowing
 

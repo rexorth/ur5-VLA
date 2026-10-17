@@ -1,5 +1,5 @@
-# The UR5 cell: robot, cameras, control, safety, logging. Both arms of an A/B share this file;
-# the policy comes from a separate one:
+# The UR5 cell: robot, cameras, control, safety, logging. Every run uses this file, openpi or
+# LeRobot alike; the policy comes from a separate one:
 #
 #   ur5vla run -c configs/cell.yaml -p configs/policy/openpi.yaml --prompt "..."
 

@@ -106,7 +106,7 @@ def test_lerobot_backend_against_fake_server():
     port = server.add_insecure_port('localhost:0')
     server.start()
     try:
-        backend = LeRobotBackend(action_hz=30, port=port, pretrained_name_or_path='user/ckpt',
+        backend = LeRobotBackend(action_hz=30, port=port, policy_type='pi05', pretrained_name_or_path='user/ckpt',
                                  camera_map={'base': 'front', 'wrist': 'wrist'}, actions_per_chunk=5)
         info = backend.connect()
         assert info.chunk_len == 5

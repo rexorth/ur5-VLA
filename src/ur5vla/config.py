@@ -1,6 +1,6 @@
 """Run configuration: one YAML file defines robot, cameras, policy, control, safety and logging.
 
-Switching arms of an A/B changes only the `policy:` block. Unknown keys are errors, not
+Switching between openpi and LeRobot changes only the `policy:` block. Unknown keys are errors, not
 warnings: a typo in a safety limit must not silently fall back to a default.
 """
 
@@ -164,7 +164,7 @@ def parse(raw: dict[str, Any], source: str | None = None) -> RunConfig:
 
 def load(path: str | Path, policy_path: str | Path | None = None) -> RunConfig:
     """Load a cell config. `policy_path` names a file holding just a policy block, which replaces
-    the cell's `policy:`. That way the arms of an A/B share one cell file and can differ in
+    the cell's `policy:`. That way openpi and LeRobot runs share one cell file and can differ in
     nothing else."""
     path = Path(path)
     with path.open() as f:

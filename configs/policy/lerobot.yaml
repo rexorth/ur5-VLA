@@ -4,6 +4,8 @@
 backend: lerobot
 host: localhost
 port: 8080
+# Any type the server supports: act, smolvla, diffusion, tdmpc, vqbet, pi0, pi05, groot.
+# The server loads this model when the run connects, so switching models needs no server restart.
 policy_type: pi05
 pretrained_name_or_path: "<hf-repo-or-checkpoint-dir>"
 policy_device: cuda           # where the server runs the policy

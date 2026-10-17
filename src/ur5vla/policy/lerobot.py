@@ -41,8 +41,8 @@ JOINT_NAMES = ('shoulder_pan', 'shoulder_lift', 'elbow', 'wrist_1', 'wrist_2', '
 class LeRobotConfig:
     action_hz: float                # rate of the training data's actions (the dataset fps)
     camera_map: dict[str, str]      # logical camera -> policy camera (observation.images.<name>)
+    policy_type: str                # act | smolvla | diffusion | tdmpc | vqbet | pi0 | pi05 | groot
     pretrained_name_or_path: str
-    policy_type: str = 'pi05'
     host: str = 'localhost'
     port: int = 8080
     policy_device: str = 'cuda'     # where the SERVER runs the policy
