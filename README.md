@@ -28,6 +28,9 @@ source .venv-openpi/bin/activate     # or .venv-lerobot
 
 `replay` and everything else works in either venv. openpi-client comes from Physical
 Intelligence's git repo, pinned in `uv.lock`. The PyPI package of that name lists no maintainer.
+`.venv-lerobot` gets CPU-only torch, because the client only unpickles action tensors. The
+policy servers (openpi, LeRobot) run from their own repositories and environments, not from
+these venvs.
 
 ## Bring-up
 

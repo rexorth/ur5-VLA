@@ -22,7 +22,9 @@ cameras = [
 # gets its own venv. See README "Install".
 # openpi-client imports typing_extensions without declaring it.
 openpi = ["openpi-client", "typing-extensions"]
-lerobot = ["lerobot[async]>=0.6,<0.7"]
+# torch/torchvision are listed so the CPU-index source below applies: the client only unpickles
+# action tensors. The LeRobot policy server runs from its own environment.
+lerobot = ["lerobot[async]>=0.6,<0.7", "torch", "torchvision"]
 
 [project.scripts]
 ur5vla = "ur5vla.cli:main"
@@ -40,6 +42,13 @@ conflicts = [[{ extra = "openpi" }, { extra = "lerobot" }]]
 [tool.uv.sources]
 # The PyPI "openpi-client" has no listed maintainer; take it from Physical Intelligence's repo.
 openpi-client = { git = "https://github.com/Physical-Intelligence/openpi.git", subdirectory = "packages/openpi-client" }
+torch = [{ index = "pytorch-cpu", extra = "lerobot" }]
+torchvision = [{ index = "pytorch-cpu", extra = "lerobot" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
