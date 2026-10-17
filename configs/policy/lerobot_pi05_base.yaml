@@ -1,0 +1,22 @@
+# PLUMBING TEST ONLY. lerobot/pi05_base is a base model for fine-tuning: its outputs are not UR5
+# joint angles. Use it with `ur5vla policy-check` (no motion) or `run --dry-run`, never on the arm.
+#
+# Server, from its own venv (see README "LeRobot server"):
+#   python -m lerobot.async_inference.policy_server --host=127.0.0.1 --port=8080 --fps=15
+backend: lerobot
+host: localhost
+port: 8080
+policy_type: pi05
+# A local copy of lerobot/pi05_base whose config.json says "dtype": "bfloat16": in float32 the
+# weights alone are 14.5 GB, more than the RTX 3060's 12 GB. Path is on the server's machine.
+pretrained_name_or_path: /home/omey/abhay_ws/checkpoints/pi05_base_bf16
+policy_device: cuda
+actions_per_chunk: 50
+action_hz: 15
+# pi05_base's camera slots are base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb (224x224); the
+# one not sent is filled with a blank image by the policy. The server stretches frames to 224x224,
+# which distorts 4:3 images; a checkpoint fine-tuned on this cell's data would not.
+camera_map: {base: base_0_rgb, wrist: left_wrist_0_rgb}
+image_size: null
+include_gripper_state: true
+action_mode: absolute

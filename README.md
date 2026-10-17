@@ -34,6 +34,35 @@ Intelligence's git repo, pinned in `uv.lock`. The PyPI package of that name list
 policy servers (openpi, LeRobot) run from their own repositories and environments, not from
 these venvs.
 
+## LeRobot server
+
+The server runs from its own venv (for example `~/abhay_ws/lerobot`) with lerobot **0.6.1**, the
+same version as this client, because the two sides exchange pickled LeRobot objects.
+
+```bash
+uv pip install 'lerobot[async,pi]==0.6.1'   # add ,training,peft to fine-tune; other models need their extra
+hf auth login                               # π₀/π₀.₅ use the gated google/paligemma-3b-pt-224 tokenizer:
+                                            # accept its license on the Hub first
+python -m lerobot.async_inference.policy_server --host=127.0.0.1 --port=8080 --fps=<action_hz>
+```
+
+The server doesn't pick the model; each run's policy file does (`policy_type`,
+`pretrained_name_or_path`), and the server loads it when the run connects. Two constraints:
+
+- **bfloat16 on 12 GB.** On the RTX 3060, π₀/π₀.₅ must be served in bfloat16. Make a local copy
+  of the checkpoint whose `config.json` says `"dtype": "bfloat16"`, with the weights symlinked:
+  ```bash
+  src=$(ls -d ~/.cache/huggingface/hub/models--lerobot--pi05_base/snapshots/*/)
+  dst=~/abhay_ws/checkpoints/pi05_base_bf16 && mkdir -p $dst
+  for f in model.safetensors policy_preprocessor.json policy_postprocessor.json; do ln -s "$(readlink -f $src/$f)" $dst/$f; done
+  python3 -c "import json; c=json.load(open('$src/config.json')); c['dtype']='bfloat16'; json.dump(c, open('$dst/config.json','w'), indent=2)"
+  ```
+- **Merge LoRA first.** The server loads checkpoints with `from_pretrained`, which ignores LoRA
+  adapters, so a LoRA-trained checkpoint has to be merged into a full one before serving.
+
+`configs/policy/lerobot_pi05_base.yaml` is a plumbing test against that bf16 copy of the base
+model. It sends and receives correctly formatted data, but the base model can't control a UR5.
+
 ## Bring-up
 
 Run these in order. Every command takes `-c <cell config>`, and the policy commands also take `-p <policy file>`.
