@@ -1,0 +1,19 @@
+# TEMPLATE: a LeRobot policy fine-tuned on this cell's demos (dataset written by `ur5vla
+# to-lerobot`). Feature names come from that dataset, so they match what this adapter sends.
+# See docs/procedures.md section 6.2.
+#
+# Server, from ~/abhay_ws/lerobot:
+#   python -m lerobot.async_inference.policy_server --host=127.0.0.1 --port=8080 --fps=15
+backend: lerobot
+host: localhost
+port: 8080
+policy_type: pi05                   # what you trained: pi05, pi0, smolvla, act, ...
+# lerobot-train's output: <output_dir>/checkpoints/last/pretrained_model (merge LoRA first).
+pretrained_name_or_path: /home/omey/abhay_ws/outputs/pi05_ur5/checkpoints/last/pretrained_model
+policy_device: cuda
+actions_per_chunk: 50               # <= the policy's chunk_size
+action_hz: 15                       # = the dataset fps (to-lerobot --fps)
+camera_map: {base: base, wrist: wrist}   # logical camera -> dataset camera name
+image_size: null                    # native: the dataset stores native resolution
+include_gripper_state: true         # the dataset's state is 6 joints + gripper
+action_mode: absolute

@@ -156,6 +156,18 @@ def test_openpi_connect_gives_up_when_no_server():
         _openpi_backend(port, wait_for_server_s=0.5).connect()
 
 
+def test_openpi_request_matches_a_ur5vla_dataset_layout():
+    pytest.importorskip('openpi_client')
+    from ur5vla.policy.openpi import OpenPIBackend
+    b = OpenPIBackend(action_hz=15, camera_map={'base': 'base'}, image_key='observation.images.{name}',
+                      state_key='observation.state', gripper_key=None, include_gripper_state=True,
+                      image_size=None)
+    req = b.build_request(_obs())
+    assert set(req) == {'observation.images.base', 'observation.state', 'prompt'}
+    np.testing.assert_allclose(req['observation.state'], np.r_[Q, 0.25], rtol=1e-6)
+    assert req['observation.images.base'].shape == (480, 640, 3)
+
+
 def test_lerobot_backend_against_fake_server():
     grpc = pytest.importorskip('grpc')
     pytest.importorskip('lerobot')

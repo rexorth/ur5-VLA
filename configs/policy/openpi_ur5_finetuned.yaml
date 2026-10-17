@@ -1,0 +1,20 @@
+# TEMPLATE: an openpi model fine-tuned on this cell's demos (dataset written by `ur5vla to-lerobot`
+# in openpi's environment). openpi renames dataset keys only during training; live requests must
+# already use the names its input transform reads. The training config in docs/procedures.md
+# section 6.3 reads the dataset's own key names, which is what this file sends.
+#
+# Server, from ~/abhay_ws/openpi:
+#   uv run scripts/serve_policy.py policy:checkpoint --policy.config=<your config> \
+#       --policy.dir=checkpoints/<your config>/<exp name>/<step>
+backend: openpi
+host: localhost
+port: 8000
+action_hz: 15                       # = the dataset fps (to-lerobot --fps)
+camera_map: {base: base, wrist: wrist}   # logical camera -> dataset camera name
+image_key: "observation.images.{name}"
+state_key: observation.state
+gripper_key: null                   # the gripper is inside observation.state ...
+include_gripper_state: true         # ... as its 7th entry, like the dataset
+image_size: [224, 224]
+action_mode: absolute               # openpi's output transforms return absolute joints
+gripper_index: 6

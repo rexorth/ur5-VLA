@@ -38,7 +38,10 @@ class OpenPIConfig:
     state_key: str = 'observation/joint_position'
     gripper_key: str | None = 'observation/gripper_position'
     image_size: list[int] | None = field(default_factory=lambda: [224, 224])  # H, W; None = native
-    state_dim: int | None = None    # zero-pad the joint state to this length
+    state_dim: int | None = None    # zero-pad the state to this length
+    # Append the gripper to the state vector: the layout `ur5vla to-lerobot` writes, so a model
+    # fine-tuned on this cell's data gets the same 7-vector it trained on (set gripper_key: null).
+    include_gripper_state: bool = False
     chunk_len: int | None = None    # use only the first N actions of each chunk
     action_mode: str = 'absolute'
     gripper_open: float = 0.0
@@ -102,6 +105,8 @@ class OpenPIBackend(PolicyBackend):
                 img = image_tools.resize_with_pad(img, c.image_size[0], c.image_size[1])
             req[c.image_key.format(name=policy_name)] = image_tools.convert_to_uint8(img)
         state = np.asarray(obs.q, dtype=np.float32)
+        if c.include_gripper_state:
+            state = np.r_[state, np.float32(self.mapping.gripper_to_policy(obs.gripper))]
         if c.state_dim is not None and c.state_dim > len(state):
             state = np.pad(state, (0, c.state_dim - len(state)))
         req[c.state_key] = state

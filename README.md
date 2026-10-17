@@ -5,7 +5,8 @@ Intelligence's π models) or **LeRobot** (any policy its async server supports: 
 SmolVLA, π₀, π₀.₅, GR00T, ...). Which one is chosen per run by a config file. Robot I/O, safety,
 cameras, chunk handling and logging are shared code, so a difference between openpi and LeRobot
 runs comes from the policy stack and not from the plumbing. The design is in
-[docs/design.md](docs/design.md).
+[docs/design.md](docs/design.md); step-by-step commands for bring-up, teleoperation, inference and
+fine-tuning are in [docs/procedures.md](docs/procedures.md).
 
 ```
 cameras ──latest frame──┐
