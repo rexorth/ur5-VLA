@@ -24,9 +24,13 @@ control:
 safety:
   max_step_rad: 0.02          # per 8 ms tick
   ft_limit_n: 30              # CB3: on the controller's joint-current wrench ESTIMATE, tared per episode
-  # Hold if no chunk lands for this long. Chunks land every ~(1 - refill_fraction) * chunk
-  # duration (+ latency jitter); keep that below this, or the arm holds between chunks.
-  watchdog_s: 1.0
+  # Watchdog: hold if the next chunk is overdue. After each chunk the next is expected
+  # ~(1 - refill_fraction) * chunk duration later (or after one latency, if the server is slower
+  # than that); the watchdog allows watchdog_factor times that.
+  watchdog_factor: 1.5
+  # Optional hard cap on the watchdog window, s: the longest the arm may keep moving without a
+  # fresh chunk. null = no cap (then the bound is watchdog_factor x the expected gap).
+  watchdog_max_s: null
   max_frame_age_s: 0.1
   # SET PER TASK before running on the arm. These defaults are the UR5's own range and a loose box.
   joint_min_deg: [-360, -360, -360, -360, -360, -360]

@@ -5,6 +5,6 @@ sine_joint: 5
 sine_amplitude_deg: 5
 sine_period_s: 4
 action_hz: 15
-chunk_len: 15                 # 1 s: half a chunk + latency stays inside the 1 s watchdog
+chunk_len: 15                 # 1 s of motion per chunk
 latency_s: 0.1                # pretend inference takes this long, to exercise the async path
 camera_map: {}                # cameras that must be fresh; none, so it runs with no cameras

@@ -52,3 +52,5 @@ explicit = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# A crash in the exec/inference/recorder threads must fail the test, not just warn.
+filterwarnings = ["error::pytest.PytestUnhandledThreadExceptionWarning"]

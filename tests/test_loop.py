@@ -126,8 +126,8 @@ def test_stale_camera_holds_then_resumes(tmp_path):
 
 
 class SlowAfterFirst(PolicyBackend):
-    """First chunk (1 s) at once; later ones (4 s, so still live on arrival) after 1.5 s, which
-    is longer than the 1 s watchdog."""
+    """First chunk (1 s) at once; later ones (4 s, so still live on arrival) after 1.5 s. The
+    next chunk is expected 0.5 s after the first, so the watchdog fires at 0.75 s."""
     n = 0
 
     def connect(self):
@@ -151,5 +151,22 @@ def test_watchdog_holds_then_resumes(tmp_path):
     result, ep, _ = run(tmp_path, {}, SlowAfterFirst(), seconds=2.8)
     hold = [e for e in read_jsonl(ep / EVENTS) if e['kind'] == 'hold']
     assert hold and hold[0]['reason'] == 'watchdog'
+    assert 0.6 < hold[0]['t'] - read_jsonl(ep / CHUNKS)[0]['t_received'] < 0.9
     assert 'resume' in events(ep)
     assert result.end_reason == 'timeout'
+
+
+LONG_CHUNKS = {**SINE, 'chunk_len': 50, 'latency_s': 0.1, 'camera_map': {}}   # 3.3 s chunks
+
+
+def test_watchdog_adapts_to_long_chunks(tmp_path):
+    # Chunks land every ~1.67 s: a fixed 1 s timeout would hold every cycle; this must not.
+    result, ep, _ = run(tmp_path, {}, LONG_CHUNKS, seconds=4.0)
+    assert result.holds == 0 and result.n_chunks >= 2
+    assert 'timing_warning' not in events(ep)
+
+
+def test_watchdog_hard_cap_still_applies(tmp_path):
+    result, ep, _ = run(tmp_path, {}, LONG_CHUNKS, seconds=4.0, safety={'watchdog_max_s': 1.0})
+    kinds = events(ep)
+    assert 'timing_warning' in kinds and result.holds >= 1

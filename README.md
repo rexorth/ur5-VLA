@@ -80,17 +80,20 @@ not a server restart. The checkpoint must output joint positions in this robot's
 
 ## Behaviour worth knowing
 
-- **Hold vs stop.** A stale policy camera (older than `max_frame_age_s`) or no chunk for
-  `watchdog_s` causes a *hold*: servoStop, then an automatic resume when fresh data arrives. A
+- **Hold vs stop.** A stale policy camera (older than `max_frame_age_s`) or an overdue chunk (the
+  watchdog) causes a *hold*: servoStop, then an automatic resume when fresh data arrives. A
   safety violation, the robot's own protective or emergency stop, or the e-stop ends the
   episode. Steps over `max_step_rad` are never clipped.
-- **Watchdog vs refill timing.** Chunks arrive about every `(1 - refill_fraction) × chunk
-  duration`. Latency shifts the arrivals but not their spacing; only latency jitter adds to it.
-  Two conditions must hold, and the loop warns once for each it sees broken:
-  - The spacing plus jitter must stay below `watchdog_s`, or the arm holds between healthy
-    chunks.
-  - Latency must stay below `refill_fraction × chunk duration`, or the trajectory runs out before
-    the next chunk lands and the arm pauses each cycle.
+- **Refill timing.** Chunks arrive about every `(1 - refill_fraction) × chunk duration`.
+  Latency shifts the arrivals but not their spacing; only latency jitter adds to it. Latency
+  must stay below `refill_fraction × chunk duration`, or the trajectory runs out before the next
+  chunk lands and the arm pauses each cycle. The loop warns once if it doesn't.
+- **Watchdog.** After each chunk, the loop works out when the next one should land: the gap
+  above, or the last latency if the server is slower than that. It holds only if no chunk has
+  arrived within `watchdog_factor` (default 1.5) times that gap, so a healthy server never trips
+  it, whatever the chunk length. The longest the arm moves without a fresh chunk is therefore
+  about 1.5 replanning intervals. `watchdog_max_s` adds an optional hard cap in seconds; if it is
+  shorter than the expected gap, the arm holds between healthy chunks, and the loop warns.
 - **Chunk merge.** Chunk step k is the target for `t_obs + k·dt`. Steps already due when the
   chunk lands are skipped, the rest is crossfaded in over `crossfade_steps`, and then interpolated to
   125 Hz. This is identical for every backend.

@@ -86,7 +86,10 @@ class ControlConfig:
 class SafetyConfig:
     max_step_rad: float = 0.02      # per 8 ms tick; a larger jump stops, it is never clipped
     ft_limit_n: float | None = 30.0 # on |F| after a tare at episode start; None disables
-    watchdog_s: float = 1.0         # no fresh chunk for this long -> hold
+    # Hold when a chunk is overdue: none arrived within watchdog_factor x the expected gap
+    # between chunks, max((1 - control.refill_fraction) x chunk duration, last latency).
+    watchdog_factor: float = 1.5
+    watchdog_max_s: float | None = None  # optional hard cap on that window, s; None = no cap
     max_frame_age_s: float = 0.1    # older policy-camera frames -> hold, do not query
     # Tighter than the controller's. Defaults are the UR5's own +-360 deg: set them per task.
     joint_min_deg: list[float] = field(default_factory=lambda: [-360.0] * 6)
@@ -99,6 +102,10 @@ class SafetyConfig:
     tcp_offset_m: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
 
     def __post_init__(self):
+        if self.watchdog_factor <= 1.0:
+            raise ConfigError('safety.watchdog_factor must be > 1 (it is a margin over the expected gap)')
+        if self.watchdog_max_s is not None and self.watchdog_max_s <= 0:
+            raise ConfigError('safety.watchdog_max_s must be > 0, or null for no cap')
         for key in ('joint_min_deg', 'joint_max_deg'):
             if len(getattr(self, key)) != 6:
                 raise ConfigError(f'safety.{key} needs 6 values')

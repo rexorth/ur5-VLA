@@ -9,7 +9,8 @@ Observation from the latest frames and state, call backend.infer(), merge the ch
 
 What stops the arm:
   HOLD (servoStop, resumes by itself once fresh data arrives):
-      no chunk merged for safety.watchdog_s; a policy camera older than safety.max_frame_age_s.
+      a chunk overdue (watchdog: none within safety.watchdog_factor x the expected gap between
+      chunks, capped at safety.watchdog_max_s); a policy camera older than safety.max_frame_age_s.
   STOPPED (servoStop, episode ends):
       any SafetyLayer violation, the robot's own protective/emergency stop, the software e-stop,
       an arm error.
@@ -159,7 +160,7 @@ class ControlLoop:
         self._end_detail: dict[str, Any] = {}
         self._state: RobotState | None = None
         self._stale = threading.Event()
-        self._last_chunk_t: float | None = None
+        self._watchdog_deadline: float | None = None    # set by the inference thread per chunk
         self._latencies: list[float] = []
         self._policy_errors = 0
         self._holds = 0
@@ -180,7 +181,6 @@ class ControlLoop:
 
     def _exec_loop(self) -> None:
         period = self.cfg.robot.period_s
-        watchdog = self.cfg.safety.watchdog_s
         rec = self._recorder
         mode = Mode.IDLE
         q_cmd: np.ndarray | None = None
@@ -202,9 +202,10 @@ class ControlLoop:
                 hold_reason = None
                 target = None
                 if violation is None:
+                    deadline = self._watchdog_deadline
                     if self._stale.is_set():
                         hold_reason = 'stale_camera'
-                    elif self._last_chunk_t is not None and now - self._last_chunk_t > watchdog:
+                    elif deadline is not None and now > deadline:
                         hold_reason = 'watchdog'
                     else:
                         target = self.buffer.sample(now)
@@ -270,30 +271,50 @@ class ControlLoop:
         wrench = None if state.wrench is None else state.wrench.copy()
         return Observation(images, state.q.copy(), state.gripper, wrench, prompt, state.t), {}
 
-    def _check_timing(self, chunk_s: float, infer_s: float) -> None:
-        """Say once if the config cannot keep up in normal operation.
+    def _expected_gap(self, chunk_s: float, infer_s: float) -> float:
+        """When the next chunk should land after this one.
 
-        A chunk's trajectory ends at its t_obs + chunk_s, so each request goes out a fixed
-        (1 - refill_fraction) * chunk_s after the previous one: latency shifts the arrivals but
-        not their spacing (only its jitter adds). Two ways that goes wrong:
-          * spacing >= watchdog_s: the watchdog trips between healthy chunks;
+        A chunk's trajectory ends at its t_obs + chunk_s, so the next request goes out
+        (1 - refill_fraction) * chunk_s after the previous one: latency shifts arrivals but not
+        their spacing. Unless latency exceeds the refill lead, in which case requests go out
+        back to back and the gap is the latency itself.
+        """
+        return max((1 - self.cfg.control.refill_fraction) * chunk_s, infer_s)
+
+    def _watchdog_window(self, chunk_s: float, infer_s: float) -> float:
+        s = self.cfg.safety
+        window = s.watchdog_factor * self._expected_gap(chunk_s, infer_s)
+        return window if s.watchdog_max_s is None else min(window, s.watchdog_max_s)
+
+    def _check_timing(self, chunk_s: float, infer_s: float) -> None:
+        """Say once if the config cannot keep up in normal operation:
+          * watchdog_max_s below the expected gap: the watchdog trips between healthy chunks;
           * latency >= refill_fraction * chunk_s: the trajectory ends before the next chunk lands,
             so the arm settles on the last target each cycle.
         """
-        r, W = self.cfg.control.refill_fraction, self.cfg.safety.watchdog_s
-        spacing, lead = (1 - r) * chunk_s, r * chunk_s
-        if spacing >= W:
-            log.warning('chunks arrive every ~%.2f s but safety.watchdog_s is %.2f s: the arm will '
-                        'hold between chunks. Raise control.refill_fraction or the watchdog, or '
-                        'shorten the chunk.', spacing, W)
-            self._recorder.log_event('timing_warning', kind='watchdog', spacing_s=spacing, watchdog_s=W)
+        gap, lead = self._expected_gap(chunk_s, infer_s), self.cfg.control.refill_fraction * chunk_s
+        cap = self.cfg.safety.watchdog_max_s
+        if cap is not None and gap >= cap:
+            log.warning('chunks arrive every ~%.2f s but safety.watchdog_max_s is %.2f s: the arm '
+                        'will hold between chunks. Raise control.refill_fraction or the cap, or '
+                        'shorten the chunk.', gap, cap)
+            self._recorder.log_event('timing_warning', check='watchdog', gap_s=gap, watchdog_max_s=cap)
         if infer_s >= lead:
             log.warning('inference took %.2f s but requests go out with only %.2f s of trajectory '
                         'left: the arm will pause each cycle. Raise control.refill_fraction.',
                         infer_s, lead)
-            self._recorder.log_event('timing_warning', kind='latency', infer_s=infer_s, lead_s=lead)
+            self._recorder.log_event('timing_warning', check='latency', infer_s=infer_s, lead_s=lead)
 
     def _infer_loop(self, prompt: str) -> None:
+        # Policy errors are retried inside; anything else is a bug and ends the episode rather
+        # than leaving the arm on watchdog hold with no inference thread.
+        try:
+            self._infer_steps(prompt)
+        except Exception as exc:
+            log.exception('inference thread failed')
+            self._end('error', {'error': repr(exc)})
+
+    def _infer_steps(self, prompt: str) -> None:
         rec = self._recorder
         refill = self.cfg.control.refill_fraction
         chunk_s: float | None = None
@@ -330,12 +351,18 @@ class ControlLoop:
             if not self._running.is_set():
                 return
             t_recv = time.monotonic()
+            new_s = len(chunk.q_targets) * chunk.dt
+            # Move the deadline before merging, so the execution thread never sees the new
+            # trajectory under the old deadline; put it back if the chunk is rejected.
+            prev_deadline = self._watchdog_deadline
+            self._watchdog_deadline = t_recv + self._watchdog_window(new_s, t_recv - t_req)
             res = self.buffer.merge(chunk, t_recv)
             if res.accepted:
-                self._last_chunk_t = t_recv
                 if chunk_s is None:
-                    self._check_timing(len(chunk.q_targets) * chunk.dt, t_recv - t_req)
-                chunk_s = len(chunk.q_targets) * chunk.dt
+                    self._check_timing(new_s, t_recv - t_req)
+                chunk_s = new_s
+            else:
+                self._watchdog_deadline = prev_deadline
             self._latencies.append(t_recv - obs.t)
             rec.log_chunk({
                 't_obs': obs.t, 't_request': t_req, 't_received': t_recv,
