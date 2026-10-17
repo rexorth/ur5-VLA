@@ -68,6 +68,94 @@ def test_openpi_backend_against_fake_server():
     assert chunk.info['server_timing'] == {'infer_ms': 3.0}
 
 
+def _fake_openpi_server(on_request):
+    """Speaks the openpi protocol; on_request(n, request) returns a reply dict, a str (sent as a
+    server error, then the connection closes), or sleeps first. n counts requests globally."""
+    from openpi_client import msgpack_numpy
+    from websockets.exceptions import ConnectionClosed
+    from websockets.sync.server import serve
+
+    state = {'n': 0, 'connections': 0}
+
+    def handler(ws):
+        state['connections'] += 1
+        try:
+            ws.send(msgpack_numpy.packb({}))
+            for msg in ws:
+                state['n'] += 1
+                reply = on_request(state['n'], msgpack_numpy.unpackb(msg))
+                if isinstance(reply, str):
+                    ws.send(reply)
+                    ws.close()
+                    return
+                ws.send(msgpack_numpy.packb(reply))
+        except ConnectionClosed:
+            pass
+
+    server = serve(handler, 'localhost', 0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, state
+
+
+def _openpi_backend(port, **kw):
+    from ur5vla.policy.openpi import OpenPIBackend
+    return OpenPIBackend(action_hz=10, host='localhost', port=port, camera_map={'base': 'image'}, **kw)
+
+
+def test_openpi_timeout_drops_the_connection_and_reconnects():
+    pytest.importorskip('openpi_client')
+    import time
+
+    def on_request(n, req):
+        if n == 2:
+            time.sleep(1.5)                         # the reply to request 2 arrives late
+        return {'actions': np.full((5, 7), float(n))}
+
+    server, state = _fake_openpi_server(on_request)
+    try:
+        backend = _openpi_backend(server.socket.getsockname()[1], timeout_s=0.5)
+        backend.connect()
+        assert backend.infer(_obs()).q_targets[0, 0] == 1.0
+        t0 = time.monotonic()
+        with pytest.raises(TimeoutError):
+            backend.infer(_obs())
+        assert time.monotonic() - t0 < 1.0
+        chunk = backend.infer(_obs())               # reconnects; must not get request 2's reply
+        assert chunk.q_targets[0, 0] == 3.0 and state['connections'] == 2
+        backend.close()
+    finally:
+        server.shutdown()
+
+
+def test_openpi_server_error_raises_then_reconnects():
+    pytest.importorskip('openpi_client')
+
+    def on_request(n, req):
+        return 'Traceback: KeyError observation/image' if n == 1 else {'actions': np.zeros((5, 7))}
+
+    server, state = _fake_openpi_server(on_request)
+    try:
+        backend = _openpi_backend(server.socket.getsockname()[1])
+        backend.connect()
+        with pytest.raises(RuntimeError, match='KeyError'):
+            backend.infer(_obs())
+        backend.infer(_obs())
+        assert state['connections'] == 2
+        backend.close()
+    finally:
+        server.shutdown()
+
+
+def test_openpi_connect_gives_up_when_no_server():
+    pytest.importorskip('openpi_client')
+    import socket
+    with socket.socket() as s:                      # a port with nothing listening
+        s.bind(('localhost', 0))
+        port = s.getsockname()[1]
+    with pytest.raises(ConnectionError, match='no server'):
+        _openpi_backend(port, wait_for_server_s=0.5).connect()
+
+
 def test_lerobot_backend_against_fake_server():
     grpc = pytest.importorskip('grpc')
     pytest.importorskip('lerobot')

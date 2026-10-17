@@ -1041,6 +1041,7 @@ lerobot = [
 openpi = [
     { name = "openpi-client" },
     { name = "typing-extensions" },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -1062,6 +1063,7 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'lerobot'", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "ur5vla", extra = "lerobot" } },
     { name = "typing-extensions", marker = "extra == 'openpi'" },
     { name = "ur-rtde", specifier = ">=1.6" },
+    { name = "websockets", marker = "extra == 'openpi'", specifier = ">=17" },
 ]
 provides-extras = ["cameras", "openpi", "lerobot"]
 

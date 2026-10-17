@@ -103,6 +103,11 @@ not a server restart. The checkpoint must output joint positions in this robot's
   checkpoint's shape by stretching. Pre-padding to 224×224 would be distorted. The action rate
   comes from `action_hz`, not the server's `--fps`, and a warning is logged if they differ.
   The wire format is pickle, so the server must be trusted.
+- **Policy calls time out.** Every call has a timeout (`timeout_s`). The first call gets a
+  longer one, because the server compiles or loads the model then. A failed or timed-out openpi
+  call drops the connection, and the next call reconnects, so a late reply can't be taken as the
+  answer to a newer request. Calls are serialized, and a call still running when an episode
+  ends is discarded rather than executed in the next one.
 - **openpi.** Images are letterboxed to 224×224 with openpi-client's own `resize_with_pad`.
   Request keys must match the checkpoint's repack transform. `configs/policy/openpi.yaml` uses
   the DROID convention.

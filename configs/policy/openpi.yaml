@@ -18,3 +18,6 @@ action_mode: absolute         # openpi's output transforms normally return absol
 gripper_open: 0.0
 gripper_closed: 1.0
 gripper_index: 6
+timeout_s: 10                 # per inference; on timeout the connection is dropped and reopened
+warmup_timeout_s: 300         # first inference: the server JIT-compiles the model
+wait_for_server_s: 120        # at startup, keep retrying this long while the server loads

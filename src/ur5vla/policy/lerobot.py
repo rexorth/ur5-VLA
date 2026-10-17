@@ -51,7 +51,7 @@ class LeRobotConfig:
     include_gripper_state: bool = True    # observation.state = 6 joints (+ gripper)
     rename_map: dict[str, str] = field(default_factory=dict)
     timeout_s: float = 10.0         # per observation / action call
-    load_timeout_s: float = 600.0   # SendPolicyInstructions: the server loads the checkpoint
+    load_timeout_s: float = 600.0   # loading the checkpoint, and the first inference after it
     action_mode: str = 'absolute'
     gripper_open: float = 0.0
     gripper_closed: float = 1.0
@@ -69,6 +69,7 @@ class LeRobotBackend(PolicyBackend):
         self._instructed = False
         self._step = 0
         self._warned_dt = False
+        self._warm = False
 
     def connect(self) -> PolicyInfo:
         import grpc
@@ -124,7 +125,8 @@ class LeRobotBackend(PolicyBackend):
         t0 = time.monotonic()
         self._stub.SendObservations(send_bytes_in_chunks(pickle.dumps(timed), self._pb.Observation),
                                     timeout=self.cfg.timeout_s)
-        resp = self._stub.GetActions(self._pb.Empty(), timeout=self.cfg.timeout_s)
+        timeout = self.cfg.timeout_s if self._warm else self.cfg.load_timeout_s
+        resp = self._stub.GetActions(self._pb.Empty(), timeout=timeout)
         rtt = time.monotonic() - t0
         if not resp.data:
             raise RuntimeError(f'lerobot: no actions for observation #{self._step} (see the server log)')
@@ -133,6 +135,7 @@ class LeRobotBackend(PolicyBackend):
             raise RuntimeError(f'lerobot: chunk is for observation #{actions[0].get_timestep()}, '
                                f'expected #{self._step}')
         self._check_dt(actions)
+        self._warm = True
         a = np.stack([np.asarray(ta.get_action(), dtype=np.float64) for ta in actions])
         return self.mapping.to_chunk(a, obs, 1.0 / self.cfg.action_hz, {'rtt_s': rtt, 'timestep': self._step})
 

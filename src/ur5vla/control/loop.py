@@ -82,6 +82,7 @@ class ControlLoop:
         # The GIL hand-off interval bounds how long the execution thread can wait on another
         # thread's bytecode; the default 5 ms is most of an 8 ms tick.
         sys.setswitchinterval(0.0005)
+        self._infer_lock = threading.Lock()
         self._reset_episode_state()
 
     # ---- public ----
@@ -105,7 +106,7 @@ class ControlLoop:
         before anything moves. Returns its latency."""
         obs = self.observe(prompt)
         t0 = time.monotonic()
-        self.backend.infer(obs)
+        self._call_backend(obs)
         return time.monotonic() - t0
 
     def run_episode(self, prompt: str, recorder: EpisodeRecorder,
@@ -121,9 +122,13 @@ class ControlLoop:
         self.backend.reset()
         self.end_request.clear()
 
-        self._running.set()
-        threads = [threading.Thread(target=self._exec_loop, name='exec', daemon=True),
-                   threading.Thread(target=self._infer_loop, args=(prompt,), name='infer', daemon=True)]
+        # Each episode's threads get their own flag: a thread still inside a policy call when
+        # the episode ends must not wake up into the next one.
+        running = threading.Event()
+        running.set()
+        threads = [threading.Thread(target=self._exec_loop, args=(running,), name='exec', daemon=True),
+                   threading.Thread(target=self._infer_loop, args=(prompt, running), name='infer',
+                                    daemon=True)]
         t0 = time.monotonic()
         for t in threads:
             t.start()
@@ -137,9 +142,11 @@ class ControlLoop:
             self.estop.set()
             self._done.wait(2.0)
             self._end('estop', {'source': 'SIGINT'})
-        self._running.clear()
+        running.clear()
         threads[0].join(timeout=2.0)
-        threads[1].join(timeout=1.0)    # may sit in infer() until its own timeout; it is a daemon
+        threads[1].join(timeout=1.0)
+        if threads[1].is_alive():       # inside a policy call, bounded by the backend's timeout
+            log.info('a policy call is still running; its result will be discarded')
 
         lat = np.asarray(self._latencies)
         return EpisodeResult(
@@ -153,7 +160,6 @@ class ControlLoop:
     # ---- shared state ----
 
     def _reset_episode_state(self) -> None:
-        self._running = threading.Event()
         self._done = threading.Event()
         self._end_lock = threading.Lock()
         self._end_reason: str | None = None
@@ -179,7 +185,7 @@ class ControlLoop:
 
     # ---- execution thread ----
 
-    def _exec_loop(self) -> None:
+    def _exec_loop(self, running: threading.Event) -> None:
         period = self.cfg.robot.period_s
         rec = self._recorder
         mode = Mode.IDLE
@@ -187,7 +193,7 @@ class ControlLoop:
         g_cmd = 0.0
         t_prev = None
         try:
-            while self._running.is_set():
+            while running.is_set():
                 token = self.arm.init_period()
                 now = time.monotonic()
                 state = self.arm.read_state()
@@ -305,20 +311,28 @@ class ControlLoop:
                         infer_s, lead)
             self._recorder.log_event('timing_warning', check='latency', infer_s=infer_s, lead_s=lead)
 
-    def _infer_loop(self, prompt: str) -> None:
+    def _infer_loop(self, prompt: str, running: threading.Event) -> None:
         # Policy errors are retried inside; anything else is a bug and ends the episode rather
         # than leaving the arm on watchdog hold with no inference thread.
         try:
-            self._infer_steps(prompt)
+            self._infer_steps(prompt, running)
         except Exception as exc:
             log.exception('inference thread failed')
-            self._end('error', {'error': repr(exc)})
+            if running.is_set():
+                self._end('error', {'error': repr(exc)})
 
-    def _infer_steps(self, prompt: str) -> None:
+    def _call_backend(self, obs: Observation):
+        # One call at a time: a call left running by an earlier episode's thread (bounded by the
+        # backend's own timeout) finishes before the next one uses the connection.
+        with self._infer_lock:
+            return self.backend.infer(obs)
+
+    def _infer_steps(self, prompt: str, running: threading.Event) -> None:
         rec = self._recorder
         refill = self.cfg.control.refill_fraction
         chunk_s: float | None = None
-        while self._running.is_set():
+        errors_in_a_row = 0
+        while running.is_set():
             now = time.monotonic()
             remaining = self.buffer.remaining_s(now)
             threshold = np.inf if chunk_s is None else refill * chunk_s
@@ -338,17 +352,22 @@ class ControlLoop:
 
             t_req = time.monotonic()
             try:
-                chunk = self.backend.infer(obs)
+                chunk = self._call_backend(obs)
             except PolicyDone as exc:
-                self._end('policy_done', {'detail': str(exc)})
+                if running.is_set():
+                    self._end('policy_done', {'detail': str(exc)})
                 return
             except Exception as exc:
+                if not running.is_set():
+                    return
                 self._policy_errors += 1
+                errors_in_a_row += 1
                 log.warning('policy error (%d): %r', self._policy_errors, exc)
                 rec.log_event('policy_error', error=repr(exc))
-                time.sleep(0.2)
+                time.sleep(min(0.2 * 2 ** (errors_in_a_row - 1), 2.0))   # 0.2, 0.4, ... 2 s
                 continue
-            if not self._running.is_set():
+            errors_in_a_row = 0
+            if not running.is_set():
                 return
             t_recv = time.monotonic()
             new_s = len(chunk.q_targets) * chunk.dt

@@ -20,8 +20,9 @@ cameras = [
 ]
 # The two policy clients pin incompatible numpy majors (openpi-client <2, lerobot >=2), so each
 # gets its own venv. See README "Install".
-# openpi-client imports typing_extensions without declaring it.
-openpi = ["openpi-client", "typing-extensions"]
+# openpi-client imports typing_extensions without declaring it. websockets>=17 for the direct
+# (legacy=True) sync connection the openpi backend opens itself.
+openpi = ["openpi-client", "typing-extensions", "websockets>=17"]
 # torch/torchvision are listed so the CPU-index source below applies: the client only unpickles
 # action tensors. The LeRobot policy server runs from its own environment.
 lerobot = ["lerobot[async]>=0.6,<0.7", "torch", "torchvision"]

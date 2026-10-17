@@ -1,5 +1,6 @@
 """The whole loop on the simulated arm: threads, holds, stops, recording and replay."""
 
+import threading
 import time
 
 import numpy as np
@@ -154,6 +155,61 @@ def test_watchdog_holds_then_resumes(tmp_path):
     assert 0.6 < hold[0]['t'] - read_jsonl(ep / CHUNKS)[0]['t_received'] < 0.9
     assert 'resume' in events(ep)
     assert result.end_reason == 'timeout'
+
+
+class HangsOnThirdCall(PolicyBackend):
+    """Holds still, except call 3, which hangs 3 s (past the loop's 1 s join) and then returns a
+    5 s chunk, still live on arrival, that would move joint 0 by 0.2 rad. Records how many calls
+    ever overlapped."""
+    def __init__(self):
+        self.n = self.active = self.max_active = 0
+        self.lock = threading.Lock()
+
+    def connect(self):
+        return PolicyInfo('hang', 15, 1 / 15, [])
+
+    def infer(self, obs):
+        with self.lock:
+            self.n += 1
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            n = self.n
+        try:
+            offset, H = 0.0, 15
+            if n == 3:
+                time.sleep(3.0)
+                offset, H = 0.2, 75
+            return ActionChunk(np.tile(obs.q + [offset, 0, 0, 0, 0, 0], (H, 1)), np.zeros(H), 1 / 15, obs.t)
+        finally:
+            with self.lock:
+                self.active -= 1
+
+    def reset(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_call_left_hanging_does_not_leak_into_next_episode(tmp_path):
+    # warm-up = call 1; episode 1: call 2 at once, call 3 at ~0.43 s hangs past the episode end.
+    cfg = config_mod.parse({'robot': {'dry_run': True}, 'cameras': {}, 'policy': {}})
+    backend = HangsOnThirdCall()
+    arm = SimArm(cfg.robot)
+    loop = ControlLoop(cfg, arm, NoGripper(), {}, backend, backend.connect())
+    loop.warmup('test')
+    results, dirs = [], []
+    for i, seconds in enumerate((1.0, 3.0)):
+        rec = EpisodeRecorder(tmp_path / f'ep{i}', {}, cfg.logging)
+        rec.start({})
+        results.append(loop.run_episode('test', rec, seconds))
+        rec.finish({})
+        dirs.append(rec.dir)
+    assert [r.end_reason for r in results] == ['timeout', 'timeout']
+    assert backend.max_active == 1                  # never two calls on one connection
+    q0 = np.load(dirs[1] / TICKS)['q'][:, 0]
+    assert np.ptp(q0) < 1e-9                        # call 3's chunk was never executed
+    assert results[1].n_chunks >= 1                 # and episode 2 still ran normally
 
 
 LONG_CHUNKS = {**SINE, 'chunk_len': 50, 'latency_s': 0.1, 'camera_map': {}}   # 3.3 s chunks
