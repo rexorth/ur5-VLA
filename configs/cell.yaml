@@ -24,8 +24,8 @@ control:
 safety:
   max_step_rad: 0.02          # per 8 ms tick
   ft_limit_n: 30              # CB3: on the controller's joint-current wrench ESTIMATE, tared per episode
-  # Hold if no chunk lands for this long. Needs (1 - refill_fraction) * chunk duration + latency
-  # below it, or the arm holds every cycle (the loop warns once if not).
+  # Hold if no chunk lands for this long. Chunks land every ~(1 - refill_fraction) * chunk
+  # duration (+ latency jitter); keep that below this, or the arm holds between chunks.
   watchdog_s: 1.0
   max_frame_age_s: 0.1
   # SET PER TASK before running on the arm. These defaults are the UR5's own range and a loose box.

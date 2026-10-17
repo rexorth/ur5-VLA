@@ -271,15 +271,27 @@ class ControlLoop:
         return Observation(images, state.q.copy(), state.gripper, wrench, prompt, state.t), {}
 
     def _check_timing(self, chunk_s: float, infer_s: float) -> None:
-        """The next chunk lands (1 - refill_fraction) * chunk_s + latency after this one. If that
-        is past the watchdog, the arm holds every cycle in normal operation: say so once."""
-        gap = (1 - self.cfg.control.refill_fraction) * chunk_s + infer_s
-        if gap >= self.cfg.safety.watchdog_s:
-            log.warning('chunks will arrive every ~%.2f s but safety.watchdog_s is %.2f s: the arm '
-                        'will hold each cycle. Raise control.refill_fraction or the watchdog, or '
-                        'shorten the chunk.', gap, self.cfg.safety.watchdog_s)
-            self._recorder.log_event('timing_warning', expected_gap_s=gap,
-                                     watchdog_s=self.cfg.safety.watchdog_s)
+        """Say once if the config cannot keep up in normal operation.
+
+        A chunk's trajectory ends at its t_obs + chunk_s, so each request goes out a fixed
+        (1 - refill_fraction) * chunk_s after the previous one: latency shifts the arrivals but
+        not their spacing (only its jitter adds). Two ways that goes wrong:
+          * spacing >= watchdog_s: the watchdog trips between healthy chunks;
+          * latency >= refill_fraction * chunk_s: the trajectory ends before the next chunk lands,
+            so the arm settles on the last target each cycle.
+        """
+        r, W = self.cfg.control.refill_fraction, self.cfg.safety.watchdog_s
+        spacing, lead = (1 - r) * chunk_s, r * chunk_s
+        if spacing >= W:
+            log.warning('chunks arrive every ~%.2f s but safety.watchdog_s is %.2f s: the arm will '
+                        'hold between chunks. Raise control.refill_fraction or the watchdog, or '
+                        'shorten the chunk.', spacing, W)
+            self._recorder.log_event('timing_warning', kind='watchdog', spacing_s=spacing, watchdog_s=W)
+        if infer_s >= lead:
+            log.warning('inference took %.2f s but requests go out with only %.2f s of trajectory '
+                        'left: the arm will pause each cycle. Raise control.refill_fraction.',
+                        infer_s, lead)
+            self._recorder.log_event('timing_warning', kind='latency', infer_s=infer_s, lead_s=lead)
 
     def _infer_loop(self, prompt: str) -> None:
         rec = self._recorder

@@ -76,10 +76,13 @@ share the cell file and can differ in nothing else. Interleave trials by alterna
   `watchdog_s` causes a *hold*: servoStop, then an automatic resume when fresh data arrives. A
   safety violation, the robot's own protective or emergency stop, or the e-stop ends the
   episode. Steps over `max_step_rad` are never clipped.
-- **Watchdog vs refill timing.** A new chunk lands about `(1 - refill_fraction) × chunk duration +
-  latency` after the previous one. If that exceeds `watchdog_s`, the arm holds every cycle; the
-  loop warns once when this happens. Long chunks, such as LeRobot π₀.₅'s 50 actions at 30 Hz, need a
-  higher `refill_fraction` or a longer watchdog.
+- **Watchdog vs refill timing.** Chunks arrive about every `(1 - refill_fraction) × chunk
+  duration`. Latency shifts the arrivals but not their spacing; only latency jitter adds to it.
+  Two conditions must hold, and the loop warns once for each it sees broken:
+  - The spacing plus jitter must stay below `watchdog_s`, or the arm holds between healthy
+    chunks.
+  - Latency must stay below `refill_fraction × chunk duration`, or the trajectory runs out before
+    the next chunk lands and the arm pauses each cycle.
 - **Chunk merge.** Chunk step k is the target for `t_obs + k·dt`. Steps already due when the
   chunk lands are skipped, the rest is crossfaded in over `crossfade_steps`, and then interpolated to
   125 Hz. This is identical for every backend.
