@@ -39,6 +39,31 @@ safety:
   workspace_max_m: [0.9, 0.9, 1.0]
   tcp_offset_m: [0, 0, 0]               # flange -> fingertip once a gripper is mounted
 
+# Gamepad teleoperation (`ur5vla teleop`, `ur5vla demo`). Numbers below are an Xbox One pad over
+# USB (xpad driver); run `ur5vla gamepad -c configs/cell.yaml` to see yours live. Each robot axis
+# is a sum of terms, clipped to [-1, 1]: {axis: i}, {axis: i, trigger: true} (0..1), {button: i},
+# each with an optional sign: -1. Listing a robot axis replaces its default; leave one out = unused.
+teleop:
+  device: null                # /dev/input/jsN; null = the first joystick found
+  frame: base                 # starting frame (base | tool); the toggle_frame button flips it
+  max_linear_m_s: 0.05        # at full deflection; deliberately slow for bring-up
+  max_angular_deg_s: 15
+  linear_accel_m_s2: 0.5
+  angular_accel_deg_s2: 90
+  max_joint_speed_deg_s: 45
+  slow_scale: 0.25            # while the slow button is held
+  deadzone: 0.12
+  curve: 1.5                  # stick response |x|^curve: finer near the center
+  axes:
+    x:  [{axis: 1, sign: -1}]                                         # left stick up/down
+    y:  [{axis: 0, sign: -1}]                                         # left stick left/right
+    z:  [{axis: 5, trigger: true}, {axis: 2, trigger: true, sign: -1}]  # RT up, LT down
+    rx: [{axis: 4, sign: -1}]                                         # right stick up/down
+    ry: [{axis: 3, sign: -1}]                                         # right stick left/right
+    rz: [{axis: 6, sign: -1}]                                         # d-pad left/right
+  gripper: [{button: 0}, {button: 1, sign: -1}]                       # A close, B open
+  buttons: {deadman: 4, slow: 5, toggle_frame: 6, done: 7}            # LB (hold), RB, View, Menu
+
 logging:
   root: runs
   image_format: jpg

@@ -4,6 +4,12 @@
     ur5vla cameras      -c configs/cell.yaml                       camera fps / drops / frame age
     ur5vla policy-check -c configs/cell.yaml -p configs/policy/openpi.yaml   query, no motion
     ur5vla run          -c configs/cell.yaml -p configs/policy/openpi.yaml --prompt "..."
+
+Demonstrations:
+    ur5vla gamepad      [-c configs/cell.yaml]     live controller numbers, to write the mapping
+    ur5vla teleop       -c configs/cell.yaml       drive the arm with the gamepad, nothing recorded
+    ur5vla demo         -c configs/cell.yaml --prompt "..." --episodes 10    drive and record
+    ur5vla to-lerobot   runs/<run> --repo-id <user>/<name> --root <dir> --fps 15
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ from pathlib import Path
 import numpy as np
 
 from . import config as config_mod
+from . import convert
 from .cameras import CameraSource, build_cameras
 from .control import ControlLoop
 from .keys import KeyListener
@@ -62,6 +69,29 @@ def _ask(prompt: str, assume_yes: bool, default: str = '') -> str:
     if assume_yes:
         return default
     return input(prompt).strip().lower()
+
+
+def _move_to_start(cfg: config_mod.RunConfig, arm, assume_yes: bool) -> bool:
+    """moveJ to robot.start_q_deg after confirmation. False if the operator declines."""
+    if cfg.robot.start_q_deg is None:
+        return True
+    q_now = np.rad2deg(arm.read_state().q)
+    print(f'start pose {cfg.robot.start_q_deg} deg (now {np.round(q_now, 1).tolist()})')
+    if _ask(f'move there at {cfg.robot.move_speed_deg_s} deg/s? [y/N] ', assume_yes, 'y') != 'y':
+        return False
+    arm.move_j(np.deg2rad(cfg.robot.start_q_deg), np.deg2rad(cfg.robot.move_speed_deg_s),
+               np.deg2rad(cfg.robot.move_accel_deg_s2))
+    return True
+
+
+def _ask_outcome(assume_yes: bool, interventions: bool = True) -> dict:
+    label = _ask('outcome [s]uccess / [f]ail / [d]iscard: ', assume_yes, '')
+    out = {'label': {'s': 'success', 'f': 'fail', 'd': 'discard'}.get(label, 'unlabelled')}
+    if interventions:
+        n = _ask('operator interventions (Enter = 0): ', assume_yes, '0')
+        out['interventions'] = int(n) if n.isdigit() else 0
+    out['note'] = _ask('note (optional): ', assume_yes, '')
+    return out
 
 
 # ---- commands ----
@@ -154,18 +184,14 @@ def cmd_run(args) -> int:
         log.info('warm-up inference: %.2f s', loop.warmup(prompt))
 
         for ep in range(args.episodes):
-            if cfg.robot.start_q_deg is not None:
-                q_now = np.rad2deg(arm.read_state().q)
-                print(f'start pose {cfg.robot.start_q_deg} deg (now {np.round(q_now, 1).tolist()})')
-                if _ask(f'move there at {cfg.robot.move_speed_deg_s} deg/s? [y/N] ', args.yes, 'y') != 'y':
-                    break
-                arm.move_j(np.deg2rad(cfg.robot.start_q_deg), np.deg2rad(cfg.robot.move_speed_deg_s),
-                           np.deg2rad(cfg.robot.move_accel_deg_s2))
+            if not _move_to_start(cfg, arm, args.yes):
+                break
             if _ask(f'episode {ep}: Enter to start, q to quit ', args.yes) == 'q':
                 break
 
             recorder = EpisodeRecorder(run_dir / f'ep_{ep:03d}', cameras, cfg.logging)
-            recorder.start({'run': run_name, 'episode': ep, 'prompt': prompt, 'config_path': cfg.source,
+            recorder.start({'run': run_name, 'episode': ep, 'kind': 'rollout', 'prompt': prompt,
+                            'config_path': cfg.source,
                             'config': cfg.raw, 'dry_run': cfg.robot.dry_run,
                             'policy_info': dataclasses.asdict(info)})
             print('running: [space] or [e] = e-stop, [d] = episode done, Ctrl-C = e-stop', flush=True)
@@ -178,11 +204,7 @@ def cmd_run(args) -> int:
 
             outcome = {'result': dataclasses.asdict(result)}
             if result.end_reason != 'estop':
-                label = _ask('outcome [s]uccess / [f]ail / [d]iscard: ', args.yes, '')
-                outcome['label'] = {'s': 'success', 'f': 'fail', 'd': 'discard'}.get(label, 'unlabelled')
-                n = _ask('operator interventions (Enter = 0): ', args.yes, '0')
-                outcome['interventions'] = int(n) if n.isdigit() else 0
-                outcome['note'] = _ask('note (optional): ', args.yes, '')
+                outcome.update(_ask_outcome(args.yes))
             recorder.finish(outcome)
             print(f'saved {recorder.dir}')
             if result.end_reason in ('estop', 'error'):
@@ -193,6 +215,111 @@ def cmd_run(args) -> int:
         arm.close()
         _stop_cameras(cameras)
     return 0
+
+
+def _teleop_help(cfg: config_mod.RunConfig) -> str:
+    b = cfg.teleop.buttons
+    return (f'hold button {b["deadman"]} to move, {b["slow"]} = slow, {b["toggle_frame"]} = base/tool '
+            f'frame, {b["done"]} = done | keys: [space]/[e] e-stop, [d] done, Ctrl-C e-stop')
+
+
+def cmd_gamepad(args) -> int:
+    from .teleop import BUTTON_ROLES, JoystickDevice
+    mapping, device = None, args.device
+    if args.config:
+        cfg = config_mod.load(args.config)
+        mapping, device = cfg.teleop.mapping(), device or cfg.teleop.device
+    pad = JoystickDevice(device).open()
+    print(f'{pad.name} on {pad.path}. Move each control to see its number; Ctrl-C to quit.')
+    try:
+        while True:
+            s = pad.snapshot()
+            if not s.connected:
+                print('\ndisconnected')
+                return 1
+            line = (f"axes {' '.join(f'{i}:{v:+.2f}' for i, v in enumerate(s.axes))} | buttons "
+                    f"{','.join(str(i) for i, b in enumerate(s.buttons) if b) or '-'}")
+            if mapping is not None:
+                held = ','.join(r for r in BUTTON_ROLES if mapping.held(r, s)) or '-'
+                line += (f' | x y z rx ry rz {np.array2string(mapping.twist(s), precision=2, suppress_small=True)}'
+                         f' | held {held}')
+            print('\r' + line + '   ', end='', flush=True)
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        print()
+        return 0
+    finally:
+        pad.close()
+
+
+def cmd_teleop(args) -> int:
+    from .control.teleop import TeleopSession
+    from .teleop import JoystickDevice
+    cfg = _load(args)
+    pad = JoystickDevice(cfg.teleop.device).open()
+    arm, gripper = make_arm(cfg.robot), NoGripper()
+    try:
+        arm.connect()
+        gripper.connect()
+        session = TeleopSession(cfg, arm, gripper, pad)
+        print(f'teleop, {session.frame} frame: {_teleop_help(cfg)}', flush=True)
+        with KeyListener({' ': session.estop.set, 'e': session.estop.set, 'd': session.end_request.set}):
+            result = session.run_episode()
+        print(f'teleop ended: {result.end_reason} {result.detail or ""} ({result.duration_s:.0f} s)')
+    finally:
+        gripper.close()
+        arm.close()
+        pad.close()
+    return 0
+
+
+def cmd_demo(args) -> int:
+    from .control.teleop import TeleopSession
+    from .teleop import JoystickDevice
+    cfg = _load(args)
+    prompt = args.prompt or cfg.prompt
+    if not prompt:
+        print('a prompt is required (--prompt or `prompt:` in the config)', file=sys.stderr)
+        return 2
+    run_name = f'{time.strftime("%Y%m%d-%H%M%S")}_demo' + (f'_{args.tag}' if args.tag else '')
+    run_dir = Path(cfg.logging.root) / run_name
+    pad = JoystickDevice(cfg.teleop.device).open()
+    cameras = _start_cameras(cfg)
+    arm, gripper = make_arm(cfg.robot), NoGripper()
+    try:
+        arm.connect()
+        gripper.connect()
+        session = TeleopSession(cfg, arm, gripper, pad)
+        for ep in range(args.episodes):
+            if not _move_to_start(cfg, arm, args.yes):
+                break
+            if _ask(f'demo {ep}: Enter to start recording, q to quit ', args.yes) == 'q':
+                break
+            recorder = EpisodeRecorder(run_dir / f'ep_{ep:03d}', cameras, cfg.logging)
+            recorder.start({'run': run_name, 'episode': ep, 'kind': 'demo', 'prompt': prompt,
+                            'config_path': cfg.source, 'config': cfg.raw, 'dry_run': cfg.robot.dry_run})
+            print(f'recording, {session.frame} frame: {_teleop_help(cfg)}', flush=True)
+            with KeyListener({' ': session.estop.set, 'e': session.estop.set, 'd': session.end_request.set}):
+                result = session.run_episode(recorder, args.max_seconds or cfg.control.max_episode_s)
+            print(f'demo {ep} ended: {result.end_reason} {result.detail or ""} ({result.duration_s:.1f} s)')
+            outcome = {'result': dataclasses.asdict(result)}
+            if result.end_reason in ('operator', 'timeout'):
+                print('label it: [s]uccess = a good demo to train on')
+                outcome.update(_ask_outcome(args.yes, interventions=False))
+            recorder.finish(outcome)
+            print(f'saved {recorder.dir}')
+            if result.end_reason not in ('operator', 'timeout'):
+                break
+    finally:
+        gripper.close()
+        arm.close()
+        pad.close()
+        _stop_cameras(cameras)
+    return 0
+
+
+def cmd_to_lerobot(args) -> int:
+    return convert.run(args)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -223,6 +350,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument('--tag', help='appended to the run directory name')
     p.add_argument('-y', '--yes', action='store_true',
                    help='no prompts: confirm moves, start episodes at once, leave outcomes unlabelled')
+
+    p = sub.add_parser('gamepad', help='show live controller axes/buttons (and the mapped twist)')
+    p.add_argument('-c', '--config', help='cell config: also show what its teleop mapping makes of it')
+    p.add_argument('--device', help='/dev/input/jsN (default: teleop.device, else the first found)')
+    p.set_defaults(fn=cmd_gamepad)
+    add('teleop', cmd_teleop, dry=True)
+    p = add('demo', cmd_demo, dry=True)
+    p.add_argument('--prompt', help='task prompt; overrides `prompt:` in the config')
+    p.add_argument('--episodes', type=int, default=1)
+    p.add_argument('--max-seconds', type=float, help='overrides control.max_episode_s')
+    p.add_argument('--tag', help='appended to the run directory name')
+    p.add_argument('-y', '--yes', action='store_true', help='no prompts; demos left unlabelled')
+    p = sub.add_parser('to-lerobot', help='write recorded episodes as a LeRobot dataset')
+    convert.add_arguments(p)
+    p.set_defaults(fn=cmd_to_lerobot)
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,

@@ -25,7 +25,7 @@ cameras = [
 openpi = ["openpi-client", "typing-extensions", "websockets>=17"]
 # torch/torchvision are listed so the CPU-index source below applies: the client only unpickles
 # action tensors. The LeRobot policy server runs from its own environment.
-lerobot = ["lerobot[async]>=0.6,<0.7", "torch", "torchvision"]
+lerobot = ["lerobot[async,dataset]>=0.6,<0.7", "torch", "torchvision"]
 
 [project.scripts]
 ur5vla = "ur5vla.cli:main"

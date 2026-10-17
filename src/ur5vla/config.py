@@ -118,6 +118,57 @@ class SafetyConfig:
             raise ConfigError('safety.workspace_min_m must be below workspace_max_m')
 
 
+def _xbox_axes() -> dict[str, list[dict]]:
+    # Xbox One pad over USB (xpad driver). Axes: 0 LX, 1 LY, 2 LT, 3 RX, 4 RY, 5 RT, 6 dpad X,
+    # 7 dpad Y; sticks read -1 at up/left. Run `ur5vla gamepad` to see your numbering.
+    return {
+        'x': [{'axis': 1, 'sign': -1}],                                   # left stick up/down
+        'y': [{'axis': 0, 'sign': -1}],                                   # left stick left/right
+        'z': [{'axis': 5, 'trigger': True}, {'axis': 2, 'trigger': True, 'sign': -1}],  # RT / LT
+        'rx': [{'axis': 4, 'sign': -1}],                                  # right stick up/down
+        'ry': [{'axis': 3, 'sign': -1}],                                  # right stick left/right
+        'rz': [{'axis': 6, 'sign': -1}],                                  # d-pad left/right
+    }
+
+
+@dataclass
+class TeleopConfig:
+    device: str | None = None       # /dev/input/jsN; None = the first joystick found
+    frame: str = 'base'             # starting frame, toggled live: base | tool
+    max_linear_m_s: float = 0.05    # full stick deflection
+    max_angular_deg_s: float = 15.0
+    linear_accel_m_s2: float = 0.5  # ramp on the commanded twist, also when stopping
+    angular_accel_deg_s2: float = 90.0
+    max_joint_speed_deg_s: float = 45.0
+    slow_scale: float = 0.25        # speed factor while the `slow` button is held
+    deadzone: float = 0.12
+    curve: float = 1.5              # stick response: |x|^curve
+    damping: float = 0.02           # damped least squares near singularities
+    gripper_speed: float = 1.0      # full open-close range per second
+    axes: dict[str, list[dict]] = field(default_factory=_xbox_axes)
+    gripper: list[dict] = field(default_factory=lambda: [{'button': 0}, {'button': 1, 'sign': -1}])  # A / B
+    # Xbox buttons (xpad): 0 A, 1 B, 2 X, 3 Y, 4 LB, 5 RB, 6 View, 7 Menu, 8 Xbox, 9/10 stick clicks
+    buttons: dict[str, int | None] = field(default_factory=lambda: {
+        'deadman': 4, 'slow': 5, 'toggle_frame': 6, 'done': 7})   # LB held to move, RB, View, Menu
+
+    def __post_init__(self):
+        if self.frame not in ('base', 'tool'):
+            raise ConfigError("teleop.frame must be 'base' or 'tool'")
+        if not 0.0 <= self.deadzone < 1.0:
+            raise ConfigError('teleop.deadzone must be in [0, 1)')
+        if self.curve <= 0:
+            raise ConfigError('teleop.curve must be > 0')
+        from .teleop.gamepad import GamepadMapping   # validates the mapping now, not mid-run
+        try:
+            GamepadMapping.from_config(self.axes, self.gripper, self.buttons, self.deadzone, self.curve)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(str(exc)) from exc
+
+    def mapping(self):
+        from .teleop.gamepad import GamepadMapping
+        return GamepadMapping.from_config(self.axes, self.gripper, self.buttons, self.deadzone, self.curve)
+
+
 @dataclass
 class LoggingConfig:
     root: str = 'runs'
@@ -137,12 +188,13 @@ class RunConfig:
     control: ControlConfig
     safety: SafetyConfig
     logging: LoggingConfig
+    teleop: TeleopConfig = field(default_factory=TeleopConfig)
     prompt: str = ''
     source: str | None = None           # path the config was loaded from
     raw: dict[str, Any] = field(default_factory=dict)  # as loaded, saved with every episode
 
 
-SECTIONS = ('robot', 'cameras', 'policy', 'control', 'safety', 'logging', 'prompt')
+SECTIONS = ('robot', 'cameras', 'policy', 'control', 'safety', 'logging', 'teleop', 'prompt')
 
 
 def parse(raw: dict[str, Any], source: str | None = None) -> RunConfig:
@@ -163,6 +215,7 @@ def parse(raw: dict[str, Any], source: str | None = None) -> RunConfig:
         control=from_dict(ControlConfig, raw.get('control'), 'control'),
         safety=from_dict(SafetyConfig, raw.get('safety'), 'safety'),
         logging=from_dict(LoggingConfig, raw.get('logging'), 'logging'),
+        teleop=from_dict(TeleopConfig, raw.get('teleop'), 'teleop'),
         prompt=str(raw.get('prompt') or ''),
         source=source,
         raw=raw,

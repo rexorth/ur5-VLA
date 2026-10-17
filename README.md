@@ -143,6 +143,62 @@ not a server restart. The checkpoint must output joint positions in this robot's
 - **CB3 wrench.** `getActualTCPForce()` on a CB3 is an estimate from joint currents. It is tared at
   the start of each episode and only suitable as a collision backstop.
 
+## Demonstrations and datasets
+
+**Gamepad teleop.** The gamepad is read through the Linux joystick device (`/dev/input/js*`), with
+no extra library. Motion is Cartesian jogging of the TCP in the **base** or **tool** frame,
+executed exactly like a policy: joint targets streamed with servoJ at 125 Hz, each one checked by
+the same SafetyLayer. A step that would cross a joint limit or the workspace box is refused, so
+the arm stops at the wall and can be driven back out. Robot-side stops end the session.
+
+Default Xbox One mapping over USB (the `xpad` driver), all remappable in the `teleop:` block of
+`configs/cell.yaml`:
+
+| Control | Does |
+|---|---|
+| LB (hold) | Deadman: nothing moves unless held; releasing stops at once |
+| Left stick | x / y |
+| RT / LT | +z / -z |
+| Right stick | rx / ry |
+| D-pad left/right | rz |
+| RB (hold) | Slow mode (`slow_scale`) |
+| View | Toggle base / tool frame |
+| Menu | Done (ends the demo) |
+| A / B | Gripper close / open (logged; no gripper yet) |
+
+```bash
+ur5vla gamepad -c configs/cell.yaml        # live axis/button numbers + the twist they map to
+ur5vla teleop  -c configs/cell.yaml        # drive, nothing recorded
+ur5vla demo    -c configs/cell.yaml --prompt "pick up the red block" --episodes 20
+```
+Each demo is recorded like a policy run (`kind: demo` in `meta.json`). Afterwards, label each
+one: `s` keeps it for training.
+
+If your numbering differs from the defaults (Bluetooth, or another driver), `ur5vla gamepad`
+shows the numbers to put in the mapping. Each robot axis is a sum of terms clipped to [-1, 1]:
+`{axis: i}`, `{axis: i, trigger: true}` (a trigger resting at -1, read as 0..1) or
+`{button: i}`, each with an optional `sign: -1`.
+
+**To a LeRobot dataset.** Frames are taken at the policy rate:
+- `observation.state`: the joints plus the gripper;
+- `action`: the joint targets sent at that moment, the convention the loop uses to execute chunks;
+- native-resolution camera frames;
+- the prompt, as the task.
+
+Feature names match what the LeRobot adapter sends at inference.
+```bash
+ur5vla to-lerobot runs/<run>_demo --repo-id <hf-user>/ur5_pick --root ~/abhay_ws/datasets/ur5_pick --fps 15
+```
+- **Which format gets written** depends on the LeRobot in the environment that runs the
+  converter. LeRobot 0.6 (`.venv-lerobot`) writes v3.0, with the quantile statistics π₀.₅ needs.
+  openpi trains from dataset format **v2.1**, written by the older LeRobot it pins. Run the same
+  converter inside openpi's environment without installing this package:
+  `PYTHONPATH=<this repo>/src python -m ur5vla.convert ...`
+- **Filters:** `--labels` (default `success`) and `--kinds` (default `demo`) choose episodes.
+  `--camera base=front` renames a camera.
+- **Must match the policy file:** `--fps` must equal the policy's `action_hz`, and the dataset's
+  camera names are what the policy file's `camera_map` should point at.
+
 ## Recordings
 
 Each episode is written to `runs/<time>_<backend>/ep_NNN/`:
@@ -159,15 +215,18 @@ format back.
 ## Layout
 
 ```
-configs/        cell.yaml, dry_run.yaml, policy/{openpi,lerobot,replay_sine}.yaml
+configs/        cell.yaml, dry_run.yaml, policy/{openpi,lerobot,lerobot_pi05_base,replay_sine}.yaml
 src/ur5vla/
   cameras/      CameraSource + realsense, oak (depthai v3), mcu_uvc, replay, synthetic
   policy/       PolicyBackend + openpi, lerobot, replay
   robot/        ur_rtde arm, simulated arm, UR5 kinematics, gripper interface
-  control/      ChunkBuffer, SafetyLayer, ControlLoop
+  control/      ChunkBuffer, SafetyLayer, ControlLoop, TeleopSession
+  teleop/       gamepad reader and control mapping
   recording.py  episode recorder
-  cli.py        ur5vla state | cameras | policy-check | run
-tests/          unit tests, loop tests on the simulated arm, adapter tests against fake servers
+  convert.py    recordings -> LeRobot dataset (v3.0 or v2.1)
+  cli.py        ur5vla state | cameras | policy-check | run | gamepad | teleop | demo | to-lerobot
+tests/          unit tests, loop and teleop tests on the simulated arm, adapter tests against fake
+                servers, dataset write/read-back
 ```
 
 `pytest` runs in either venv. The adapter test for the other venv's library is skipped.
@@ -178,5 +237,6 @@ tests/          unit tests, loop tests on the simulated arm, adapter tests again
   the wire formats.
 - Gripper: open question. `NoGripper` reads 0 and ignores commands, but commands are still logged.
 - `mcu_stream` camera driver (milestone 7, only if needed).
-- Converting recordings to a LeRobot dataset, and an A/B trial scheduler.
+- The v2.1 (openpi) dataset path is untested: it needs openpi's environment. v3.0 is tested.
+- An A/B trial scheduler; merging LoRA adapters for serving.
 - OAK depth, which needs a StereoDepth node.
