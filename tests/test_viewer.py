@@ -26,11 +26,13 @@ def stop(cams):
 def test_drain_keeps_each_cameras_newest_frame():
     r, w = mp.Pipe(duplex=False)
     for name, value in (('base', 1), ('wrist', 2), ('base', 3)):
-        w.send((name, (2, 2, 3), float(value)))
+        w.send(('frame', name, (2, 2, 3), float(value)))
         w.send_bytes(np.full(12, value, np.uint8))
-    fresh = drain(r, 10)
+        w.send(('info', f'text {value}'))
+    fresh, info = drain(r, 10)
     assert {name: t for name, (_, t, _) in fresh.items()} == {'base': 3.0, 'wrist': 2.0}
     assert fresh['base'][2] == bytes([3] * 12)
+    assert info == 'text 3'
     w.close()
     try:
         drain(r, 10)
@@ -41,27 +43,33 @@ def test_drain_keeps_each_cameras_newest_frame():
 
 
 def _reporting_window(frames, keys, names, title, width):
-    """Waits for a whole frame from every camera, reports each by its initial, then closes."""
-    seen = {}
+    """Waits for a whole frame from every camera and the info text, reports each by its initial
+    ('i' for the info), then closes."""
+    seen, info = {}, None
     t_end = time.monotonic() + 10
-    while len(seen) < len(names) and time.monotonic() < t_end:
-        seen.update(drain(frames, 8))
+    while (len(seen) < len(names) or info is None) and time.monotonic() < t_end:
+        fresh, new_info = drain(frames, 8)
+        seen.update(fresh)
+        info = new_info or info
         time.sleep(0.01)
     for name, (shape, _, data) in seen.items():
         if len(data) == np.prod(shape):
             keys.send(name[0])
+    if info == 'legend\npose':
+        keys.send('i')
     keys.send('x')          # unbound: ignored
     keys.send('e')
 
 
 def test_frames_reach_the_window_and_its_keys_come_back():
     cams = cameras()
-    got = {k: threading.Event() for k in 'bwe'}
+    got = {k: threading.Event() for k in 'bwie'}
     viewer = CameraViewer(cams, window=_reporting_window)
     try:
         with viewer, viewer.keys({k: evt.set for k, evt in got.items()}):
+            viewer.set_info('legend\npose')
             assert got['e'].wait(20)
-            assert got['b'].is_set() and got['w'].is_set()
+            assert got['b'].is_set() and got['w'].is_set() and got['i'].is_set()
             # The window has closed itself; the sender notices and stops, nothing raises.
             viewer._proc.join(5)
             viewer._sender.join(2)

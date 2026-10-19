@@ -135,29 +135,39 @@ def _pose_text(q: np.ndarray, tcp_offset_m) -> str:
 
 
 @contextlib.contextmanager
-def _live_pose(session, tcp_offset_m):
-    """Redraw one terminal line with where the arm is, 5 times a second, while teleoperating."""
-    if not sys.stdout.isatty():
+def _teleop_display(session, tcp_offset_m, viewer, terminal: bool):
+    """While teleoperating, 5 times a second: where the arm is, on one terminal line (if
+    `terminal`), and the controls legend for the current frame plus the pose in the camera window
+    (if there is one)."""
+    terminal = terminal and sys.stdout.isatty()
+    if viewer is not None:
+        viewer.set_info(session.mapping.legend(session.frame))
+    if not terminal and viewer is None:
         yield
         return
     stop = threading.Event()
 
     def show():
         while not stop.wait(0.2):
-            if session.state is not None:
+            if session.state is None:
+                continue
+            pose = _pose_text(session.state.q, tcp_offset_m)
+            if terminal:
                 # The cursor is left at the start of the line, so a log message overwrites it
                 # rather than being appended to it.
-                print(f'{_pose_text(session.state.q, tcp_offset_m)}  {session.frame:4} frame\r',
-                      end='', flush=True)
+                print(f'{pose}  {session.frame:4} frame\r', end='', flush=True)
+            if viewer is not None:
+                viewer.set_info(f'{session.mapping.legend(session.frame)}\n\n{pose}')
 
-    thread = threading.Thread(target=show, name='pose', daemon=True)
+    thread = threading.Thread(target=show, name='teleop-display', daemon=True)
     thread.start()
     try:
         yield
     finally:
         stop.set()
         thread.join()
-        print('\x1b[K', end='', flush=True)    # clear it: the caller prints the final pose
+        if terminal:
+            print('\x1b[K', end='', flush=True)    # clear it: the caller prints the final pose
 
 
 # ---- commands ----
@@ -289,10 +299,7 @@ def cmd_run(args) -> int:
     return 0
 
 
-def _teleop_help(cfg: config_mod.RunConfig) -> str:
-    b = cfg.teleop.buttons
-    return (f'hold button {b["deadman"]} to move, {b["slow"]} = slow, {b["toggle_frame"]} = base/tool '
-            f'frame, {b["done"]} = done | keys: [space]/[e] e-stop, [d] done, Ctrl-C e-stop')
+TELEOP_KEYS = 'keys: [space]/[e] e-stop, [d] done, Ctrl-C e-stop'
 
 
 def cmd_gamepad(args) -> int:
@@ -338,9 +345,9 @@ def cmd_teleop(args) -> int:
         gripper.connect()
         session = TeleopSession(cfg, arm, gripper, pad)
         tcp_offset = cfg.safety.tcp_offset_m
-        print(f'teleop, {session.frame} frame: {_teleop_help(cfg)}', flush=True)
+        print(f'{session.mapping.legend(session.frame)}\n{TELEOP_KEYS}', flush=True)
         with _operator_keys(_episode_keys(session.estop, session.end_request), viewer), \
-                _live_pose(session, tcp_offset):
+                _teleop_display(session, tcp_offset, viewer, terminal=True):
             result = session.run_episode()
         print(f'teleop ended: {result.end_reason} {result.detail or ""} ({result.duration_s:.0f} s)')
         q = arm.read_state().q
@@ -375,6 +382,7 @@ def cmd_demo(args) -> int:
         arm.connect()
         gripper.connect()
         session = TeleopSession(cfg, arm, gripper, pad)
+        print(session.mapping.legend(session.frame), flush=True)
         for ep in range(args.episodes):
             if not _move_to_start(cfg, arm, args.yes):
                 break
@@ -383,8 +391,9 @@ def cmd_demo(args) -> int:
             recorder = EpisodeRecorder(run_dir / f'ep_{ep:03d}', cameras, cfg.logging)
             recorder.start({'run': run_name, 'episode': ep, 'kind': 'demo', 'prompt': prompt,
                             'config_path': cfg.source, 'config': cfg.raw, 'dry_run': cfg.robot.dry_run})
-            print(f'recording, {session.frame} frame: {_teleop_help(cfg)}', flush=True)
-            with _operator_keys(_episode_keys(session.estop, session.end_request), viewer):
+            print(f'recording, {session.frame} frame | {TELEOP_KEYS}', flush=True)
+            with _operator_keys(_episode_keys(session.estop, session.end_request), viewer), \
+                    _teleop_display(session, cfg.safety.tcp_offset_m, viewer, terminal=False):
                 result = session.run_episode(recorder, args.max_seconds or cfg.control.max_episode_s)
             print(f'demo {ep} ended: {result.end_reason} {result.detail or ""} ({result.duration_s:.1f} s)')
             outcome = {'result': dataclasses.asdict(result)}

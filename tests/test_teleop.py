@@ -196,3 +196,20 @@ def test_teleop_command_shows_the_pose_records_nothing_and_prints_a_start_pose(t
     assert len(start) == 6 and all(isinstance(v, float) for v in start)
     assert not (tmp_path / 'runs').exists()                             # nothing recorded
 
+
+def test_legend_names_each_axis_its_controls_and_direction():
+    lines = config_mod.TeleopConfig().mapping().legend('base').splitlines()
+    assert lines[0].startswith('BASE frame') and 'View switches' in lines[0]
+    rows = {line.split()[0]: line for line in lines[1:7]}
+    assert rows['x'].endswith('move along x    left stick up +, down -')
+    assert rows['z'].endswith('RT +, LT -')
+    assert rows['roll'].endswith('rotate about x  right stick up +, down -')
+    assert rows['tilt'].endswith('rotate about y  right stick left +, right -')
+    assert rows['yaw'].endswith('rotate about z  d-pad left +, right -')
+    assert lines[-1] == '  hold LB to move, RB slow, Menu done, gripper A close, B open'
+    # Remapped: buttons and an axis xpad has no name for; an axis left out.
+    remapped = config_mod.TeleopConfig(axes={'x': [{'button': 3}, {'button': 0, 'sign': -1}],
+                                             'y': [{'axis': 9, 'sign': -1}]}).mapping()
+    text = remapped.legend('tool')
+    assert text.startswith('TOOL frame') and 'Y +, A -' in text
+    assert 'axis 9 negative +, positive -' in text and 'not mapped' in text

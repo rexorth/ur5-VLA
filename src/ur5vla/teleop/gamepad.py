@@ -165,6 +165,36 @@ def find_joystick() -> str:
 ROBOT_AXES = ('x', 'y', 'z', 'rx', 'ry', 'rz')
 BUTTON_ROLES = ('deadman', 'slow', 'toggle_frame', 'done')
 
+# Control names under xpad (Xbox pads over USB), for the legend only: under another driver the
+# numbers mean other controls, so check them with `ur5vla gamepad`. Axes: (name, at -1, at +1).
+XPAD_AXES = {0: ('left stick', 'left', 'right'), 1: ('left stick', 'up', 'down'), 2: ('LT', '', ''),
+             3: ('right stick', 'left', 'right'), 4: ('right stick', 'up', 'down'), 5: ('RT', '', ''),
+             6: ('d-pad', 'left', 'right'), 7: ('d-pad', 'up', 'down')}
+XPAD_BUTTONS = ('A', 'B', 'X', 'Y', 'LB', 'RB', 'View', 'Menu', 'Xbox', 'left stick click',
+                'right stick click')
+LEGEND_ROWS = (('x', 'x', 'move along x'), ('y', 'y', 'move along y'), ('z', 'z', 'move along z'),
+               ('rx', 'roll', 'rotate about x'), ('ry', 'tilt', 'rotate about y'),
+               ('rz', 'yaw', 'rotate about z'))
+FRAME_TEXT = {'base': "x y z are the robot base's axes, as on the pendant",
+              'tool': "x y z are the tool's own axes; z points out of the flange"}
+
+
+def describe_terms(terms: list[Term], plus: str = '+', minus: str = '-') -> str:
+    """Which controls drive a value up and down, e.g. 'left stick up +, down -' or 'RT +, LT -'."""
+    parts = []
+    for t in terms:
+        if t.button is not None:
+            name = XPAD_BUTTONS[t.button] if t.button < len(XPAD_BUTTONS) else f'button {t.button}'
+            parts.append(f'{name} {plus if t.sign > 0 else minus}')
+        elif t.trigger:
+            name = XPAD_AXES.get(t.axis, (f'axis {t.axis}',))[0]
+            parts.append(f'{name} {plus if t.sign > 0 else minus}')
+        else:
+            name, low, high = XPAD_AXES.get(t.axis, (f'axis {t.axis}', 'negative', 'positive'))
+            up, down = (high, low) if t.sign > 0 else (low, high)
+            parts.append(f'{name} {up} {plus}, {down} {minus}')
+    return ', '.join(parts) or 'not mapped'
+
 
 @dataclass
 class Term:
@@ -233,6 +263,21 @@ class GamepadMapping:
 
     def held(self, role: str, pad: GamepadState) -> bool:
         return pad.button(self.buttons.get(role))
+
+    def legend(self, frame: str) -> str:
+        """The controls, one robot axis per line, for the terminal and the camera window."""
+        def button(role: str) -> str:
+            b = self.buttons.get(role)
+            return 'unmapped' if b is None else XPAD_BUTTONS[b] if b < len(XPAD_BUTTONS) else f'button {b}'
+
+        lines = [f'{frame.upper()} frame: {FRAME_TEXT[frame]} ({button("toggle_frame")} switches)']
+        lines += [f'  {label:<5} {what:<15} {describe_terms(self.axes[axis])}'
+                  for axis, label, what in LEGEND_ROWS]
+        lines += ['  rotations turn the tool in place about the TCP; + is counter-clockwise seen from the',
+                  '  + end of the axis (right-hand rule)',
+                  f'  hold {button("deadman")} to move, {button("slow")} slow, {button("done")} done, '
+                  f'gripper {describe_terms(self.gripper, "close", "open")}']
+        return '\n'.join(lines)
 
 
 @dataclass

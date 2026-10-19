@@ -8,6 +8,9 @@ newest, so frames never queue up. Closing the window stops the viewer, never the
 The window has focus whenever the operator clicks on it, so keys pressed there are sent back and
 dispatched like the terminal's (keys.py): the e-stop key works whichever window is in front.
 Prompts that need Enter (start, labels) are still answered in the terminal.
+
+Below the images, the window can show a text panel (set_info): teleop puts the controls legend
+and the arm's pose there.
 """
 
 from __future__ import annotations
@@ -47,6 +50,8 @@ class CameraViewer:
         self.width = width
         self._window = window or _window
         self._bindings: dict[str, Callable[[], None]] | None = None
+        self._info: str | None = None
+        self._info_sent: str | None = None
         self._stop = threading.Event()
         self._proc = None
         self._frames = None         # our end: frames to the window
@@ -73,6 +78,10 @@ class CameraViewer:
 
     def is_open(self) -> bool:
         return self._proc is not None and self._proc.is_alive()
+
+    def set_info(self, text: str) -> None:
+        """Show `text` (monospace, may be several lines) under the images."""
+        self._info = text
 
     @contextlib.contextmanager
     def keys(self, bindings: dict[str, Callable[[], None]]) -> Iterator[None]:
@@ -120,6 +129,9 @@ class CameraViewer:
     def _send_new(self, last: dict[str, tuple[object, float]]) -> None:
         """Send each camera's latest frame if it is new and that camera's previous one went out
         about a period ago (0.8: so capture jitter cannot halve a camera running at the cap)."""
+        if self._info != self._info_sent:
+            self._info_sent = self._info
+            self._frames.send(('info', self._info_sent))
         now = time.monotonic()
         for name, cam in self.cameras.items():
             frame = cam.latest()
@@ -128,7 +140,7 @@ class CameraViewer:
                 continue
             last[name] = (frame, now)
             rgb = np.ascontiguousarray(frame.rgb)
-            self._frames.send((name, rgb.shape, frame.t_capture))
+            self._frames.send(('frame', name, rgb.shape, frame.t_capture))
             # Flat: send_bytes sizes its header with len(), which for an HxWx3 buffer is H.
             self._frames.send_bytes(rgb.reshape(-1))
 
@@ -144,16 +156,21 @@ class CameraViewer:
             pass
 
 
-def drain(conn, limit: int) -> dict[str, tuple[tuple[int, ...], float, bytes]]:
-    """Read up to `limit` frames waiting in the pipe; keep each camera's newest as
-    {name: (shape, t_capture, rgb bytes)}. Raises EOFError once the sender has closed."""
-    fresh = {}
+def drain(conn, limit: int) -> tuple[dict[str, tuple[tuple[int, ...], float, bytes]], str | None]:
+    """Read up to `limit` messages waiting in the pipe. Returns each camera's newest frame as
+    {name: (shape, t_capture, rgb bytes)}, and the newest info text (None if none came).
+    Raises EOFError once the sender has closed."""
+    fresh, info = {}, None
     for _ in range(limit):
         if not conn.poll():
             break
-        name, shape, t = conn.recv()
-        fresh[name] = (shape, t, conn.recv_bytes())
-    return fresh
+        msg = conn.recv()
+        if msg[0] == 'info':
+            info = msg[1]
+        else:
+            _, name, shape, t = msg
+            fresh[name] = (shape, t, conn.recv_bytes())
+    return fresh, info
 
 
 def _window(frames, keys, names: list[str], title: str, width: int) -> None:
@@ -177,6 +194,7 @@ def _window(frames, keys, names: list[str], title: str, width: int) -> None:
         captions[name].grid(row=0, column=i, sticky='we', padx=4)
         panels[name] = tk.Label(root, bg='black')
         panels[name].grid(row=1, column=i, padx=2, pady=(0, 2))
+    info_panel = tk.Label(root, fg='white', bg='black', justify='left', anchor='w', font='TkFixedFont')
 
     def on_key(event) -> None:
         if event.char:
@@ -189,10 +207,14 @@ def _window(frames, keys, names: list[str], title: str, width: int) -> None:
     def pump() -> None:
         nonlocal last_caption
         try:
-            fresh = drain(frames, 4 * len(names))
+            fresh, info = drain(frames, 4 * len(names) + 1)
         except (EOFError, OSError):
             root.destroy()
             return
+        if info is not None:
+            if not info_panel.grid_info():      # only once there is something to show
+                info_panel.grid(row=2, column=0, columnspan=len(names), sticky='w', padx=4, pady=(0, 4))
+            info_panel.configure(text=info)
         now = time.monotonic()
         for name, (shape, t, data) in fresh.items():
             img = Image.frombuffer('RGB', (shape[1], shape[0]), data, 'raw', 'RGB', 0, 1)

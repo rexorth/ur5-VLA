@@ -158,10 +158,11 @@ Default Xbox One mapping over USB (the `xpad` driver), all remappable in the `te
 | Control | Does |
 |---|---|
 | LB (hold) | Deadman: nothing moves unless held; releasing stops at once |
-| Left stick | x / y |
+| Left stick up/down, left/right | x, y |
 | RT / LT | +z / -z |
-| Right stick | rx / ry |
-| D-pad left/right | rz |
+| Right stick up/down | roll: rotate about x |
+| Right stick left/right | tilt: rotate about y |
+| D-pad left/right | yaw: rotate about z |
 | RB (hold) | Slow mode (`slow_scale`) |
 | View | Toggle base / tool frame |
 | Menu | Done (ends the demo) |

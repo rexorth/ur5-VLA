@@ -340,6 +340,13 @@ ur5vla teleop -c configs/cell.yaml [--view] [--dry-run]
 
 **Ending.** Menu, `d`, e-stop, or any stop condition in step 2.
 
+**Legend.** At the start, teleop prints the controls for the configured mapping: which control
+moves along or rotates about each axis, and which way is +. Rotations are about axes through the
+TCP; + is counter-clockwise seen from the + end of the axis (right-hand rule). In the base frame,
+x y z are the robot base's axes as on the pendant; in the tool frame, the tool's own axes (z out
+of the flange). With `--view`, the camera window shows the same legend for the current frame,
+and the pose. Control names assume the `xpad` numbering ([4.4](#44-teleop-settings)).
+
 **Output.**
 - While it runs, one terminal line shows the joints (degrees), the TCP point (mm, UR base frame,
   at `safety.tcp_offset_m`: the point the workspace box checks) and the jog frame.
@@ -350,10 +357,11 @@ ur5vla teleop -c configs/cell.yaml [--view] [--dry-run]
 | Control | Action |
 |---|---|
 | LB (hold) | Deadman |
-| Left stick | x / y |
+| Left stick up/down, left/right | x, y |
 | RT / LT | +z / −z |
-| Right stick | rx / ry |
-| D-pad left/right | rz |
+| Right stick up/down | roll: rotate about x |
+| Right stick left/right | tilt: rotate about y |
+| D-pad left/right | yaw: rotate about z |
 | RB (hold) | Slow mode |
 | View | Toggle base / tool frame |
 | Menu | Done |
