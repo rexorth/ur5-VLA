@@ -172,6 +172,7 @@ ur5vla gamepad -c configs/cell.yaml        # live axis/button numbers + the twis
 ur5vla teleop  -c configs/cell.yaml        # drive, nothing recorded
 ur5vla demo    -c configs/cell.yaml --prompt "pick up the red block" --episodes 20
 ```
+Add `--view` to `cameras`, `run`, `teleop` or `demo` for a live window of every camera.
 Each demo is recorded like a policy run (`kind: demo` in `meta.json`). Afterwards, label each
 one: `s` keeps it for training.
 
@@ -225,6 +226,7 @@ src/ur5vla/
   teleop/       gamepad reader and control mapping
   recording.py  episode recorder
   convert.py    recordings -> LeRobot dataset (v3.0 or v2.1)
+  viewer.py     live camera window (--view), in its own process
   cli.py        ur5vla state | cameras | policy-check | run | gamepad | teleop | demo | to-lerobot
 tests/          unit tests, loop and teleop tests on the simulated arm, adapter tests against fake
                 servers, dataset write/read-back

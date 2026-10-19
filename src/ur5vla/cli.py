@@ -10,14 +10,19 @@ Demonstrations:
     ur5vla teleop       -c configs/cell.yaml       drive the arm with the gamepad, nothing recorded
     ur5vla demo         -c configs/cell.yaml --prompt "..." --episodes 10    drive and record
     ur5vla to-lerobot   runs/<run> --repo-id <user>/<name> --root <dir> --fps 15
+
+`--view` on cameras, run, teleop and demo opens a window with every camera live.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import logging
+import math
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -94,6 +99,34 @@ def _ask_outcome(assume_yes: bool, interventions: bool = True) -> dict:
     return out
 
 
+def _start_viewer(args, cameras: dict[str, CameraSource], title: str):
+    """The live camera window, if --view was given; None otherwise."""
+    if not getattr(args, 'view', False):
+        return None
+    from .viewer import CameraViewer
+    try:
+        return CameraViewer(cameras, title).start()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None
+
+
+def _close_viewer(viewer) -> None:
+    if viewer is not None:
+        viewer.close()
+
+
+def _episode_keys(estop: threading.Event, end: threading.Event) -> dict:
+    # '\x03' is Ctrl-C pressed in the camera window; in the terminal, Ctrl-C raises SIGINT instead.
+    return {' ': estop.set, 'e': estop.set, '\x03': estop.set, 'd': end.set}
+
+
+@contextlib.contextmanager
+def _operator_keys(bindings: dict, viewer):
+    """Single-key commands from the terminal and, with --view, from the camera window."""
+    with KeyListener(bindings), (contextlib.nullcontext() if viewer is None else viewer.keys(bindings)):
+        yield
+
+
 # ---- commands ----
 
 def cmd_state(args) -> int:
@@ -117,9 +150,12 @@ def cmd_state(args) -> int:
 def cmd_cameras(args) -> int:
     cfg = _load(args)
     cameras = _start_cameras(cfg)
+    viewer = None
     try:
-        t_end = time.monotonic() + args.seconds
-        while time.monotonic() < t_end:
+        viewer = _start_viewer(args, cameras, 'ur5vla cameras')
+        seconds = args.seconds if args.seconds is not None else math.inf if viewer else 10.0
+        t_end = time.monotonic() + seconds
+        while time.monotonic() < t_end and (viewer is None or viewer.is_open()):
             time.sleep(1.0)
             for cam in cameras.values():
                 h = cam.health()
@@ -130,6 +166,7 @@ def cmd_cameras(args) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        _close_viewer(viewer)
         _stop_cameras(cameras)
     return 0
 
@@ -175,7 +212,9 @@ def cmd_run(args) -> int:
     arm = make_arm(cfg.robot)
     gripper = NoGripper()
     backend = build_backend(cfg.policy)
+    viewer = None
     try:
+        viewer = _start_viewer(args, cameras, f'ur5vla run {run_name}')
         info = backend.connect()
         log.info('policy: %s', info)
         arm.connect()
@@ -195,8 +234,7 @@ def cmd_run(args) -> int:
                             'config': cfg.raw, 'dry_run': cfg.robot.dry_run,
                             'policy_info': dataclasses.asdict(info)})
             print('running: [space] or [e] = e-stop, [d] = episode done, Ctrl-C = e-stop', flush=True)
-            bindings = {' ': loop.estop.set, 'e': loop.estop.set, 'd': loop.end_request.set}
-            with KeyListener(bindings):
+            with _operator_keys(_episode_keys(loop.estop, loop.end_request), viewer):
                 result = loop.run_episode(prompt, recorder, args.max_seconds)
             print(f'episode {ep} ended: {result.end_reason} {result.detail or ""}  '
                   f'{result.duration_s:.1f} s, {result.n_chunks} chunks, '
@@ -213,6 +251,7 @@ def cmd_run(args) -> int:
         backend.close()
         gripper.close()
         arm.close()
+        _close_viewer(viewer)
         _stop_cameras(cameras)
     return 0
 
@@ -257,19 +296,24 @@ def cmd_teleop(args) -> int:
     from .teleop import JoystickDevice
     cfg = _load(args)
     pad = JoystickDevice(cfg.teleop.device).open()
+    cameras = _start_cameras(cfg) if args.view else {}
     arm, gripper = make_arm(cfg.robot), NoGripper()
+    viewer = None
     try:
+        viewer = _start_viewer(args, cameras, 'ur5vla teleop')
         arm.connect()
         gripper.connect()
         session = TeleopSession(cfg, arm, gripper, pad)
         print(f'teleop, {session.frame} frame: {_teleop_help(cfg)}', flush=True)
-        with KeyListener({' ': session.estop.set, 'e': session.estop.set, 'd': session.end_request.set}):
+        with _operator_keys(_episode_keys(session.estop, session.end_request), viewer):
             result = session.run_episode()
         print(f'teleop ended: {result.end_reason} {result.detail or ""} ({result.duration_s:.0f} s)')
     finally:
         gripper.close()
         arm.close()
         pad.close()
+        _close_viewer(viewer)
+        _stop_cameras(cameras)
     return 0
 
 
@@ -286,7 +330,9 @@ def cmd_demo(args) -> int:
     pad = JoystickDevice(cfg.teleop.device).open()
     cameras = _start_cameras(cfg)
     arm, gripper = make_arm(cfg.robot), NoGripper()
+    viewer = None
     try:
+        viewer = _start_viewer(args, cameras, f'ur5vla demo {run_name}')
         arm.connect()
         gripper.connect()
         session = TeleopSession(cfg, arm, gripper, pad)
@@ -299,7 +345,7 @@ def cmd_demo(args) -> int:
             recorder.start({'run': run_name, 'episode': ep, 'kind': 'demo', 'prompt': prompt,
                             'config_path': cfg.source, 'config': cfg.raw, 'dry_run': cfg.robot.dry_run})
             print(f'recording, {session.frame} frame: {_teleop_help(cfg)}', flush=True)
-            with KeyListener({' ': session.estop.set, 'e': session.estop.set, 'd': session.end_request.set}):
+            with _operator_keys(_episode_keys(session.estop, session.end_request), viewer):
                 result = session.run_episode(recorder, args.max_seconds or cfg.control.max_episode_s)
             print(f'demo {ep} ended: {result.end_reason} {result.detail or ""} ({result.duration_s:.1f} s)')
             outcome = {'result': dataclasses.asdict(result)}
@@ -314,6 +360,7 @@ def cmd_demo(args) -> int:
         gripper.close()
         arm.close()
         pad.close()
+        _close_viewer(viewer)
         _stop_cameras(cameras)
     return 0
 
@@ -328,7 +375,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('-v', '--verbose', action='store_true')
     sub = parser.add_subparsers(dest='cmd', required=True)
 
-    def add(name, fn, policy=False, dry=False):
+    def add(name, fn, policy=False, dry=False, view=False):
         p = sub.add_parser(name)
         p.add_argument('-c', '--config', required=True, help='cell config YAML')
         if policy:
@@ -336,15 +383,18 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument('--prompt', help='task prompt; overrides `prompt:` in the config')
         if dry:
             p.add_argument('--dry-run', action='store_true', help='simulated arm, no robot connection')
+        if view:
+            p.add_argument('--view', action='store_true', help='show every camera live in a window')
         p.set_defaults(fn=fn)
         return p
 
     add('state', cmd_state, dry=True)
-    p = add('cameras', cmd_cameras)
-    p.add_argument('--seconds', type=float, default=10.0)
+    p = add('cameras', cmd_cameras, view=True)
+    p.add_argument('--seconds', type=float,
+                   help='how long to report (default 10 s; with --view, until the window is closed)')
     p = add('policy-check', cmd_policy_check, policy=True, dry=True)
     p.add_argument('-n', type=int, default=5, help='number of inferences')
-    p = add('run', cmd_run, policy=True, dry=True)
+    p = add('run', cmd_run, policy=True, dry=True, view=True)
     p.add_argument('--episodes', type=int, default=1)
     p.add_argument('--max-seconds', type=float, help='overrides control.max_episode_s')
     p.add_argument('--tag', help='appended to the run directory name')
@@ -355,8 +405,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument('-c', '--config', help='cell config: also show what its teleop mapping makes of it')
     p.add_argument('--device', help='/dev/input/jsN (default: teleop.device, else the first found)')
     p.set_defaults(fn=cmd_gamepad)
-    add('teleop', cmd_teleop, dry=True)
-    p = add('demo', cmd_demo, dry=True)
+    add('teleop', cmd_teleop, dry=True, view=True)
+    p = add('demo', cmd_demo, dry=True, view=True)
     p.add_argument('--prompt', help='task prompt; overrides `prompt:` in the config')
     p.add_argument('--episodes', type=int, default=1)
     p.add_argument('--max-seconds', type=float, help='overrides control.max_episode_s')

@@ -56,8 +56,22 @@ These act without pressing Enter.
 | `d` | End the episode normally |
 | Ctrl-C | Same as e-stop |
 
+With `--view`, the same keys also work while the camera window has focus; Ctrl-C there is an
+e-stop too. Prompts that need Enter (starting an episode, labels) are answered in the terminal.
+
 The software e-stop is a convenience, not a safety-rated stop. Keep the pendant e-stop within
 reach.
+
+### Live camera window
+
+`cameras`, `run`, `teleop` and `demo` take `--view`. It opens a window showing every camera's
+latest frame side by side. Each caption gives the display rate and the frame's age; it turns red
+when a camera has sent no new frame for 0.5 s.
+
+- The window is a separate process, so drawing it doesn't slow the 125 Hz control loop.
+- Closing the window closes only the window; the run continues.
+- `teleop` doesn't otherwise use the cameras; with `--view` it starts them.
+- It needs the desktop session (`DISPLAY` set).
 
 ### Paths in commands
 
@@ -215,12 +229,13 @@ move the arm or disturb a pendant program. Twice a second until Ctrl-C, it print
 ### 3.3 Cameras
 
 ```bash
-ur5vla cameras -c configs/cell.yaml [--seconds 10]
+ur5vla cameras -c configs/cell.yaml [--seconds 10] [--view]
 ```
 
 | Option | Meaning |
 |---|---|
-| `--seconds` | How long to report (default 10) |
+| `--seconds` | How long to report (default 10; with `--view`, until the window is closed) |
+| `--view` | Also show the cameras live ([1](#live-camera-window)): use it to aim them |
 
 **Backend.**
 1. Builds each camera listed under `cameras:`:
@@ -296,11 +311,12 @@ No robot is involved.
 Drives the arm with the gamepad. Nothing is recorded.
 
 ```bash
-ur5vla teleop -c configs/cell.yaml [--dry-run]
+ur5vla teleop -c configs/cell.yaml [--view] [--dry-run]
 ```
 
 | Option | Meaning |
 |---|---|
+| `--view` | Start the cameras and show them live ([1](#live-camera-window)) |
 | `--dry-run` | Simulated arm; a real gamepad still drives it |
 
 **Backend.** Every 8 ms tick (`src/ur5vla/control/teleop.py`):
@@ -343,7 +359,7 @@ Drives the arm and records each demonstration.
 
 ```bash
 ur5vla demo -c configs/cell.yaml --prompt "pick up the red block" \
-    [--episodes 20] [--max-seconds 120] [--tag v1] [--dry-run] [-y]
+    [--episodes 20] [--max-seconds 120] [--tag v1] [--view] [--dry-run] [-y]
 ```
 
 | Option | Meaning |
@@ -352,6 +368,7 @@ ur5vla demo -c configs/cell.yaml --prompt "pick up the red block" \
 | `--episodes` | Number of demos (default 1) |
 | `--max-seconds` | Time limit per demo (default `control.max_episode_s`, 120) |
 | `--tag` | Appended to the run directory name |
+| `--view` | Show the cameras live ([1](#live-camera-window)) |
 | `--dry-run` | Simulated arm |
 | `-y` | No prompts: start demos at once, confirm start-pose moves, leave labels `unlabelled` |
 
@@ -619,7 +636,7 @@ Executes a policy on the arm.
 
 ```bash
 ur5vla run -c configs/cell.yaml -p configs/policy/<file>.yaml --prompt "..." \
-    [--episodes 10] [--max-seconds 120] [--tag A] [--dry-run] [-y]
+    [--episodes 10] [--max-seconds 120] [--tag A] [--view] [--dry-run] [-y]
 ```
 
 | Option | Meaning |
@@ -628,6 +645,7 @@ ur5vla run -c configs/cell.yaml -p configs/policy/<file>.yaml --prompt "..." \
 | `--episodes` | Default 1 |
 | `--max-seconds` | Time limit per episode (default `control.max_episode_s`) |
 | `--tag` | Appended to the run directory name |
+| `--view` | Show the cameras live ([1](#live-camera-window)) |
 | `--dry-run` | Simulated arm |
 | `-y` | No prompts: start-pose moves confirmed, outcomes left unlabelled |
 
@@ -929,6 +947,7 @@ converting them to absolute time.
 | `inference took … the arm will pause each cycle` | Latency ≥ `refill_fraction × chunk duration` | Raise `control.refill_fraction` |
 | `chunks arrive every … the arm will hold` | `safety.watchdog_max_s` below the expected gap | Raise or unset it, or raise `refill_fraction` |
 | An episode ends with `safety: step` right after starting | The first targets are far from the current pose (wrong policy or start pose) | `policy-check`: the step-0 distance should be small |
+| `--view needs a display` | No desktop session (`DISPLAY` unset), e.g. over SSH | Run from the desktop, or leave out `--view` |
 | `blocked by workspace` during teleop | The TCP reached the workspace box | Intended; drive back in, or adjust `safety.workspace_*_m` |
 | `servoJ refused`, or the arm won't move | Protective stop, or another control script running | Clear the stop on the pendant; stop any External Control program |
 | `overruns` > 0 in `meta.json` | Another process starved the 125 Hz loop | Avoid heavy work (model loading, training) on this PC during runs, or limit its threads |
