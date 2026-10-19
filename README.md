@@ -169,7 +169,7 @@ Default Xbox One mapping over USB (the `xpad` driver), all remappable in the `te
 
 ```bash
 ur5vla gamepad -c configs/cell.yaml        # live axis/button numbers + the twist they map to
-ur5vla teleop  -c configs/cell.yaml        # drive, nothing recorded
+ur5vla teleop  -c configs/cell.yaml        # position the arm, nothing recorded; prints start_q_deg
 ur5vla demo    -c configs/cell.yaml --prompt "pick up the red block" --episodes 20
 ```
 Add `--view` to `cameras`, `run`, `teleop` or `demo` for a live window of every camera.

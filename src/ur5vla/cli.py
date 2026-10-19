@@ -36,6 +36,7 @@ from .keys import KeyListener
 from .policy import build_backend
 from .recording import EpisodeRecorder
 from .robot import NoGripper, make_arm
+from .robot.kinematics import tool_point
 
 log = logging.getLogger('ur5vla')
 
@@ -125,6 +126,38 @@ def _operator_keys(bindings: dict, viewer):
     """Single-key commands from the terminal and, with --view, from the camera window."""
     with KeyListener(bindings), (contextlib.nullcontext() if viewer is None else viewer.keys(bindings)):
         yield
+
+
+def _pose_text(q: np.ndarray, tcp_offset_m) -> str:
+    """Joints, and the TCP point the workspace box is checked at (UR base frame)."""
+    x, y, z = tool_point(q, np.asarray(tcp_offset_m, dtype=float)) * 1000
+    return f"q [{' '.join(f'{v:7.1f}' for v in np.rad2deg(q))}] deg  tcp [{x:5.0f} {y:5.0f} {z:5.0f}] mm"
+
+
+@contextlib.contextmanager
+def _live_pose(session, tcp_offset_m):
+    """Redraw one terminal line with where the arm is, 5 times a second, while teleoperating."""
+    if not sys.stdout.isatty():
+        yield
+        return
+    stop = threading.Event()
+
+    def show():
+        while not stop.wait(0.2):
+            if session.state is not None:
+                # The cursor is left at the start of the line, so a log message overwrites it
+                # rather than being appended to it.
+                print(f'{_pose_text(session.state.q, tcp_offset_m)}  {session.frame:4} frame\r',
+                      end='', flush=True)
+
+    thread = threading.Thread(target=show, name='pose', daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
+        print('\x1b[K', end='', flush=True)    # clear it: the caller prints the final pose
 
 
 # ---- commands ----
@@ -304,10 +337,16 @@ def cmd_teleop(args) -> int:
         arm.connect()
         gripper.connect()
         session = TeleopSession(cfg, arm, gripper, pad)
+        tcp_offset = cfg.safety.tcp_offset_m
         print(f'teleop, {session.frame} frame: {_teleop_help(cfg)}', flush=True)
-        with _operator_keys(_episode_keys(session.estop, session.end_request), viewer):
+        with _operator_keys(_episode_keys(session.estop, session.end_request), viewer), \
+                _live_pose(session, tcp_offset):
             result = session.run_episode()
         print(f'teleop ended: {result.end_reason} {result.detail or ""} ({result.duration_s:.0f} s)')
+        q = arm.read_state().q
+        print(f'arm at {_pose_text(q, tcp_offset)}\n'
+              f'to start every episode here, set in the cell file under robot:\n'
+              f'  start_q_deg: {np.round(np.rad2deg(q), 2).tolist()}')
     finally:
         gripper.close()
         arm.close()

@@ -265,8 +265,9 @@ Run `ur5vla teleop -c configs/cell.yaml` ([4.2](#42-ur5vla-teleop)). On the firs
 - motion in both the base and the tool frame;
 - that the workspace box stops the arm where you expect.
 
-Then jog to a good start pose, read its joints with `ur5vla state` in a second terminal, and put
-them in `robot.start_q_deg`.
+Then jog to a good start pose and end with Menu or `d`. Teleop prints the pose as a
+`start_q_deg: [...]` line; paste it under `robot:` in the cell file. Add `--view` to watch the
+cameras while you position the arm.
 
 ### 3.6 First policy-free motion (milestone 1)
 
@@ -308,7 +309,7 @@ No robot is involved.
 
 ### 4.2 `ur5vla teleop`
 
-Drives the arm with the gamepad. Nothing is recorded.
+Drives the arm with the gamepad, to position it. Nothing is recorded.
 
 ```bash
 ur5vla teleop -c configs/cell.yaml [--view] [--dry-run]
@@ -338,6 +339,11 @@ ur5vla teleop -c configs/cell.yaml [--view] [--dry-run]
 6. **Stream the target** with `servoJ`, using the same call, rate, lookahead and gain as policy runs.
 
 **Ending.** Menu, `d`, e-stop, or any stop condition in step 2.
+
+**Output.**
+- While it runs, one terminal line shows the joints (degrees), the TCP point (mm, UR base frame,
+  at `safety.tcp_offset_m`: the point the workspace box checks) and the jog frame.
+- On exit, it prints the final pose and a `start_q_deg:` line to paste into the cell file.
 
 **Default controls** ([4.4](#44-teleop-settings)):
 

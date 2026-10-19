@@ -27,6 +27,7 @@ from ..config import RunConfig, TeleopConfig
 from ..robot.arm import Arm
 from ..robot.gripper import Gripper
 from ..robot.kinematics import fk, jacobian
+from ..types import RobotState
 from ..teleop.gamepad import EdgeDetector, GamepadState
 from .loop import Mode
 from .safety import SafetyLayer, Violation
@@ -98,6 +99,7 @@ class TeleopSession:
         self.safety = SafetyLayer(cfg.safety)
         self.jog = CartesianJogger(cfg.teleop, np.asarray(cfg.safety.tcp_offset_m))
         self.frame = cfg.teleop.frame
+        self.state: RobotState | None = None     # latest read by the execution thread, for display
         self.estop = threading.Event()
         self.end_request = threading.Event()
         if self.mapping.buttons.get('deadman') is None:
@@ -157,6 +159,7 @@ class TeleopSession:
                 now = time.monotonic()
                 state = self.arm.read_state()
                 state.gripper = self.gripper.position()
+                self.state = state
                 loop_dt = np.nan if t_prev is None else now - t_prev
                 t_prev = now
                 if loop_dt > 1.5 * period:

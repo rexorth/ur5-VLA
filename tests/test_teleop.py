@@ -161,3 +161,38 @@ def test_buttons_toggle_frame_and_end(tmp_path):
 def test_unplugged_controller_ends_the_session(tmp_path):
     result, _, _, _ = session(tmp_path, lambda t: pad(connected=t < 0.2), 2.0)
     assert result.end_reason == 'gamepad_lost'
+
+
+def test_teleop_command_shows_the_pose_records_nothing_and_prints_a_start_pose(tmp_path, monkeypatch, capsys):
+    import sys
+    from pathlib import Path
+
+    import yaml
+
+    from ur5vla import cli, teleop
+
+    class FakeDevice:
+        def __init__(self, device):     # stick up with LB held, then Menu (done) after 0.5 s
+            self.pad = ScriptedPad(lambda t: pad({1: -1.0}, buttons=[LB, MENU] if t > 0.5 else [LB]))
+
+        def open(self):
+            return self
+
+        def snapshot(self):
+            return self.pad.snapshot()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(teleop, 'JoystickDevice', FakeDevice)
+    monkeypatch.setattr(sys.stdout, 'isatty', lambda: True)     # so the live pose line is drawn
+    monkeypatch.chdir(tmp_path)
+    cell = Path(__file__).parents[1] / 'configs' / 'dry_run.yaml'
+    assert cli.main(['teleop', '-c', str(cell)]) == 0
+    out = capsys.readouterr().out
+    assert 'teleop ended: operator' in out
+    assert 'base frame\r' in out and 'deg  tcp [' in out                 # the live line
+    start = yaml.safe_load(out.rstrip().splitlines()[-1])['start_q_deg']
+    assert len(start) == 6 and all(isinstance(v, float) for v in start)
+    assert not (tmp_path / 'runs').exists()                             # nothing recorded
+
