@@ -195,6 +195,7 @@ class RunConfig:
 
 
 SECTIONS = ('robot', 'cameras', 'policy', 'control', 'safety', 'logging', 'teleop', 'prompt')
+ROTATIONS = (0, 90, 180, 270)       # cameras.<name>.rotate, degrees clockwise
 
 
 def parse(raw: dict[str, Any], source: str | None = None) -> RunConfig:
@@ -205,6 +206,9 @@ def parse(raw: dict[str, Any], source: str | None = None) -> RunConfig:
     for name, cam in cameras.items():
         if not isinstance(cam, dict) or 'type' not in cam:
             raise ConfigError(f'cameras.{name} needs a `type`')
+        if cam.get('rotate', 0) not in ROTATIONS:
+            raise ConfigError(f'cameras.{name}.rotate must be one of {ROTATIONS} (degrees clockwise), '
+                              f'got {cam["rotate"]!r}')
     policy = raw.get('policy') or {}
     if policy and 'backend' not in policy:
         raise ConfigError('policy.backend is required (openpi | lerobot | replay)')

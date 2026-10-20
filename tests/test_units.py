@@ -154,3 +154,20 @@ def test_unknown_keys_are_errors():
         config_mod.parse({'safety': {'max_stp_rad': 0.5}})
     with pytest.raises(ConfigError, match='lookahead'):
         config_mod.parse({'robot': {'servoj': {'lookahead': 0.5}}})
+
+
+def test_camera_rotate_turns_frames_clockwise_and_bad_values_are_errors():
+    from ur5vla.cameras import build_camera
+    from ur5vla.types import Frame
+    rgb = np.arange(2 * 3 * 3, dtype=np.uint8).reshape(2, 3, 3)    # 2 tall, 3 wide
+    depth = np.arange(6, dtype=np.float32).reshape(2, 3)
+    for deg, top_left_goes_to in ((90, (0, 1)), (180, (1, 2)), (270, (2, 0))):
+        cam = build_camera('base', {'type': 'synthetic', 'rotate': deg})
+        cam._publish(Frame(rgb, depth, 1.0, 7))
+        out = cam.latest()
+        assert out.rgb.shape == ((3, 2, 3) if deg != 180 else (2, 3, 3))
+        assert out.rgb.flags['C_CONTIGUOUS'] and (out.t_capture, out.seq) == (1.0, 7)
+        np.testing.assert_array_equal(out.rgb[top_left_goes_to], rgb[0, 0])
+        assert out.depth[top_left_goes_to] == depth[0, 0]
+    with pytest.raises(ConfigError, match='rotate'):
+        config_mod.parse({'cameras': {'base': {'type': 'synthetic', 'rotate': 45}}})

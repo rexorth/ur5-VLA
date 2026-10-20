@@ -11,10 +11,19 @@ robot:
   move_speed_deg_s: 20
   move_accel_deg_s2: 40
 
-# Which camera takes which role is still open (design doc); this follows the design's example.
+# Each camera is picked by its vendor ID, not a /dev/video node: OAKs have no video node, and node
+# numbers change between boots. null = the first one found (fine with one of each type). To list:
+#   realsense: rs-enumerate-devices -s   (the "Serial Number" column, not the /dev/v4l/by-id one)
+#   oak:       python -c "import depthai as dai; print([d.getDeviceId() for d in dai.Device.getAllAvailableDevices()])"
+# Both stream colour: RealSense its RGB sensor (rgb8), OAK the sensor on `socket` (CAM_A on an
+# OAK-D: the IMX378; CAM_B/CAM_C are the mono stereo pair). Close OAK Viewer first: one program
+# at a time can hold an OAK.
+# rotate (0/90/180/270, clockwise) turns a camera mounted on its side upright; with 90 or 270 the
+# frames are `width` tall. Fix it before recording demos: a model expects the view it was
+# trained on.
 cameras:
-  base:  {type: oak, device_id: null, width: 640, height: 480, fps: 30}
-  wrist: {type: realsense, serial: null, width: 640, height: 480, fps: 30}
+  base:  {type: oak, device_id: "14442C10F10E3BD400", width: 640, height: 480, fps: 30, rotate: 90}  # OAK-D, on its side
+  wrist: {type: realsense, serial: "234422064578", width: 640, height: 480, fps: 30}      # D415
 
 control:
   refill_fraction: 0.5        # ask for a chunk when half the last one is left

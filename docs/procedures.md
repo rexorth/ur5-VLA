@@ -248,6 +248,26 @@ ur5vla cameras -c configs/cell.yaml [--seconds 10] [--view]
 4. Once a second, prints per camera: measured fps, dropped frames (from the device's frame
    counter), age of the latest frame, and frame shape.
 
+**Choosing the cameras.** Each entry under `cameras:` names a role (`base`, `wrist`; policy
+files map these to the model's camera names) and a driver `type`. A camera is picked by its
+vendor ID, not by a `/dev/video` node: OAKs have none, and node numbers change between boots.
+
+| Type | ID key | How to list IDs | Stream |
+|---|---|---|---|
+| `realsense` | `serial` | `rs-enumerate-devices -s`, "Serial Number" column (not the number in `/dev/v4l/by-id`) | The RGB sensor, `rgb8` |
+| `oak` | `device_id` | `python -c "import depthai as dai; print([d.getDeviceId() for d in dai.Device.getAllAvailableDevices()])"` | The sensor on `socket` (default `CAM_A`: on an OAK-D the IMX378 colour camera), RGB on the device |
+| `mcu_uvc` | `device` | `v4l2-ctl --list-devices`; prefer a `/dev/v4l/by-id/...` path | UVC frames, converted to RGB |
+
+An ID of `null` takes the first device of that type, which is fine with one of each. Quote IDs
+(`"234422064578"`). Every driver delivers RGB at `width` × `height`; depth is off unless a
+RealSense sets `depth: true`.
+
+**`rotate`** (any type): `0`, `90`, `180` or `270` degrees clockwise, for a camera mounted on its
+side or upside down. Every frame is turned before anything uses it (control loop, recordings,
+policy, viewer). `width`/`height` stay the sensor's, so `90` and `270` give frames `width` tall.
+Settle the rotation and camera placement before recording demos and keep them for deployment:
+the model expects the view it was trained on.
+
 **Check.**
 - fps is close to the configured rate.
 - Drops stay at 0.
@@ -961,6 +981,7 @@ converting them to absolute time.
 | `inference took … the arm will pause each cycle` | Latency ≥ `refill_fraction × chunk duration` | Raise `control.refill_fraction` |
 | `chunks arrive every … the arm will hold` | `safety.watchdog_max_s` below the expected gap | Raise or unset it, or raise `refill_fraction` |
 | An episode ends with `safety: step` right after starting | The first targets are far from the current pose (wrong policy or start pose) | `policy-check`: the step-0 distance should be small |
+| An OAK isn't found, or `cameras` times out on it | Another program holds it (OAK Viewer, a second `ur5vla`) | Close that program; one at a time can use an OAK |
 | `--view needs a display` | No desktop session (`DISPLAY` unset), e.g. over SSH | Run from the desktop, or leave out `--view` |
 | `blocked by workspace` during teleop | The TCP reached the workspace box | Intended; drive back in, or adjust `safety.workspace_*_m` |
 | `servoJ refused`, or the arm won't move | Protective stop, or another control script running | Clear the stop on the pendant; stop any External Control program |

@@ -13,6 +13,8 @@ import time
 from abc import ABC, abstractmethod
 from collections import deque
 
+import numpy as np
+
 from ..types import CameraHealth, Frame
 
 log = logging.getLogger(__name__)
@@ -41,6 +43,8 @@ class ThreadedCamera(CameraSource):
     Subclasses implement _open(), _grab() and _close(). _grab() may block (with a timeout) and
     returns a Frame, or None if nothing arrived.
     """
+
+    rotate_deg = 0                  # clockwise; set from the camera's `rotate:` key
 
     def __init__(self, name: str):
         self.name = name
@@ -92,6 +96,11 @@ class ThreadedCamera(CameraSource):
         return CameraHealth(self.name, fps, drops, age, running)
 
     def _publish(self, frame: Frame) -> None:
+        if self.rotate_deg:
+            k = -self.rotate_deg // 90      # np.rot90 turns counter-clockwise for k > 0
+            frame = Frame(np.ascontiguousarray(np.rot90(frame.rgb, k)),
+                          None if frame.depth is None else np.ascontiguousarray(np.rot90(frame.depth, k)),
+                          frame.t_capture, frame.seq)
         with self._lock:
             if self._last_seq is not None and frame.seq > self._last_seq + 1:
                 self._drops += frame.seq - self._last_seq - 1
