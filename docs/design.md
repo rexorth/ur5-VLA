@@ -2,6 +2,9 @@
 
 Oct 16, 2026 · @Abhay
 
+> The original design. The code has since moved on in places (the watchdog, the gripper, the
+> camera roles); [architecture.md](architecture.md) describes how it works now.
+
 ## Goals and non-goals
 
 One control loop runs the CB3 UR5 under either an openpi or a LeRobot π₀.₅ policy, swapped by a config flag, so any difference in task success comes from the policy stack and not from the plumbing.

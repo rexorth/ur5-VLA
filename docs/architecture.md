@@ -1,11 +1,13 @@
 # How each part works
 
 One section per module or system: what it is, where it lives, how it is configured, and the
-behaviour that matters when you use or change it. [procedures.md](procedures.md) has the commands
-step by step; [design.md](design.md) has the reasoning behind the design.
+behaviour that matters when you use or change it. This is the one place for how things work. The
+commands, their options and what to check are in [procedures.md](procedures.md);
+[design.md](design.md) is the original design.
 
 | System | Code |
 |---|---|
+| [Environments](#environments) | `pyproject.toml`, `uv.lock` |
 | [Threads and processes](#threads-and-processes) | the whole program |
 | [Configuration](#configuration) | `config.py` |
 | [Robot arm](#robot-arm) | `robot/arm.py` |
@@ -23,9 +25,74 @@ step by step; [design.md](design.md) has the reasoning behind the design.
 | [Dataset conversion](#dataset-conversion) | `convert.py` |
 | [Command line](#command-line) | `cli.py` |
 
-Paths are relative to `src/ur5vla/`.
+Code paths are relative to `src/ur5vla/`. Cell files (`cell.yaml`, `dry_run.yaml`) and policy files
+(`policy/*.yaml`) are in `configs/`; tests are in `tests/`.
 
 ---
+
+## Environments
+
+Four Python environments, each with one job. They are separate because their dependencies
+conflict: openpi-client needs numpy < 2, LeRobot needs numpy ≥ 2, and each policy server pins its
+own stack. Creating them is in [procedures.md](procedures.md#2-one-time-setup).
+
+| Environment | Location | Runs | Use it with |
+|---|---|---|---|
+| `.venv-openpi` | this repo | `ur5vla` with the openpi client | `source .venv-openpi/bin/activate` |
+| `.venv-lerobot` | this repo | `ur5vla` with the LeRobot client; `to-lerobot` (dataset format v3.0) | `source .venv-lerobot/bin/activate` |
+| LeRobot server | `~/abhay_ws/lerobot/.venv` | the LeRobot policy server; `lerobot-train` | `source ~/abhay_ws/lerobot/.venv/bin/activate` |
+| openpi | `~/abhay_ws/openpi/.venv` | the openpi policy server; openpi training; dataset format v2.1 | `cd ~/abhay_ws/openpi`, then prefix each command with `uv run` |
+
+- **Which repo venv: pick it by the policy file.** `-p configs/policy/openpi*.yaml` needs
+  `.venv-openpi`; `-p configs/policy/lerobot*.yaml` needs `.venv-lerobot`. Everything else
+  (`state`, `cameras`, `gripper`, `gamepad`, `teleop`, `demo`, and runs with `replay_sine.yaml`)
+  behaves the same in either. In the wrong venv, the run fails at connect with
+  `No module named 'openpi_client'` or `No module named 'lerobot'`.
+- **Activating, or running by path.** These are equivalent; activating saves typing:
+
+  ```bash
+  cd ~/abhay_ws/ur5-VLA
+  source .venv-lerobot/bin/activate          # in this shell, `ur5vla` and `python` are this venv's
+  ur5vla policy-check -c configs/cell.yaml -p configs/policy/lerobot.yaml
+  deactivate                                 # back to the system Python
+
+  .venv-lerobot/bin/ur5vla policy-check -c configs/cell.yaml -p configs/policy/lerobot.yaml   # no activation
+  ```
+
+  `uv sync` puts a `ur5vla` command in each venv's `bin/`, tied to that venv's Python. This repo is
+  installed in editable mode, so code changes apply without reinstalling.
+- **A policy session is two terminals,** the server in its environment and `ur5vla` in the
+  matching repo venv. Full server commands are in
+  [procedures.md](procedures.md#6-inference).
+
+  ```bash
+  # LeRobot. Terminal 1, the server:
+  source ~/abhay_ws/lerobot/.venv/bin/activate
+  python -m lerobot.async_inference.policy_server --host=127.0.0.1 --port=8080 --fps=15
+  # Terminal 2, the robot:
+  cd ~/abhay_ws/ur5-VLA && source .venv-lerobot/bin/activate
+  ur5vla run -c configs/cell.yaml -p configs/policy/lerobot_ur5_finetuned.yaml --prompt "..."
+
+  # openpi. Terminal 1, the server (openpi's own uv project, no activation):
+  cd ~/abhay_ws/openpi
+  uv run scripts/serve_policy.py policy:checkpoint --policy.config=<config> --policy.dir=<checkpoint>
+  # Terminal 2, the robot:
+  cd ~/abhay_ws/ur5-VLA && source .venv-openpi/bin/activate
+  ur5vla run -c configs/cell.yaml -p configs/policy/openpi_ur5_finetuned.yaml --prompt "..."
+  ```
+- **One venv per shell.** Activating another replaces the first. The prompt shows the active one
+  (`(.venv-lerobot)`), and so does `echo $VIRTUAL_ENV`.
+- **Don't use `uv run` or a bare `uv sync` in this repo.** Without `UV_PROJECT_ENVIRONMENT`, uv
+  uses a third `.venv`, without the policy clients, and syncs it. `uv run` is right only inside
+  `~/abhay_ws/openpi`, where it uses openpi's environment.
+- **`uv sync` is exact.** It makes the venv match `uv.lock` and removes anything installed by hand.
+  Add a dependency to `pyproject.toml` instead, or sync with `--inexact`.
+- **How the two repo venvs are built.** One `uv.lock` resolves both: the `openpi` and `lerobot`
+  extras are declared conflicting, so each goes in its own venv. Python is 3.12, the newest
+  ur_rtde has wheels for. openpi-client comes from Physical Intelligence's git repo, pinned to
+  commit `215abfb` (the PyPI package of that name lists no maintainer). `.venv-lerobot` gets
+  CPU-only torch, because the client only unpickles action tensors and encodes video; it also gets
+  LeRobot's dataset libraries.
 
 ## Threads and processes
 
@@ -59,7 +126,10 @@ also: recorder (1 poll + 2 writer threads), key listener thread, camera window (
 
 `config.py` turns one YAML cell file into a `RunConfig`: `robot`, `cameras`, `policy`, `control`,
 `safety`, `logging`, `teleop`, `gripper` and `prompt`. `-p <policy file>` replaces only the
-`policy:` block, so an openpi run and a LeRobot run share every other setting.
+`policy:` block, so an openpi run and a LeRobot run share every other setting. The keys of each
+block are listed in procedures.md: [safety](procedures.md#25-safety-settings-to-set-before-the-arm-moves),
+[gripper](procedures.md#34-gripper), [teleop](procedures.md#44-teleop-settings),
+[policy files](procedures.md#63-policy-files) and [timing](procedures.md#66-timing-settings).
 
 - **Unknown keys are errors.** Each section is built with `from_dict`, which rejects keys the
   dataclass doesn't declare, so a typo in a safety limit fails at load time instead of silently
@@ -69,8 +139,8 @@ also: recorder (1 poll + 2 writer threads), key listener thread, camera window (
   with min < max, camera `rotate` in 0/90/180/270, gripper speed and force in [0, 1].
 - **Cameras and the policy stay plain dicts here.** Each driver and backend validates its own keys
   the same way when it is built, so a key meant for a different driver is also an error.
-- **Saved with every episode.** The config as loaded (`raw`) and its source path go into each
-  episode's `meta.json`.
+- **Saved with every episode.** The config as loaded and its source path go into each episode's
+  `meta.json`.
 - **`--dry-run`** sets `robot.dry_run`, which swaps in the simulated arm and the simulated gripper.
 
 ## Robot arm
@@ -114,14 +184,8 @@ real arm or the simulated one, from `robot.dry_run`.
 ## Gripper
 
 `robot/gripper.py` holds the `Gripper` interface and the simple grippers; `robot/robotiq.py` holds
-the Robotiq 2F-85 driver. Configured in the `gripper:` block; bring-up in
+the Robotiq 2F-85 driver. Commands, setup and settings are in
 [procedures.md](procedures.md#34-gripper).
-
-```bash
-ur5vla gripper -c configs/cell.yaml              # watch the status, read-only
-ur5vla gripper -c configs/cell.yaml --activate   # activate if needed: the fingers open and close fully
-ur5vla gripper -c configs/cell.yaml --close      # or --open, --to 0.5
-```
 
 - **Interface.** `connect(read_only)`, `close`, `position`, `command`, `fault` and `status_text`.
   The loop and teleop call `position`, `command` and `fault` every tick, so none of them may
@@ -156,7 +220,8 @@ ur5vla gripper -c configs/cell.yaml --close      # or --open, --to 0.5
 
 `cameras/`. Every camera is a `CameraSource` with its own capture thread, exposing only its latest
 frame. Configured under `cameras:`, one entry per role (`base`, `wrist`); policy files map roles to
-the model's camera names. Setup in [procedures.md](procedures.md#33-cameras).
+the model's camera names. Finding device IDs and checking the cameras:
+[procedures.md](procedures.md#33-cameras).
 
 | Type | Library | Picked by | What it delivers |
 |---|---|---|---|
@@ -178,7 +243,7 @@ the model's camera names. Setup in [procedures.md](procedures.md#33-cameras).
   OAK timestamps are already on the host's steady clock. UVC gives no capture time, so arrival time
   is used and `seq` is counted locally (drops are invisible).
 - **Picked by vendor ID**, not `/dev/video` nodes: OAKs have none, and node numbers change between
-  boots. `null` takes the first device of that type.
+  boots. `null` takes the first device of that type. One program at a time can hold an OAK.
 - **`rotate`** (0/90/180/270, clockwise) turns every frame, and its depth, as it is published, so
   the loop, recorder, policy and viewer all see the turned frame. Sensor `width`/`height` are
   unchanged, so 90 and 270 give frames `width` tall.
@@ -192,7 +257,8 @@ the model's camera names. Setup in [procedures.md](procedures.md#33-cameras).
 ## Live camera window
 
 `viewer.py`. `--view` on `cameras`, `run`, `teleop` and `demo` opens a window with every camera's
-latest frame side by side.
+latest frame side by side. `teleop` doesn't otherwise use the cameras; with `--view` it starts
+them.
 
 - **A separate process.** The window is a spawned (not forked) process running Tk, so drawing never
   competes with the execution thread for the GIL. The headless OpenCV in both venvs can't open
@@ -204,8 +270,8 @@ latest frame side by side.
   the frame's age, and turns red when a camera has sent no new frame for 0.5 s. A text panel under
   the images shows the controller legend and the pose during teleop and demos.
 - **Keys work in the window.** While an episode runs, keys pressed in the window are sent back and
-  act as in the terminal (space/`e` e-stop, `d` done; Ctrl-C there is an e-stop too), so the e-stop
-  key works whichever window has focus. Prompts that need Enter stay in the terminal.
+  act as in the terminal; Ctrl-C there is an e-stop too. So the e-stop key works whichever window
+  has focus.
 - **Closing the window** closes only the window; the run continues.
 - **Shutdown.** The run closes the pipe and the window exits on its own. A window that has stopped
   reading is terminated, so it can't hold up the end of a run. The window ignores Ctrl-C in the
@@ -215,9 +281,8 @@ latest frame side by side.
 ## Policy backends
 
 `policy/`. The loop talks to one `PolicyBackend` interface. Each adapter owns its transport, key
-names and unit conversion; the server applies its own checkpoint's normalisation. Configured by the
-policy file (`-p`); `backend` picks the adapter. Commands in
-[procedures.md](procedures.md#6-inference).
+names and unit conversion; the server applies its own checkpoint's normalisation. The policy file
+(`-p`) configures it, and `backend` picks the adapter.
 
 - **Interface.** `connect()` returns a `PolicyInfo` (chunk length, action spacing, which cameras the
   policy needs); `infer(observation)` returns an `ActionChunk`; `reset()` starts an episode;
@@ -226,38 +291,47 @@ policy file (`-p`); `backend` picks the adapter. Commands in
 - **One output form.** Every `ActionChunk` holds absolute joint targets in radians (H×6), a gripper
   value per step (0 open … 1 closed), the step spacing `dt`, and `t_obs`, the time of the
   observation it answers.
+- **What a checkpoint must output:** this robot's joint positions in its joint order
+  (shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3), then the gripper; absolute, or
+  offsets from the observed joints with `action_mode: delta`. If it doesn't, `policy-check` shows
+  the first step landing far from the current pose.
 - **`ActionMapping`** converts a policy's action vector to that form: `action_mode: delta` adds the
   observed joints; `gripper_open`/`gripper_closed` map the policy's gripper values to 0…1 (and the
   measured gripper back, for the state); `gripper_index` is the action column holding the gripper.
 - **Lazy imports.** Backends are built by name and imported on first use, because openpi-client and
-  LeRobot live in different venvs.
+  LeRobot live in different venvs ([Environments](#environments)).
 
 **openpi** (`policy/openpi.py`), against openpi's `serve_policy.py` over a msgpack websocket.
 
-- **Keys.** The request uses the keys the checkpoint's training config repacks from: each camera
-  under `image_key` with its `camera_map` name, the joints under `state_key`, the gripper under
-  `gripper_key` (or appended to the state with `include_gripper_state`), and `prompt`.
-  `state_dim` zero-pads the state; `chunk_len` keeps only the first N actions.
+- **Keys.** The request must use the names the checkpoint's input transform reads: each camera
+  under `image_key` with its `camera_map` name, the joints under `state_key` (with the gripper
+  appended if `include_gripper_state`), the gripper under `gripper_key`, and `prompt`. openpi
+  applies its key renaming (`RepackTransform`) only during training, so live requests must
+  already use those names.
 - **Images** are letterboxed to 224×224 with openpi-client's own `resize_with_pad`.
 - **Own connection.** The websocket is opened here, not through openpi-client's
   `WebsocketClientPolicy`, which waits forever for the server and for each reply. openpi-client
   still does the encoding, so the bytes on the wire are the same.
 - **Timeouts.** Each call has `timeout_s`; the first gets `warmup_timeout_s` (300 s), because the
-  server compiles the model then. `connect()` keeps retrying for `wait_for_server_s` while the
-  server loads.
+  server JIT-compiles the model then, for tens of seconds. `connect()` keeps retrying for
+  `wait_for_server_s` while the server loads.
 - **Failures reconnect.** Any failed or timed-out call closes the connection and the next call
   opens a new one, so a late reply can't be taken as the answer to a newer request. A text reply
   is the server's traceback, raised as an error.
+- **On the server,** each request goes through the training config's input transforms (state
+  padding, image resizing with padding, tokenization), normalization, the model, unnormalization
+  and the output transforms (for example deltas back to absolute joints).
 
 **LeRobot** (`policy/lerobot.py`), against LeRobot's async policy server over gRPC.
 
 - **Only LeRobot's stubs.** Chunk timing and blending stay in our loop rather than LeRobot's robot
   client, so execution is identical to openpi runs.
-- **The run chooses the model.** The first `infer()` sends the policy instructions:
-  `policy_type`, `pretrained_name_or_path` (a path on the server's machine, or a Hub id), the
-  state and image features, `actions_per_chunk` and the device. The server loads that model then,
-  within `load_timeout_s` (600 s). They go with the first call because the image shapes are known
-  only once frames exist.
+- **The run chooses the model.** The server starts with no model. The first `infer()` sends the
+  policy instructions: `policy_type`, `pretrained_name_or_path` (a path on the server's machine, or
+  a Hub id), the state and image features, `actions_per_chunk` and the device. The server loads
+  that checkpoint with its pre- and post-processors (normalization statistics, tokenizer), within
+  `load_timeout_s` (600 s). The instructions go with the first call because the image shapes are
+  known only once frames exist.
 - **Observation.** `<joint>.pos` for the six joints (plus `gripper.pos` with
   `include_gripper_state`), each camera under its `camera_map` name, and the prompt as the task. The
   names match what `to-lerobot` writes, so a model fine-tuned on this cell's data gets what it
@@ -267,28 +341,31 @@ policy file (`-p`); `backend` picks the adapter. Commands in
 - **Images** go at native resolution by default. The server resizes them to the checkpoint's image
   shape by stretching; for a checkpoint fine-tuned on this cell's recordings that is the recorded
   shape, so nothing changes.
+- **On the server,** each request: the pickled observation arrives; images are resized; the
+  preprocessor normalizes the state and tokenizes the prompt; the policy predicts a chunk; the
+  postprocessor unnormalizes it; the chunk goes back pickled, one timestamp per action.
 - **Checks.** Each returned chunk must answer the observation just sent (by timestep). The action
   spacing comes from `action_hz`; a warning is logged once if the server's `--fps` differs.
 - **Between episodes** `reset()` calls `Ready()`, which flushes the server's queue but keeps the
   loaded policy.
-- **Each command reloads the model.** Every new `ur5vla` process sends the instructions again. On a
-  12 GB GPU, restart the server between commands: it builds the new copy on the GPU before
-  releasing the old one.
-- **Trusted server only.** The wire format is pickle.
+- **Each command reloads the model.** Every new `ur5vla` process sends the instructions again, and
+  the server builds the new copy on the GPU before releasing the old one. On a 12 GB GPU the two
+  copies don't fit, hence the restart in [procedures.md](procedures.md#61-start-the-lerobot-server).
+- **Trusted server only.** The wire format is pickle, and the client and server must run the same
+  LeRobot version.
 
 **Replay** (`policy/replay.py`), with no server and no GPU.
 
 - **Sine** (no `episode`): a slow sinusoid on one joint around wherever the arm was at the first
-  inference. The defaults move wrist 3 by ±5° over 4 s. `latency_s` fakes inference time, so the
-  asynchronous path is exercised.
+  inference. The defaults move wrist 3 by ±5° over 4 s (about 8°/s at peak). `latency_s` fakes
+  inference time, so the asynchronous path is exercised.
 - **Episode:** a recorded episode's chunks in order, re-timed to the current observation, then
   `PolicyDone`. The targets are absolute, so start from the recorded start pose.
 
 ## Control loop
 
 `control/loop.py`. One episode is two threads sharing a chunk buffer. The calling thread only
-watches for the end. Tuned by `control:` and `safety:`; timing behaviour is summarised in the
-README under "Behaviour worth knowing".
+watches for the end. Tuned by `control:` and `safety:`.
 
 - **Episode start.** Read the state, tare the force reading, reset the buffer to the current pose
   (so the first chunk crossfades from where the arm is), and reset the backend. `warmup()` runs one
@@ -305,25 +382,31 @@ README under "Behaviour worth knowing".
   6. log the tick, and sleep out the rest of the period.
 - **Modes.** IDLE (no trajectory yet), SERVO, HOLD and STOPPED. A **hold** calls servoStop, resets
   the buffer to the current pose and resumes by itself when fresh frames and a chunk arrive. A
-  **stop** calls servoStop and ends the episode.
+  **stop** calls servoStop and ends the episode. Steps are never clipped to stay within a limit.
 - **Inference thread.** Asks for the next chunk when less than `refill_fraction` of the last
   chunk's duration is left (the first one at once). It builds the observation from the execution
   thread's latest state and each policy camera's latest frame. If any frame is older than
   `max_frame_age_s`, the observation is stale: no request goes out, and the execution thread
   holds.
+- **Refill timing.** Chunks therefore arrive about every (1 − `refill_fraction`) × chunk duration.
+  Latency shifts the arrivals but not their spacing; only latency jitter adds to it. Latency must
+  stay below `refill_fraction` × chunk duration, or the trajectory runs out before the next chunk
+  lands and the arm pauses each cycle.
+- **Watchdog.** When a chunk lands, the next is expected after
+  max((1 − `refill_fraction`) × chunk duration, the last inference time). The arm holds if none
+  arrives within `watchdog_factor` (1.5) × that, so a healthy server never trips it, whatever the
+  chunk length, and the arm moves at most about 1.5 replanning intervals without a fresh chunk.
+  `watchdog_max_s` adds an optional hard cap; below the expected gap, the arm holds between
+  healthy chunks.
+- **Timing warnings.** On the first chunk, the loop warns once if latency exceeds the refill lead
+  or the cap is below the expected gap.
 - **Policy errors** are retried with backoff (0.2, 0.4, … 2 s); after a run of errors the watchdog
   holds the arm. Calls are serialized, and a call still running when an episode ends is
   discarded, not executed in the next one.
-- **Watchdog.** When a chunk lands, the next is expected after
-  max((1 − `refill_fraction`) × chunk duration, the last inference time). The arm holds if none
-  arrives within `watchdog_factor` (1.5) × that, capped by `watchdog_max_s` if set. The loop warns
-  once if the settings can't keep up (latency longer than the refill lead, or a cap below the
-  expected gap).
 - **Every chunk is logged** with its observation time, request and receive times, latency,
   targets, whether it was accepted, and the sequence numbers of the frames it saw.
-- **Ending.** `d` (operator), `max_episode_s` (timeout), Ctrl-C or space/`e` (e-stop),
-  `PolicyDone`, a safety stop, or an error. The result carries the reason, the chunk count, holds,
-  overruns, and mean and p95 latency.
+- **Result.** The end reason (`operator`, `timeout`, `estop`, `policy_done`, `safety`, `error`),
+  the chunk count, holds, overruns, and mean and p95 latency.
 
 ## Chunk buffer
 
@@ -346,8 +429,8 @@ into it. The same merge runs for every backend.
 ## Safety layer
 
 `control/safety.py`. The checks run in the execution thread before every command, in policy runs
-and teleop alike. Configured under `safety:`; set the limits per task before the arm moves
-([procedures.md](procedures.md#25-safety-settings-to-set-before-the-arm-moves)).
+and teleop alike. Configured under `safety:`; what to set before the arm moves is in
+[procedures.md](procedures.md#25-safety-settings-to-set-before-the-arm-moves).
 
 - **State checks:** the robot's own protective or emergency stop, and the force limit
   (`ft_limit_n` on |F| after a tare at the start of each episode).
@@ -365,19 +448,18 @@ and teleop alike. Configured under `safety:`; set the limits per task before the
 ## Gamepad and teleop
 
 `teleop/gamepad.py` reads the controller and maps it; `control/teleop.py` turns it into arm motion.
-Configured under `teleop:`; commands in
+Configured under `teleop:`. Using it, the controls and the legend:
 [procedures.md](procedures.md#4-teleoperation-and-demonstrations).
 
 - **Reading.** The Linux joystick device (`/dev/input/js*`), with no extra library. A thread reads
   events; the kernel replays the full state when the device opens. Axes are scaled to −1…1.
   Unplugging is detected, and ends the session as `gamepad_lost`.
 - **Mapping.** Each robot axis (x, y, z and rotations about x, y, z) is a sum of terms, clipped to
-  −1…1: a stick axis, a trigger (resting at −1, read as 0…1) or a button, each with an optional
-  sign. Stick axes get a deadzone, and the sum a response curve (|x|^`curve`), finer near the
-  centre. Buttons have roles: deadman, slow, frame toggle and done; the gripper has its own terms.
-- **Legend.** Built from the mapping: which control moves along or rotates about each axis (roll
-  about x, tilt about y, yaw about z), which way is +, and what x y z mean in the current frame.
-  Printed at the start of `teleop` and `demo`, and shown in the camera window with `--view`.
+  −1…1: stick axes, triggers or buttons, each with an optional sign (the syntax is in
+  [procedures.md](procedures.md#44-teleop-settings)). Stick axes get a deadzone, and the sum a
+  response curve (|x|^`curve`), finer near the centre. Buttons have roles: deadman, slow, frame
+  toggle and done; the gripper has its own terms.
+- **Legend.** `GamepadMapping.legend()` writes it from the mapping, so it follows any remapping.
 - **Jogging, every 8 ms:**
   1. The deadman gates motion; releasing it stops the arm at once.
   2. The mapped twist is scaled by the maximum speeds (or `slow_scale`), then ramped by the
@@ -387,47 +469,44 @@ Configured under `teleop:`; commands in
   4. Damped least squares on the Jacobian of the TCP turns it into a joint step:
      dq = Jᵀ(JJᵀ + λ²I)⁻¹ ξ dt, which stays bounded near singularities. A step faster than
      `max_joint_speed_deg_s` is scaled down.
-  5. The safety layer checks the step. A refused step isn't taken: the arm stops at the wall and
-     can be driven back out.
+  5. The safety layer checks the step. A refused step isn't taken and a `blocked` event is logged:
+     the arm stops at the wall and can be driven back out.
   6. servoJ streams the target, with the same call, rate, lookahead and gain as policy runs.
 - **Gripper.** While A or B is held, the gripper target ramps at `gripper_speed`.
-- **Ending.** Menu or `d`; a robot stop, the e-stop, a gripper fault or an unplugged controller
-  also end it.
-- **Positioning.** `teleop` shows a live pose line (joints, and the TCP the workspace box checks)
-  and prints a `start_q_deg:` line on exit, to paste into the cell file. Nothing is recorded.
+- **Display.** The session publishes its latest robot state; `teleop` draws its live pose line
+  from it, and with `--view` the window shows the legend and the pose.
 - **Demonstrations.** `demo` runs the same session with a recorder: every tick logs the measured
   state and the commanded target, which becomes the demonstration's action.
 
 ## Operator keys
 
-`keys.py`. Single-key commands while an episode runs, without Enter.
+`keys.py`. Single-key commands while an episode runs; the keys are listed in
+[procedures.md](procedures.md#keys-during-run-teleop-and-demo).
 
-- **Keys.** Space or `e` is the software e-stop; `d` ends the episode normally. The terminal is in
-  cbreak mode only during the episode, so Ctrl-C still raises an interrupt, which is also treated
-  as an e-stop.
+- **Terminal mode.** The terminal is in cbreak mode only during the episode, so keys act without
+  Enter while Ctrl-C still raises an interrupt, which the loop treats as an e-stop.
 - **No terminal, no keys.** If stdin isn't a terminal, the keys are off (with a warning); Ctrl-C
   still stops.
-- **With `--view`**, the camera window forwards the same keys.
-- **A convenience, not a safety-rated stop.** The pendant e-stop is the real one.
+- **With `--view`**, the camera window forwards the same keys ([Live camera window](#live-camera-window)).
 
 ## Recording
 
 `recording.py`. Every episode, policy run or demonstration, is written to
-`runs/<time>_<backend or demo>[_<tag>]/ep_NNN/`:
+`runs/<YYYYmmdd-HHMMSS>_<backend or demo>[_<tag>]/ep_NNN/`:
 
 | File | Contents |
 |---|---|
-| `meta.json` | The config as loaded, prompt, policy info, git commit, clock anchor, outcome and counts |
-| `ticks.npz` | Every execution tick: time, joints, joint speeds, TCP pose, wrench, gripper, the command sent, the loop mode, the tick length |
-| `chunks.jsonl` | Every chunk: observation time, latency, targets, and the frames it saw |
+| `meta.json` | Kind (`demo` or `rollout`), prompt, the config as loaded, policy info, git commit, clock anchor, outcome (label, result, interventions, note) and counts |
+| `ticks.npz` | Every execution tick: `t`, `q`, `qd`, `tcp_pose`, `wrench`, `gripper`, `q_cmd`, `g_cmd`, `mode`, `loop_dt` |
+| `chunks.jsonl` | Every chunk: observation time, latency, targets, merge result, and the frames it saw |
 | `events.jsonl` | Holds, resumes, stale and fresh cameras, policy errors, timing warnings, safety stops, the end; in teleop also the deadman, frame changes and blocked steps |
-| `cameras/<name>/` | Native-resolution frames (JPEG by default), depth as millimetre PNGs, and `index.csv` |
+| `cameras/<name>/` | Native-resolution frames (JPEG by default), depth as millimetre PNGs, and `index.csv` (sequence number, capture time, file paths) |
 
 - **Never blocks the loop.** A tick is one list append; chunks and events are single JSON lines.
   Frames are picked up from each camera's latest slot by a poll thread and encoded by two writer
   threads through a queue. If the disk falls behind, frames are dropped from the recording and
   counted (`frames_dropped_by_recorder`), never queued against the loop.
-- **Ticks without a command** (holds, before the first chunk) are stored as NaN.
+- **Ticks without a command** (holds, before the first chunk) store NaN in `q_cmd` and `g_cmd`.
 - **Absolute time.** All times are host monotonic seconds; `meta.json` stores one (monotonic,
   wall-clock) pair to place them.
 - **Reproducible.** The git commit is stored, with `-dirty` if the tree had uncommitted changes.
@@ -436,7 +515,8 @@ Configured under `teleop:`; commands in
 ## Dataset conversion
 
 `convert.py`, run as `ur5vla to-lerobot`. Turns recorded episodes into a LeRobot dataset for
-fine-tuning either stack. Commands in [procedures.md](procedures.md#5-datasets).
+fine-tuning either stack. The command and its options:
+[procedures.md](procedures.md#5-datasets).
 
 - **Which episodes.** By outcome label (default `success`) and kind (default `demo`).
 - **Frames** at `--fps` (the policy's `action_hz`), from the first to the last tick that sent a
@@ -447,19 +527,23 @@ fine-tuning either stack. Commands in [procedures.md](procedures.md#5-datasets).
   - `observation.images.<camera>`: the latest frame captured at or before it, at native
     resolution;
   - `task`: the episode's prompt.
-- **Names match inference.** Feature names (`shoulder_pan.pos`, …, `gripper.pos`) are the ones the
-  LeRobot adapter sends, so a model trained on the dataset expects what this repo sends.
-  `--camera base=front` renames a camera.
+- **Names match inference.** `observation.state` and `action` are `shoulder_pan.pos`,
+  `shoulder_lift.pos`, `elbow.pos`, `wrist_1.pos`, `wrist_2.pos`, `wrist_3.pos` and `gripper.pos`
+  (the six joints only with `--no-gripper`). These are the names the LeRobot adapter sends, so a
+  model trained on the dataset expects what this repo sends.
+- **Written by LeRobot itself** (`LeRobotDataset.create` → `add_frame` → `save_episode` →
+  `finalize`): parquet data, AV1 video encoded with PyAV (or images with `--images`), and
+  statistics including the q01/q99 quantiles that π₀.₅'s default normalization needs.
 - **Staleness check.** It reports the oldest image used per camera and warns if one was more than
   two frames old, which points to a camera dropping frames.
 - **Format follows the environment.** LeRobot 0.6 writes dataset format v3.0; the older LeRobot
-  pinned by openpi writes v2.1, which openpi trains from. Frames are stored as video unless
-  `--images`.
+  pinned by openpi writes v2.1, which openpi trains from. LeRobot converts v2.1 to v3.0 but not
+  back, so v2.1 datasets are written by running the converter in openpi's environment.
 
 ## Command line
 
-`cli.py` builds the pieces above from the config and runs one command. Full options in
-[procedures.md](procedures.md).
+`cli.py` builds the pieces above from the config and runs one command. Every command, its options
+and its flow around episodes are in [procedures.md](procedures.md).
 
 | Command | Uses | Moves the arm |
 |---|---|---|
@@ -473,11 +557,5 @@ fine-tuning either stack. Commands in [procedures.md](procedures.md#5-datasets).
 | `demo [--view]` | arm, gripper, controller, cameras, recorder | Yes, recorded |
 | `to-lerobot` | recordings | No |
 
-- **Start pose.** Before each episode of `run` and `demo`, if `robot.start_q_deg` is set, it shows
-  the current and start joints, asks, and moveJs there at `move_speed_deg_s`. `-y` confirms
-  without asking.
-- **Around each episode.** It waits for Enter before starting (`q` quits). After a normal end it
-  asks for the outcome label (and, for `run`, the intervention count) and a note; after an e-stop
-  or a fault it saves the episode without asking.
 - **Shutdown order.** Backend, gripper and arm are closed first, then the window and the cameras,
   so nothing slow can delay stopping the arm.

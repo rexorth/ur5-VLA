@@ -1,9 +1,9 @@
 # UR5-VLA operating procedures
 
 Commands for bring-up, teleoperation and demonstrations, datasets, inference and fine-tuning. Each
-entry gives the command, its options, and what it does underneath.
-[architecture.md](architecture.md) explains how each module works; [design.md](design.md) covers
-the reasoning behind it.
+entry gives the command, its options, and what to check. How things work underneath, including
+which environment runs what, is in [architecture.md](architecture.md); [design.md](design.md) is
+the original design.
 
 1. [Conventions](#1-conventions)
 2. [One-time setup](#2-one-time-setup)
@@ -20,27 +20,16 @@ the reasoning behind it.
 
 ### Environments
 
-There are four Python environments, each with one job. Run a tool with its environment's
-interpreter, either by activating it (`source <venv>/bin/activate`) or by path
-(`.venv-lerobot/bin/ur5vla …`).
-
-| Environment | Location | Use it for |
-|---|---|---|
-| `.venv-openpi` | this repo | any `ur5vla` command; the openpi client |
-| `.venv-lerobot` | this repo | any `ur5vla` command; the LeRobot client; `to-lerobot` (dataset format v3.0) |
-| LeRobot server | `~/abhay_ws/lerobot/.venv` | the LeRobot policy server; `lerobot-train` |
-| openpi | `~/abhay_ws/openpi/.venv` (uv) | the openpi policy server; openpi training; dataset format v2.1 |
-
-Robot, camera, teleop and recording commands behave identically in both repo venvs; only the
-policy client differs. The two repo venvs exist because openpi-client needs numpy < 2 and LeRobot
-needs numpy ≥ 2.
+`ur5vla` runs from this repo's `.venv-openpi` or `.venv-lerobot`, picked by the policy file's
+backend; the policy servers and training run from their own environments. Which environment runs
+what, and how to activate each: [architecture.md](architecture.md#environments). Commands below
+name the environment only where it matters.
 
 ### Config files
 
 - **Cell file** (`-c configs/cell.yaml`): robot, cameras, control, safety, teleop and logging.
 - **Policy file** (`-p configs/policy/<name>.yaml`): used by the policy commands. It replaces the
   cell file's `policy:` block, so an openpi run and a LeRobot run can't differ in anything else.
-- **Unknown keys are errors**, so a typo in a safety limit can't silently fall back to a default.
 - **`configs/dry_run.yaml`** is a cell file with a simulated arm and synthetic cameras.
 
 ### Global option
@@ -57,22 +46,11 @@ These act without pressing Enter.
 | `d` | End the episode normally |
 | Ctrl-C | Same as e-stop |
 
-With `--view`, the same keys also work while the camera window has focus; Ctrl-C there is an
-e-stop too. Prompts that need Enter (starting an episode, labels) are answered in the terminal.
+With `--view` the keys also work in the camera window. Prompts that need Enter (starting an
+episode, labels) are answered in the terminal.
 
 The software e-stop is a convenience, not a safety-rated stop. Keep the pendant e-stop within
 reach.
-
-### Live camera window
-
-`cameras`, `run`, `teleop` and `demo` take `--view`. It opens a window showing every camera's
-latest frame side by side. Each caption gives the display rate and the frame's age; it turns red
-when a camera has sent no new frame for 0.5 s.
-
-- The window is a separate process, so drawing it doesn't slow the 125 Hz control loop.
-- Closing the window closes only the window; the run continues.
-- `teleop` doesn't otherwise use the cameras; with `--view` it starts them.
-- It needs the desktop session (`DISPLAY` set).
 
 ### Paths in commands
 
@@ -81,8 +59,8 @@ there. Paths inside YAML files must be absolute.
 
 ### Outputs
 
-Every recorded episode goes to `runs/<YYYYmmdd-HHMMSS>_<backend or demo>[_<tag>]/ep_NNN/`
-(see [8.1](#81-recording-layout)).
+Every recorded episode goes to `runs/<YYYYmmdd-HHMMSS>_<backend or demo>[_<tag>]/ep_NNN/`. What's
+in it: [architecture.md](architecture.md#recording).
 
 ---
 
@@ -95,12 +73,6 @@ cd ~/abhay_ws/ur5-VLA
 UV_PROJECT_ENVIRONMENT=.venv-openpi  uv sync --extra cameras --extra openpi
 UV_PROJECT_ENVIRONMENT=.venv-lerobot uv sync --extra cameras --extra lerobot
 ```
-
-**Backend.** One `uv.lock` resolves both environments.
-- The `openpi` and `lerobot` extras are declared conflicting, so each goes in its own venv.
-- `.venv-lerobot` gets CPU-only torch, because the client only unpickles action tensors and encodes
-  video. It also gets LeRobot's dataset libraries.
-- openpi-client is installed from Physical Intelligence's git repo, pinned to commit `215abfb`.
 
 **Check it.** Run `.venv-openpi/bin/python -m pytest -q` and `.venv-lerobot/bin/python -m pytest -q`.
 Each skips the other backend's tests.
@@ -194,7 +166,7 @@ Do these in order. Each step relies only on what earlier steps proved.
 .venv-openpi/bin/ur5vla run -c configs/dry_run.yaml -p configs/policy/replay_sine.yaml -y --max-seconds 10
 ```
 
-**Backend.** Runs the real execution and inference threads, chunk merge, safety layer and recorder,
+**What runs.** The real execution and inference threads, chunk merge, safety layer and recorder,
 against:
 - a simulated arm (first-order tracking of the targets);
 - two synthetic cameras;
@@ -216,8 +188,8 @@ ur5vla state -c configs/cell.yaml [--dry-run]
 | `-c` | Cell file (uses `robot.ip` and `robot.rate_hz`) |
 | `--dry-run` | Use the simulated arm instead |
 
-**Backend.** Opens only ur_rtde's receive interface. No control script is uploaded, so it can't
-move the arm or disturb a pendant program. Twice a second until Ctrl-C, it prints:
+**Output.** Read-only: nothing is uploaded to the robot, so it can't move the arm or disturb a
+pendant program. Twice a second until Ctrl-C, it prints:
 - joints in degrees;
 - TCP position in m, in the UR base frame;
 - force magnitude |F| in N;
@@ -237,38 +209,26 @@ ur5vla cameras -c configs/cell.yaml [--seconds 10] [--view]
 | Option | Meaning |
 |---|---|
 | `--seconds` | How long to report (default 10; with `--view`, until the window is closed) |
-| `--view` | Also show the cameras live ([1](#live-camera-window)): use it to aim them |
+| `--view` | Also show the cameras live ([how it works](architecture.md#live-camera-window)): use it to aim them |
 
-**Backend.**
-1. Builds each camera listed under `cameras:`:
-   - `oak` uses depthai v3;
-   - `realsense` uses pyrealsense2;
-   - `mcu_uvc` uses OpenCV/V4L2;
-   - `replay` and `synthetic` need no hardware.
-2. Starts each camera's capture thread.
-3. Waits up to 10 s for every camera's first frame.
-4. Once a second, prints per camera: measured fps, dropped frames (from the device's frame
-   counter), age of the latest frame, and frame shape.
+**Output.** Once a second, per camera: measured fps, dropped frames, age of the latest frame, and
+frame shape. How the drivers work: [architecture.md](architecture.md#cameras).
 
-**Choosing the cameras.** Each entry under `cameras:` names a role (`base`, `wrist`; policy
-files map these to the model's camera names) and a driver `type`. A camera is picked by its
-vendor ID, not by a `/dev/video` node: OAKs have none, and node numbers change between boots.
+**Choosing the cameras.** Each entry under `cameras:` names a role (`base`, `wrist`) and a driver
+`type`, and picks its device by vendor ID. To find the IDs:
 
-| Type | ID key | How to list IDs | Stream |
-|---|---|---|---|
-| `realsense` | `serial` | `rs-enumerate-devices -s`, "Serial Number" column (not the number in `/dev/v4l/by-id`) | The RGB sensor, `rgb8` |
-| `oak` | `device_id` | `python -c "import depthai as dai; print([d.getDeviceId() for d in dai.Device.getAllAvailableDevices()])"` | The sensor on `socket` (default `CAM_A`: on an OAK-D the IMX378 colour camera), RGB on the device |
-| `mcu_uvc` | `device` | `v4l2-ctl --list-devices`; prefer a `/dev/v4l/by-id/...` path | UVC frames, converted to RGB |
+| Type | ID key | How to list IDs |
+|---|---|---|
+| `realsense` | `serial` | `rs-enumerate-devices -s`, "Serial Number" column (not the number in `/dev/v4l/by-id`) |
+| `oak` | `device_id` | `python -c "import depthai as dai; print([d.getDeviceId() for d in dai.Device.getAllAvailableDevices()])"`, with OAK Viewer closed |
+| `mcu_uvc` | `device` | `v4l2-ctl --list-devices`; prefer a `/dev/v4l/by-id/...` path |
 
 An ID of `null` takes the first device of that type, which is fine with one of each. Quote IDs
-(`"234422064578"`). Every driver delivers RGB at `width` × `height`; depth is off unless a
-RealSense sets `depth: true`.
+(`"234422064578"`).
 
-**`rotate`** (any type): `0`, `90`, `180` or `270` degrees clockwise, for a camera mounted on its
-side or upside down. Every frame is turned before anything uses it (control loop, recordings,
-policy, viewer). `width`/`height` stay the sensor's, so `90` and `270` give frames `width` tall.
-Settle the rotation and camera placement before recording demos and keep them for deployment:
-the model expects the view it was trained on.
+**Mounted on its side?** Set `rotate` (0, 90, 180 or 270, clockwise). Settle the rotation and
+camera placement before recording demos and keep them for deployment: the model expects the view
+it was trained on.
 
 **Check.**
 - fps is close to the configured rate.
@@ -277,8 +237,8 @@ the model expects the view it was trained on.
 
 ### 3.4 Gripper
 
-The Robotiq 2F-85 talks Modbus RTU through its USB/RS-485 adapter, which shows up as an FTDI
-serial port.
+The Robotiq 2F-85 is driven over its USB/RS-485 adapter. How the driver works:
+[architecture.md](architecture.md#gripper).
 
 ```bash
 ur5vla gripper -c configs/cell.yaml                 # watch the status, read-only
@@ -308,26 +268,6 @@ ur5vla gripper -c configs/cell.yaml --close         # or --open, --to 0.5
 | `rate_hz` | 100 | Command/status exchanges per second |
 | `timeout_s` | 0.5 | No status for this long ends the episode |
 | `activate_timeout_s` | 10 | How long activation may take |
-
-**Backend** (`src/ur5vla/robot/robotiq.py`, on minimalmodbus):
-1. Opens the port and puts the FTDI adapter in low-latency mode (1 ms instead of 16 ms per
-   reply).
-2. Reads the status (function 4, three registers from 2000). No answer is an error naming the
-   port.
-3. Unless read-only: if the gripper isn't activated, or has a major fault, it clears and sets
-   rACT and waits for activation to finish. The gripper then opens.
-4. A thread exchanges with the gripper `rate_hz` times a second. It sends the latest command when
-   it changes (function 16, three registers from 1000: go-to, position, speed and force) and
-   reads the status. The 125 Hz loop only reads and writes those latest values, so it never waits
-   on the serial line.
-5. `run`, `teleop` and `demo` pass the target every tick (0 open .. 1 closed: the policy's gripper
-   action, or A/B), and record the measured position as the gripper state.
-6. The episode ends (`safety`, `violation: gripper`) if no status arrives for `timeout_s`, the
-   gripper reports a fault (over temperature, undervoltage, overcurrent, …), or it loses
-   activation.
-7. On exit, the gripper keeps its last command, so it keeps holding.
-
-`state` and `policy-check` connect read-only: they show the gripper but never activate or move it.
 
 **Check.**
 - `--close` with nothing between the fingers: about 0.9 (the 2F-85 stops near 230/255), `at target`.
@@ -376,14 +316,8 @@ ur5vla gamepad [-c configs/cell.yaml] [--device /dev/input/js0]
 | `-c` | Also show what the cell file's `teleop:` mapping makes of the inputs |
 | `--device` | Joystick node. Default: `teleop.device`, otherwise the first `/dev/input/js*` |
 
-**Backend.**
-1. Opens the Linux joystick device (the `joydev` driver). The kernel first replays the current
-   state, then streams changes.
-2. Normalizes axes to −1..1; buttons read 0 or 1.
-3. Prints one live line: every axis value and the pressed buttons.
-4. With `-c`, the line also shows `x y z rx ry rz` (each −1..1) and the held roles.
-
-No robot is involved.
+**Output.** One live line: every axis value (−1..1) and the pressed buttons. With `-c`, it also
+shows `x y z rx ry rz` (each −1..1) and the held roles. No robot is involved.
 
 **Using it.** Move one control at a time and note its number. Analog triggers should rest at
 −1.00.
@@ -398,28 +332,13 @@ ur5vla teleop -c configs/cell.yaml [--view] [--dry-run]
 
 | Option | Meaning |
 |---|---|
-| `--view` | Start the cameras and show them live ([1](#live-camera-window)) |
+| `--view` | Start the cameras and show them live ([how it works](architecture.md#live-camera-window)) |
 | `--dry-run` | Simulated arm; a real gamepad still drives it |
 
-**Backend.** Every 8 ms tick (`src/ur5vla/control/teleop.py`):
-1. **Read** the robot state and the gamepad state.
-2. **Stop the session** on a robot protective/emergency stop, the force limit, the e-stop key, or
-   an unplugged controller.
-3. **Compute the motion command.**
-   - Deadman held: the mapped controls become a twist in −1..1. It's scaled by the maximum speeds
-     (and by `slow_scale` while slow is held), then ramped by the acceleration limits.
-   - Deadman released: the twist goes to zero immediately.
-4. **Convert to a joint step** by damped least squares on the UR5 Jacobian of the TCP point.
-   - In the tool frame, the twist is first rotated into the base frame by the current tool
-     orientation.
-   - Rotations are about the TCP in both frames.
-   - A step that would exceed `max_joint_speed_deg_s` is scaled down.
-5. **Check the step** with the same safety check policies use: joint limits, step size, and the
-   workspace box at the TCP. A refused step isn't taken: the arm stops at the limit and can be
-   driven back out. A `blocked` event is logged.
-6. **Stream the target** with `servoJ`, using the same call, rate, lookahead and gain as policy runs.
+How jogging works, tick by tick: [architecture.md](architecture.md#gamepad-and-teleop).
 
-**Ending.** Menu, `d`, e-stop, or any stop condition in step 2.
+**Ending.** Menu or `d`. A robot stop, the force limit, the e-stop, a gripper fault or an unplugged
+controller also end it.
 
 **Legend.** At the start, teleop prints the controls for the configured mapping: which control
 moves along or rotates about each axis, and which way is +. Rotations are about axes through the
@@ -463,18 +382,18 @@ ur5vla demo -c configs/cell.yaml --prompt "pick up the red block" \
 | `--episodes` | Number of demos (default 1) |
 | `--max-seconds` | Time limit per demo (default `control.max_episode_s`, 120) |
 | `--tag` | Appended to the run directory name |
-| `--view` | Show the cameras live ([1](#live-camera-window)) |
+| `--view` | Show the cameras live ([how it works](architecture.md#live-camera-window)) |
 | `--dry-run` | Simulated arm |
 | `-y` | No prompts: start demos at once, confirm start-pose moves, leave labels `unlabelled` |
 
-**Backend, for each demo:**
+**For each demo:**
 1. **Move to the start pose.** If `robot.start_q_deg` is set, it shows the current and start
    joints, asks for confirmation, then `moveJ`s there at `robot.move_speed_deg_s`.
 2. **Wait for Enter** (`q` quits).
 3. **Start recording.** It writes `meta.json` (with `kind: demo`, the prompt and the config) and
    starts the camera frame writers.
-4. **Run a teleop session** exactly as in [4.2](#42-ur5vla-teleop). Every tick logs the measured
-   state and the commanded joint target (`q_cmd`); `q_cmd` is the demonstration's action.
+4. **Run a teleop session** as in [4.2](#42-ur5vla-teleop), recorded: the commanded targets become
+   the demonstration's actions.
 5. **Label the demo.** On Menu, `d` or the time limit, it asks for a label and a note, then saves:
    - `s`: success, a good demo to train on;
    - `f`: fail;
@@ -548,26 +467,7 @@ Converts recordings to a LeRobot dataset in format v3.0, for LeRobot training.
 | `--no-gripper` | State and action are the 6 joints only (default: 7, with the gripper) |
 | `--images` | Store frames as images instead of AV1 video |
 
-**Backend.**
-1. Selects episodes by the `kind` and label in each `meta.json`.
-2. For each episode, lays a frame grid at `--fps`, from the first to the last tick that sent a
-   command.
-3. Builds each frame from the latest data at or before its time:
-   - `observation.state`: the measured joints plus the gripper, from the latest tick;
-   - `action`: the joint targets plus the gripper command sent in that tick. Action k is the target
-     for its own frame time, the same convention the loop uses when it executes a chunk;
-   - `observation.images.<camera>`: each camera's latest frame, at native resolution;
-   - `task`: the prompt.
-4. Writes through LeRobot's own `LeRobotDataset` (`create` → `add_frame` → `save_episode` →
-   `finalize`). That produces the parquet data, AV1 video (encoded with PyAV), and statistics
-   including the `q01`/`q99` quantiles π₀.₅'s default normalization needs.
-5. Logs each episode's frame count and the oldest image it used. It warns when an image is more
-   than 2 frames old, which points to a camera dropping frames.
-
-**Feature names** are the ones the LeRobot adapter sends at inference:
-- `observation.state` and `action`: `shoulder_pan.pos`, `shoulder_lift.pos`, `elbow.pos`,
-  `wrist_1.pos`, `wrist_2.pos`, `wrist_3.pos`, `gripper.pos`;
-- images: `observation.images.<camera>`.
+How frames are built, named and written: [architecture.md](architecture.md#dataset-conversion).
 
 **Quick check.**
 
@@ -578,9 +478,8 @@ d = D('<repo-id>', root='<root>'); print(d); print(list(d[0].keys()))"
 
 ### 5.2 Datasets for openpi (format v2.1)
 
-openpi trains from dataset format v2.1, written by the older LeRobot it pins. LeRobot can convert
-v2.1 to v3.0, but not back, so run the same converter inside openpi's environment. It doesn't need
-this repo installed:
+openpi trains from dataset format v2.1, so run the same converter inside openpi's environment
+([why](architecture.md#dataset-conversion)). It doesn't need this repo installed:
 
 ```bash
 cd ~/abhay_ws/openpi
@@ -615,24 +514,11 @@ python -m lerobot.async_inference.policy_server --host=127.0.0.1 --port=8080 --f
 | `--inference_latency` | 1/30 s | Minimum time per reply; the server sleeps if inference was faster |
 | `--obs_queue_timeout` | 2 s | How long a request waits for an observation before returning empty |
 
-**Backend.** It's a gRPC server with no model loaded at startup.
-1. Each run's client calls `Ready`, which flushes the server's queues.
-2. On its first inference, the client sends `SendPolicyInstructions` with the policy file's
-   `policy_type` and `pretrained_name_or_path`. The server loads that checkpoint on
-   `policy_device` and builds its pre- and post-processors (normalization statistics, tokenizer).
-3. For each request:
-   1. the pickled observation arrives;
-   2. images are resized to the checkpoint's shapes;
-   3. the preprocessor normalizes the state and tokenizes the prompt;
-   4. the policy predicts a chunk;
-   5. the postprocessor unnormalizes it;
-   6. the chunk goes back pickled, with a timestamp per action.
+It starts with no model: each run's policy file chooses one, and the server loads it when the run
+connects ([how](architecture.md#policy-backends)).
 
-The client always sets `must_go`. Without it, the server would skip observations whose joints moved
-less than 1.0 (L2, in radians) since the last one it ran, which is nearly all of them.
-
-**Switching models.** Change the policy file; the next run loads the new model. If GPU memory runs
-out when switching between large models, restart the server.
+**Restart it between `ur5vla` commands** on the 12 GB GPU. Each command makes the server load its
+model again, and two copies of π₀.₅ don't fit. To switch models, change the policy file.
 
 ### 6.2 Start the openpi server
 
@@ -649,20 +535,11 @@ uv run scripts/serve_policy.py [--port=8000] [--default_prompt="..."] [--record]
 | `--default_prompt` | Used when a request has no prompt |
 | `--record` | Record the policy's inputs and outputs for debugging |
 
-**Backend.**
-1. Loads the checkpoint, downloading `gs://` paths into `~/.cache/openpi`.
-2. Builds the config's input and output transforms.
-3. Listens on a websocket on **all network interfaces**, with no authentication. Firewall it on a
-   shared network.
-4. For each request (msgpack): input transforms (state padding, image resize to 224×224 with
-   padding, tokenization) → normalize → model → unnormalize → output transforms (for example
-   deltas back to absolute joints) → reply.
-
-Key renaming (`RepackTransform`) is applied **only during training**, so live requests must already
-use the names the input transform reads.
-
-The first inference JIT-compiles for tens of seconds; the client's 300 s first-call timeout covers
-it. JAX reserves 75% of GPU memory, so don't run the LeRobot server at the same time.
+- **Network:** it listens on **all network interfaces**, with no authentication. Firewall it on a
+  shared network.
+- **GPU:** JAX reserves 75% of GPU memory, so don't run the LeRobot server at the same time.
+- **Requests** must use the key names the config's input transform reads
+  ([why](architecture.md#policy-backends)); the first one waits for the model to compile.
 
 ### 6.3 Policy files
 
@@ -709,16 +586,12 @@ ur5vla policy-check -c configs/cell.yaml -p configs/policy/<file>.yaml [--prompt
 | `--prompt` | Overrides `prompt:` in the config |
 | `--dry-run` | Simulated arm. Combine with `-c configs/dry_run.yaml` to need no hardware at all. |
 
-**Backend.**
-1. Starts the cameras.
-2. Connects to the robot **receive-only**.
-3. Connects the policy backend.
-4. `n` times: waits for fresh policy-camera frames, builds an observation, calls the server, and
-   prints:
-   - latency;
-   - chunk length H and step spacing dt;
-   - how far step 0 and the whole chunk are from the current joints, in degrees;
-   - the gripper range.
+**Output.** It connects to the robot **receive-only**, then `n` times waits for fresh
+policy-camera frames, calls the server, and prints:
+- latency;
+- chunk length H and step spacing dt;
+- how far step 0 and the whole chunk are from the current joints, in degrees;
+- the gripper range.
 
 **Reading it.**
 - For a policy trained on this robot, the step-0 distance should be small. A large one means the
@@ -740,32 +613,22 @@ ur5vla run -c configs/cell.yaml -p configs/policy/<file>.yaml --prompt "..." \
 | `--episodes` | Default 1 |
 | `--max-seconds` | Time limit per episode (default `control.max_episode_s`) |
 | `--tag` | Appended to the run directory name |
-| `--view` | Show the cameras live ([1](#live-camera-window)) |
+| `--view` | Show the cameras live ([how it works](architecture.md#live-camera-window)) |
 | `--dry-run` | Simulated arm |
 | `-y` | No prompts: start-pose moves confirmed, outcomes left unlabelled |
 
-**Backend.**
+**Flow.**
 1. **Connect:** starts the cameras, connects the policy backend, then connects the arm (which
    uploads ur_rtde's control script).
 2. **Warm up:** runs one inference and discards it, so the model loads and compiles before anything
    moves.
-3. **For each episode:** optional `moveJ` to `start_q_deg`, then Enter to start. It starts the
-   recorder (`kind: rollout`), tares the force reading, and runs two threads:
-   - **Execution thread, every 8 ms:**
-     1. read the state;
-     2. stop on a robot stop, the force limit or the e-stop;
-     3. hold on stale cameras or an overdue chunk (the watchdog);
-     4. sample the buffer at the current time;
-     5. check the target;
-     6. `servoJ`.
-
-     A safety violation ends the episode; targets are never clipped.
-   - **Inference thread:** when less than `refill_fraction` of the last chunk remains, it takes
-     the latest frames and state and calls the server (calls are serialized and time out). It then
-     merges the chunk: drops steps already due, crossfades over `crossfade_steps`, and
-     interpolates to 125 Hz.
-4. **End:** `d`, the time limit, e-stop, safety, the policy finishing (replay), or an error.
-5. **Label:** success / fail / discard, the number of interventions, and a note.
+3. **For each episode:** optional `moveJ` to `start_q_deg` (after asking), then Enter to start (`q`
+   quits). It records the episode (`kind: rollout`) while the control loop runs
+   ([how](architecture.md#control-loop)).
+4. **End:** `d`, the time limit, the e-stop, a safety stop, the policy finishing (replay), or an
+   error.
+5. **Label:** after a normal end, success / fail / discard, the number of interventions, and a
+   note. After an e-stop it saves without asking.
 
 **Output.** Each episode prints its end reason, duration, chunk count and mean/p95 latency. Holds
 and overruns are in its `meta.json`.
@@ -781,11 +644,8 @@ and overruns are in its `meta.json`.
 | `safety.watchdog_max_s` | `null` | Optional hard cap on that window, in seconds |
 | `safety.max_frame_age_s` | 0.1 | Policy-camera frames older than this hold the arm |
 
-Chunks arrive about every `(1 − refill_fraction) × chunk duration`; latency shifts them but doesn't
-change the spacing. The loop warns once for each of these:
-- **latency at least `refill_fraction × chunk duration`:** the trajectory runs out before the next
-  chunk, and the arm pauses each cycle;
-- **`watchdog_max_s` below the expected gap:** the arm holds between healthy chunks.
+How refill timing and the watchdog work: [architecture.md](architecture.md#control-loop). The loop
+warns once when these settings can't keep up; the fixes are in [8.1](#81-troubleshooting).
 
 ### 6.7 A/B session
 
@@ -1011,24 +871,7 @@ ignores adapters. There's no merge script in this repo yet.
 
 ## 8. Reference
 
-### 8.1 Recording layout
-
-```
-runs/<YYYYmmdd-HHMMSS>_<backend|demo>[_<tag>]/ep_NNN/
-  meta.json                 kind (demo | rollout), prompt, config, policy info, git commit,
-                            clock anchor, outcome (label, result, interventions, note)
-  ticks.npz                 every 8 ms tick: t, q, qd, tcp_pose, wrench, gripper,
-                            q_cmd, g_cmd (NaN when nothing was sent), mode, loop_dt
-  chunks.jsonl              every chunk: t_obs, latency, targets, the frames it saw, merge result
-  events.jsonl              hold, resume, stale, blocked, frame, enable/disable, safety, end
-  cameras/<name>/index.csv  seq, t_capture, image path(s)
-  cameras/<name>/rgb/       native-resolution frames (JPEG by default)
-```
-
-All times are host monotonic seconds. `meta.json` stores one (monotonic, wall-clock) pair for
-converting them to absolute time.
-
-### 8.2 Troubleshooting
+### 8.1 Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
