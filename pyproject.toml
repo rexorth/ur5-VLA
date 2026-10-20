@@ -10,6 +10,9 @@ dependencies = [
     "pyyaml>=6.0",
     "pillow>=10.0",
     "ur_rtde>=1.6",
+    # Robotiq 2F-85 over its USB/RS-485 adapter (Modbus RTU). No numpy, so both venvs take it.
+    "minimalmodbus>=2.1",
+    "pyserial>=3.5",
 ]
 
 [project.optional-dependencies]

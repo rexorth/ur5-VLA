@@ -20,7 +20,7 @@ SINE = {'backend': 'replay', 'action_hz': 15, 'chunk_len': 15, 'latency_s': 0.05
         'camera_map': {'base': 'base'}}
 
 
-def run(tmp_path, cameras_cfg, policy, *, name='ep', seconds=1.5, cameras=None, **cfg_over):
+def run(tmp_path, cameras_cfg, policy, *, name='ep', seconds=1.5, cameras=None, gripper=None, **cfg_over):
     raw = {'robot': {'dry_run': True}, 'cameras': cameras_cfg,
            'policy': policy if isinstance(policy, dict) else {}, **cfg_over}
     cfg = config_mod.parse(raw)
@@ -30,7 +30,7 @@ def run(tmp_path, cameras_cfg, policy, *, name='ep', seconds=1.5, cameras=None, 
     try:
         arm = SimArm(cfg.robot)
         backend = policy if isinstance(policy, PolicyBackend) else build_backend(cfg.policy)
-        loop = ControlLoop(cfg, arm, NoGripper(), cams, backend, backend.connect())
+        loop = ControlLoop(cfg, arm, gripper or NoGripper(), cams, backend, backend.connect())
         loop.warmup('test')
         rec = EpisodeRecorder(tmp_path / name, cams, cfg.logging)
         rec.start({'test': True})

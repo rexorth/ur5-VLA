@@ -5,6 +5,9 @@
 robot:
   dry_run: true
 
+gripper:
+  type: robotiq_2f85          # simulated in a dry run: follows commands at the configured speed
+
 cameras:
   base:  {type: synthetic, width: 640, height: 480, fps: 30}
   wrist: {type: synthetic, width: 640, height: 480, fps: 30}

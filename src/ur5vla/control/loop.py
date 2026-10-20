@@ -205,6 +205,8 @@ class ControlLoop:
                     self._overruns += 1
 
                 violation = Violation('estop') if self.estop.is_set() else self.safety.check_state(state)
+                if violation is None and (gripper_fault := self.gripper.fault()) is not None:
+                    violation = Violation('gripper', {'fault': gripper_fault})
                 hold_reason = None
                 target = None
                 if violation is None:

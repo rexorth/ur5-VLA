@@ -167,6 +167,8 @@ class TeleopSession:
                 pad = self.pad.snapshot()
 
                 stop = Violation('estop') if self.estop.is_set() else self.safety.check_state(state)
+                if stop is None and (gripper_fault := self.gripper.fault()) is not None:
+                    stop = Violation('gripper', {'fault': gripper_fault})
                 if stop is not None:
                     rec.log_event('safety', reason=stop.reason, **stop.detail)
                     self._end(rec, 'estop' if stop.reason == 'estop' else 'safety',

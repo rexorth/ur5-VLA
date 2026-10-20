@@ -73,6 +73,16 @@ teleop:
   gripper: [{button: 0}, {button: 1, sign: -1}]                       # A close, B open
   buttons: {deadman: 4, slow: 5, toggle_frame: 6, done: 7}            # LB (hold), RB, View, Menu
 
+# Robotiq 2F-85 on its USB/RS-485 adapter (Modbus RTU), driven every tick like the arm: teleop's
+# A/B and the policy's gripper action both arrive as 0 open .. 1 closed. `ur5vla gripper` tests it.
+gripper:
+  type: robotiq_2f85          # none | robotiq_2f85
+  port: /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG01X8DU-if00-port0
+  slave_id: 9
+  speed: 1.0                  # 0..1 = 20..150 mm/s
+  force: 0.5                  # 0..1 = 20..235 N
+  timeout_s: 0.5              # no status for this long ends the episode
+
 logging:
   root: runs
   image_format: jpg

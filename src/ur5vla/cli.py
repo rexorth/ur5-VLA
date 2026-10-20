@@ -2,6 +2,7 @@
 
     ur5vla state        -c configs/cell.yaml                       read-only robot state
     ur5vla cameras      -c configs/cell.yaml                       camera fps / drops / frame age
+    ur5vla gripper      -c configs/cell.yaml [--activate | --open | --close | --to 0.5]
     ur5vla policy-check -c configs/cell.yaml -p configs/policy/openpi.yaml   query, no motion
     ur5vla run          -c configs/cell.yaml -p configs/policy/openpi.yaml --prompt "..."
 
@@ -35,7 +36,7 @@ from .control import ControlLoop
 from .keys import KeyListener
 from .policy import build_backend
 from .recording import EpisodeRecorder
-from .robot import NoGripper, make_arm
+from .robot import make_arm, make_gripper
 from .robot.kinematics import tool_point
 
 log = logging.getLogger('ur5vla')
@@ -176,18 +177,59 @@ def cmd_state(args) -> int:
     cfg = _load(args)
     arm = make_arm(cfg.robot)
     arm.connect(receive_only=True)
+    gripper = make_gripper(cfg.gripper, cfg.robot.dry_run)
     try:
+        gripper.connect(read_only=True)
         while True:
             s = arm.read_state()
             print(f'q_deg {np.array2string(np.rad2deg(s.q), precision=2, suppress_small=True)}  '
                   f'tcp {np.array2string(s.tcp_pose[:3], precision=4)}  '
                   f'|F| {np.linalg.norm(s.wrench[:3]):6.1f} N  '
-                  f'pstop {s.protective_stop}  estop {s.emergency_stop}', flush=True)
+                  f'pstop {s.protective_stop}  estop {s.emergency_stop}'
+                  + (f'  {gripper.status_text()}' if cfg.gripper.type != 'none' else ''), flush=True)
             time.sleep(0.5)
     except KeyboardInterrupt:
         return 0
     finally:
+        gripper.close()
         arm.close()
+
+
+def _wait_until_still(gripper, timeout_s: float = 5.0) -> None:
+    """Until the gripper's position has held for 0.3 s: it reached the target, or an object."""
+    time.sleep(0.2)                         # let it start moving
+    t_end = time.monotonic() + timeout_s
+    last, since = gripper.position(), time.monotonic()
+    while time.monotonic() < t_end and time.monotonic() - since < 0.3:
+        time.sleep(0.05)
+        p = gripper.position()
+        if abs(p - last) > 1.5 / 255:
+            last, since = p, time.monotonic()
+
+
+def cmd_gripper(args) -> int:
+    cfg = _load(args)
+    if cfg.gripper.type == 'none':
+        print('no gripper configured: set gripper.type in the cell file', file=sys.stderr)
+        return 2
+    target = 0.0 if args.open else 1.0 if args.close else args.to
+    watch = target is None and not args.activate
+    gripper = make_gripper(cfg.gripper, cfg.robot.dry_run)
+    try:
+        gripper.connect(read_only=watch)
+        print(gripper.status_text(), flush=True)
+        if target is not None:
+            gripper.command(target)
+            _wait_until_still(gripper)
+            print(gripper.status_text(), flush=True)
+        while watch:
+            time.sleep(0.5)
+            print(gripper.status_text(), flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        gripper.close()
+    return 0
 
 
 def cmd_cameras(args) -> int:
@@ -220,11 +262,13 @@ def cmd_policy_check(args) -> int:
     cameras = _start_cameras(cfg)
     arm = make_arm(cfg.robot)
     arm.connect(receive_only=True)
+    gripper = make_gripper(cfg.gripper, cfg.robot.dry_run)
     backend = build_backend(cfg.policy)
     try:
+        gripper.connect(read_only=True)
         info = backend.connect()
         print(f'connected: {info}')
-        loop = ControlLoop(cfg, arm, NoGripper(), cameras, backend, info)
+        loop = ControlLoop(cfg, arm, gripper, cameras, backend, info)
         for i in range(args.n):
             obs = loop.observe(prompt)
             t0 = time.monotonic()
@@ -236,6 +280,7 @@ def cmd_policy_check(args) -> int:
                   f'gripper {chunk.gripper.min():.2f}..{chunk.gripper.max():.2f}')
     finally:
         backend.close()
+        gripper.close()
         arm.close()
         _stop_cameras(cameras)
     return 0
@@ -253,7 +298,7 @@ def cmd_run(args) -> int:
 
     cameras = _start_cameras(cfg)
     arm = make_arm(cfg.robot)
-    gripper = NoGripper()
+    gripper = make_gripper(cfg.gripper, cfg.robot.dry_run)
     backend = build_backend(cfg.policy)
     viewer = None
     try:
@@ -337,7 +382,7 @@ def cmd_teleop(args) -> int:
     cfg = _load(args)
     pad = JoystickDevice(cfg.teleop.device).open()
     cameras = _start_cameras(cfg) if args.view else {}
-    arm, gripper = make_arm(cfg.robot), NoGripper()
+    arm, gripper = make_arm(cfg.robot), make_gripper(cfg.gripper, cfg.robot.dry_run)
     viewer = None
     try:
         viewer = _start_viewer(args, cameras, 'ur5vla teleop')
@@ -375,7 +420,7 @@ def cmd_demo(args) -> int:
     run_dir = Path(cfg.logging.root) / run_name
     pad = JoystickDevice(cfg.teleop.device).open()
     cameras = _start_cameras(cfg)
-    arm, gripper = make_arm(cfg.robot), NoGripper()
+    arm, gripper = make_arm(cfg.robot), make_gripper(cfg.gripper, cfg.robot.dry_run)
     viewer = None
     try:
         viewer = _start_viewer(args, cameras, f'ur5vla demo {run_name}')
@@ -440,6 +485,14 @@ def main(argv: list[str] | None = None) -> int:
     p = add('cameras', cmd_cameras, view=True)
     p.add_argument('--seconds', type=float,
                    help='how long to report (default 10 s; with --view, until the window is closed)')
+    p = add('gripper', cmd_gripper, dry=True)
+    g = p.add_mutually_exclusive_group()
+    g.add_argument('--open', action='store_true', help='open fully')
+    g.add_argument('--close', action='store_true', help='close fully, or onto an object')
+    g.add_argument('--to', type=float, metavar='G', help='go to G: 0 open .. 1 closed')
+    p.add_argument('--activate', action='store_true',
+                   help='activate if needed (the fingers open and close fully). Moves also activate. '
+                        'With no option: watch the status, read-only')
     p = add('policy-check', cmd_policy_check, policy=True, dry=True)
     p.add_argument('-n', type=int, default=5, help='number of inferences')
     p = add('run', cmd_run, policy=True, dry=True, view=True)

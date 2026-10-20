@@ -169,6 +169,31 @@ class TeleopConfig:
         return GamepadMapping.from_config(self.axes, self.gripper, self.buttons, self.deadzone, self.curve)
 
 
+GRIPPER_TYPES = ('none', 'robotiq_2f85')
+
+
+@dataclass
+class GripperConfig:
+    type: str = 'none'              # none | robotiq_2f85
+    port: str | None = None         # the USB/RS-485 adapter, by id: /dev/serial/by-id/usb-FTDI_...
+    slave_id: int = 9               # Modbus address; 9 unless changed with Robotiq's software
+    baudrate: int = 115200
+    speed: float = 1.0              # 0..1 of the finger speed range (2F-85: 20..150 mm/s)
+    force: float = 0.5              # 0..1 of the grip force range (2F-85: 20..235 N)
+    rate_hz: float = 100.0          # command/status exchanges per second
+    timeout_s: float = 0.5          # no status from the gripper for this long ends the episode
+    activate_timeout_s: float = 10.0
+
+    def __post_init__(self):
+        if self.type not in GRIPPER_TYPES:
+            raise ConfigError(f'gripper.type must be one of {GRIPPER_TYPES}, got {self.type!r}')
+        for name in ('speed', 'force'):
+            if not 0.0 <= getattr(self, name) <= 1.0:
+                raise ConfigError(f'gripper.{name} must be in [0, 1]')
+        if self.rate_hz <= 0 or self.timeout_s <= 0 or self.activate_timeout_s <= 0:
+            raise ConfigError('gripper.rate_hz, timeout_s and activate_timeout_s must be > 0')
+
+
 @dataclass
 class LoggingConfig:
     root: str = 'runs'
@@ -189,12 +214,13 @@ class RunConfig:
     safety: SafetyConfig
     logging: LoggingConfig
     teleop: TeleopConfig = field(default_factory=TeleopConfig)
+    gripper: GripperConfig = field(default_factory=GripperConfig)
     prompt: str = ''
     source: str | None = None           # path the config was loaded from
     raw: dict[str, Any] = field(default_factory=dict)  # as loaded, saved with every episode
 
 
-SECTIONS = ('robot', 'cameras', 'policy', 'control', 'safety', 'logging', 'teleop', 'prompt')
+SECTIONS = ('robot', 'cameras', 'policy', 'control', 'safety', 'logging', 'teleop', 'gripper', 'prompt')
 ROTATIONS = (0, 90, 180, 270)       # cameras.<name>.rotate, degrees clockwise
 
 
@@ -220,6 +246,7 @@ def parse(raw: dict[str, Any], source: str | None = None) -> RunConfig:
         safety=from_dict(SafetyConfig, raw.get('safety'), 'safety'),
         logging=from_dict(LoggingConfig, raw.get('logging'), 'logging'),
         teleop=from_dict(TeleopConfig, raw.get('teleop'), 'teleop'),
+        gripper=from_dict(GripperConfig, raw.get('gripper'), 'gripper'),
         prompt=str(raw.get('prompt') or ''),
         source=source,
         raw=raw,

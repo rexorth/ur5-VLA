@@ -75,6 +75,7 @@ ur5vla run -c configs/dry_run.yaml -p configs/policy/replay_sine.yaml -y --max-s
 # 2. read-only: robot state (no control script is uploaded) and cameras
 ur5vla state   -c configs/cell.yaml
 ur5vla cameras -c configs/cell.yaml
+ur5vla gripper -c configs/cell.yaml          # read-only; --close / --open move it (activating first)
 
 # 3. milestone 1: execution thread + safety on the arm, no GPU. +-5 deg on wrist 3.
 ur5vla run -c configs/cell.yaml -p configs/policy/replay_sine.yaml
@@ -144,6 +145,38 @@ not a server restart. The checkpoint must output joint positions in this robot's
 - **CB3 wrench.** `getActualTCPForce()` on a CB3 is an estimate from joint currents. It is tared at
   the start of each episode and only suitable as a collision backstop.
 
+## Gripper
+
+A Robotiq 2F-85 on Robotiq's USB/RS-485 adapter, driven over Modbus RTU
+(`src/ur5vla/robot/robotiq.py`, on minimalmodbus). It implements the same `Gripper` interface as
+the simulated and absent grippers, so the control loop, teleop and recordings work the same with
+any of them. It is set up in the `gripper:` block of `configs/cell.yaml`: the adapter's
+`/dev/serial/by-id/...` port, speed and force. Bring-up steps are in
+[docs/procedures.md](docs/procedures.md#34-gripper).
+
+```bash
+ur5vla gripper -c configs/cell.yaml              # watch the status, read-only
+ur5vla gripper -c configs/cell.yaml --activate   # activate if needed: the fingers open and close fully
+ur5vla gripper -c configs/cell.yaml --close      # or --open, --to 0.5
+```
+
+- **Commands from the VLA.** The policy's gripper action (0 open … 1 closed) goes to the gripper
+  every tick, and the measured position is recorded as state. Teleop's A/B buttons close and
+  open it.
+- **Background thread.** It sends the latest target when it changes and reads the status 100 times
+  a second. The 125 Hz loop only touches the latest values, so it never waits on the serial port.
+  The FTDI adapter is put in low-latency mode (1 ms per reply instead of 16 ms).
+- **Activation** happens automatically when needed, with a timeout; it opens and closes the
+  fingers fully, once per power-up. After a major fault, the gripper is reactivated.
+- **Faults stop the episode.** No status for 0.5 s (`timeout_s`), a gripper fault (overcurrent,
+  undervoltage, overheating, …) or lost activation ends it as `safety` with `violation: gripper`,
+  in both policy runs and teleop.
+- **Read-only where nothing should move.** `state` and `policy-check` show the gripper but never
+  activate or move it.
+- **On exit** the gripper keeps its last command, so it keeps holding.
+- **Dry runs.** `--dry-run` uses a simulated gripper that follows commands at the configured
+  speed; `configs/dry_run.yaml` sets one.
+
 ## Demonstrations and datasets
 
 **Gamepad teleop.** The gamepad is read through the Linux joystick device (`/dev/input/js*`), with
@@ -166,7 +199,7 @@ Default Xbox One mapping over USB (the `xpad` driver), all remappable in the `te
 | RB (hold) | Slow mode (`slow_scale`) |
 | View | Toggle base / tool frame |
 | Menu | Done (ends the demo) |
-| A / B | Gripper close / open (logged; no gripper yet) |
+| A / B (hold) | Gripper close / open (Robotiq 2F-85) |
 
 ```bash
 ur5vla gamepad -c configs/cell.yaml        # live axis/button numbers + the twist they map to
@@ -222,13 +255,13 @@ configs/        cell.yaml, dry_run.yaml, policy/{openpi,lerobot,lerobot_pi05_bas
 src/ur5vla/
   cameras/      CameraSource + realsense, oak (depthai v3), mcu_uvc, replay, synthetic
   policy/       PolicyBackend + openpi, lerobot, replay
-  robot/        ur_rtde arm, simulated arm, UR5 kinematics, gripper interface
+  robot/        ur_rtde arm, simulated arm, UR5 kinematics, gripper interface + Robotiq 2F-85
   control/      ChunkBuffer, SafetyLayer, ControlLoop, TeleopSession
   teleop/       gamepad reader and control mapping
   recording.py  episode recorder
   convert.py    recordings -> LeRobot dataset (v3.0 or v2.1)
   viewer.py     live camera window (--view), in its own process
-  cli.py        ur5vla state | cameras | policy-check | run | gamepad | teleop | demo | to-lerobot
+  cli.py        ur5vla state | cameras | gripper | policy-check | run | gamepad | teleop | demo | to-lerobot
 tests/          unit tests, loop and teleop tests on the simulated arm, adapter tests against fake
                 servers, dataset write/read-back
 ```
@@ -237,9 +270,9 @@ tests/          unit tests, loop and teleop tests on the simulated arm, adapter 
 
 ## Not done yet
 
-- Nothing has run against the real arm, cameras or policy servers yet. Tests cover the logic and
-  the wire formats.
-- Gripper: open question. `NoGripper` reads 0 and ignores commands, but commands are still logged.
+- Nothing has run against the real arm yet. Checked on the hardware on their own: the cameras
+  (OAK-D, D415), the gripper (activate, open and close with `ur5vla gripper`) and the LeRobot
+  server (a pi05_base plumbing check). Tests cover the logic and the wire formats.
 - `mcu_stream` camera driver (milestone 7, only if needed).
 - The v2.1 (openpi) dataset path is untested: it needs openpi's environment. v3.0 is tested.
 - An A/B trial scheduler; merging LoRA adapters for serving.

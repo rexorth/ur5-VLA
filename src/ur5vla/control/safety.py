@@ -22,7 +22,7 @@ from ..robot.kinematics import tool_point
 
 @dataclass
 class Violation:
-    reason: str                     # joint_limit | step | workspace | force | robot_stopped
+    reason: str                     # joint_limit | step | workspace | force | robot_stopped | gripper
     detail: dict[str, Any] = field(default_factory=dict)
 
 

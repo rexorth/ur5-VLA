@@ -177,7 +177,7 @@ In `configs/cell.yaml`:
 | `safety.joint_min_deg` / `joint_max_deg` | The task's joint range | The shipped ±360° is no limit at all |
 | `safety.workspace_min_m` / `workspace_max_m` | The task box, in the UR base frame (as the pendant shows it) | The shipped box is loose |
 | `safety.tcp_offset_m` | Flange-to-fingertip offset, once a gripper is mounted | The box is checked at this point |
-| `robot.start_q_deg` | A taught start pose ([3.5](#35-teleop-on-the-arm)) | Every episode `moveJ`s here first |
+| `robot.start_q_deg` | A taught start pose ([3.6](#36-teleop-on-the-arm)) | Every episode `moveJ`s here first |
 | `safety.max_step_rad` | Keep 0.02 | Per-8 ms-tick jump that stops a run; never clipped |
 | `safety.ft_limit_n` | 30 to start | On a CB3 this is a joint-current estimate, tared each episode |
 
@@ -220,7 +220,8 @@ move the arm or disturb a pendant program. Twice a second until Ctrl-C, it print
 - joints in degrees;
 - TCP position in m, in the UR base frame;
 - force magnitude |F| in N;
-- the protective-stop and emergency-stop flags.
+- the protective-stop and emergency-stop flags;
+- with a gripper configured, its status (read-only).
 
 **Check.**
 - The joints match the pendant.
@@ -273,12 +274,71 @@ the model expects the view it was trained on.
 - Drops stay at 0.
 - Frame age stays well under `safety.max_frame_age_s` (100 ms). Otherwise runs will hold the arm.
 
-### 3.4 Gamepad
+### 3.4 Gripper
+
+The Robotiq 2F-85 talks Modbus RTU through its USB/RS-485 adapter, which shows up as an FTDI
+serial port.
+
+```bash
+ur5vla gripper -c configs/cell.yaml                 # watch the status, read-only
+ur5vla gripper -c configs/cell.yaml --activate      # activate if needed
+ur5vla gripper -c configs/cell.yaml --close         # or --open, --to 0.5
+```
+
+| Option | Meaning |
+|---|---|
+| (none) | Print the status twice a second until Ctrl-C. Nothing is written to the gripper. |
+| `--activate` | Activate if needed (or after a major fault), then print the status. **Activation opens and closes the fingers fully:** keep them clear. |
+| `--open`, `--close`, `--to G` | Activate if needed, go to 0 (open), 1 (closed) or G, wait until the fingers stop, print the status |
+| `--dry-run` | Simulated gripper |
+
+**Setup.**
+- `gripper.port` is the adapter's `/dev/serial/by-id/usb-FTDI_…` path (`ls /dev/serial/by-id/`),
+  which survives reboots and replugging, unlike `/dev/ttyUSB0`.
+- Your user needs read/write access to it. The desktop session usually grants it; otherwise
+  `sudo usermod -aG dialout $USER` and log in again.
+- The gripper needs 24 V. Modbus address 9 (`slave_id`) and 115200 baud are Robotiq's defaults.
+
+| Key (`gripper:`) | Default | Meaning |
+|---|---|---|
+| `type` | `none` | `none` or `robotiq_2f85`. With `--dry-run`, `robotiq_2f85` is simulated. |
+| `speed` | 1.0 | 0..1 of 20..150 mm/s |
+| `force` | 0.5 | 0..1 of 20..235 N |
+| `rate_hz` | 100 | Command/status exchanges per second |
+| `timeout_s` | 0.5 | No status for this long ends the episode |
+| `activate_timeout_s` | 10 | How long activation may take |
+
+**Backend** (`src/ur5vla/robot/robotiq.py`, on minimalmodbus):
+1. Opens the port and puts the FTDI adapter in low-latency mode (1 ms instead of 16 ms per
+   reply).
+2. Reads the status (function 4, three registers from 2000). No answer is an error naming the
+   port.
+3. Unless read-only: if the gripper isn't activated, or has a major fault, it clears and sets
+   rACT and waits for activation to finish. The gripper then opens.
+4. A thread exchanges with the gripper `rate_hz` times a second. It sends the latest command when
+   it changes (function 16, three registers from 1000: go-to, position, speed and force) and
+   reads the status. The 125 Hz loop only reads and writes those latest values, so it never waits
+   on the serial line.
+5. `run`, `teleop` and `demo` pass the target every tick (0 open .. 1 closed: the policy's gripper
+   action, or A/B), and record the measured position as the gripper state.
+6. The episode ends (`safety`, `violation: gripper`) if no status arrives for `timeout_s`, the
+   gripper reports a fault (over temperature, undervoltage, overcurrent, …), or it loses
+   activation.
+7. On exit, the gripper keeps its last command, so it keeps holding.
+
+`state` and `policy-check` connect read-only: they show the gripper but never activate or move it.
+
+**Check.**
+- `--close` with nothing between the fingers: about 0.9 (the 2F-85 stops near 230/255), `at target`.
+- `--close` on an object: `contact while closing`.
+- `--open`: about 0.01.
+
+### 3.5 Gamepad
 
 Run `ur5vla gamepad` ([4.1](#41-ur5vla-gamepad)) and confirm every control in the mapping does what
 you expect.
 
-### 3.5 Teleop on the arm
+### 3.6 Teleop on the arm
 
 Run `ur5vla teleop -c configs/cell.yaml` ([4.2](#42-ur5vla-teleop)). On the first run, verify:
 - the deadman: nothing moves unless LB is held;
@@ -289,7 +349,7 @@ Then jog to a good start pose and end with Menu or `d`. Teleop prints the pose a
 `start_q_deg: [...]` line; paste it under `robot:` in the cell file. Add `--view` to watch the
 cameras while you position the arm.
 
-### 3.6 First policy-free motion (milestone 1)
+### 3.7 First policy-free motion (milestone 1)
 
 ```bash
 ur5vla run -c configs/cell.yaml -p configs/policy/replay_sine.yaml
@@ -385,7 +445,7 @@ and the pose. Control names assume the `xpad` numbering ([4.4](#44-teleop-settin
 | RB (hold) | Slow mode |
 | View | Toggle base / tool frame |
 | Menu | Done |
-| A / B | Gripper close / open (logged only; no gripper mounted yet) |
+| A / B (hold) | Gripper close / open, at `gripper_speed` |
 
 ### 4.3 `ur5vla demo`
 
@@ -982,6 +1042,9 @@ converting them to absolute time.
 | `chunks arrive every … the arm will hold` | `safety.watchdog_max_s` below the expected gap | Raise or unset it, or raise `refill_fraction` |
 | An episode ends with `safety: step` right after starting | The first targets are far from the current pose (wrong policy or start pose) | `policy-check`: the step-0 distance should be small |
 | An OAK isn't found, or `cameras` times out on it | Another program holds it (OAK Viewer, a second `ur5vla`) | Close that program; one at a time can use an OAK |
+| `Robotiq gripper: no answer on …` | No 24 V, wrong port or address, or RS-485 wiring | Check the gripper's LED, `ls /dev/serial/by-id/`, `gripper.slave_id` |
+| `Permission denied` on the gripper port | No access to the serial device | `sudo usermod -aG dialout $USER`, then log in again |
+| An episode ends with `violation: gripper` | Lost link, a gripper fault, or lost activation | `ur5vla gripper -c configs/cell.yaml` shows it; `--activate` clears a major fault |
 | `--view needs a display` | No desktop session (`DISPLAY` unset), e.g. over SSH | Run from the desktop, or leave out `--view` |
 | `blocked by workspace` during teleop | The TCP reached the workspace box | Intended; drive back in, or adjust `safety.workspace_*_m` |
 | `servoJ refused`, or the arm won't move | Protective stop, or another control script running | Clear the stop on the pendant; stop any External Control program |
