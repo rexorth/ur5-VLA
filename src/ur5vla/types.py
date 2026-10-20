@@ -41,6 +41,22 @@ class RobotState:
     gripper: float = 0.0            # 0 open .. 1 closed
     protective_stop: bool = False
     emergency_stop: bool = False
+    safety_mode: int = 1            # the controller's, see SAFETY_MODES: 1 normal, 2 reduced
+    robot_mode: int = 7             # see ROBOT_MODES: 7 running (powered, brakes released)
+    program_running: bool = True    # the ur_rtde control script on the controller
+    speed_scaling: float = 1.0      # below 1: the controller is slowing the arm (e.g. near a limit)
+    t_robot: float | None = None    # controller clock, s; None if unknown (simulated arm)
+
+
+# RTDE safety_mode and robot_mode values.
+SAFETY_MODES = {1: 'normal', 2: 'reduced', 3: 'protective stop', 4: 'recovery', 5: 'safeguard stop',
+                6: 'system emergency stop', 7: 'robot emergency stop', 8: 'violation', 9: 'fault',
+                10: 'validate joint id', 11: 'undefined', 12: 'automatic mode safeguard stop',
+                13: 'three-position enabling stop'}
+SAFETY_OK = (1, 2)
+ROBOT_MODES = {-1: 'no controller', 0: 'disconnected', 1: 'confirm safety', 2: 'booting', 3: 'power off',
+               4: 'power on', 5: 'idle (brakes on)', 6: 'backdrive', 7: 'running', 8: 'updating firmware'}
+ROBOT_RUNNING = 7
 
 
 @dataclass
