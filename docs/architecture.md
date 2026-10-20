@@ -127,7 +127,7 @@ also: recorder (1 poll + 2 writer threads), key listener thread, camera window (
 `config.py` turns one YAML cell file into a `RunConfig`: `robot`, `cameras`, `policy`, `control`,
 `safety`, `logging`, `teleop`, `gripper` and `prompt`. `-p <policy file>` replaces only the
 `policy:` block, so an openpi run and a LeRobot run share every other setting. The keys of each
-block are listed in procedures.md: [safety](procedures.md#25-safety-settings-to-set-before-the-arm-moves),
+block are listed in procedures.md: [safety](procedures.md#25-safety-limits-the-pendant-and-cellyaml-together),
 [gripper](procedures.md#34-gripper), [teleop](procedures.md#44-teleop-settings),
 [policy files](procedures.md#63-policy-files) and [timing](procedures.md#66-timing-settings).
 
@@ -136,7 +136,7 @@ block are listed in procedures.md: [safety](procedures.md#25-safety-settings-to-
   falling back to a default.
 - **Values are checked at load:** servoJ lookahead and gain within ur_rtde's ranges,
   `refill_fraction` in (0, 1], `watchdog_factor` > 1, six joint limits and three workspace bounds
-  with min < max, camera `rotate` in 0/90/180/270, gripper speed and force in [0, 1].
+  with min < max, positive speed and tracking limits, camera `rotate` in 0/90/180/270, gripper speed and force in [0, 1].
 - **Cameras and the policy stay plain dicts here.** Each driver and backend validates its own keys
   the same way when it is built, so a key meant for a different driver is also an error.
 - **Saved with every episode.** The config as loaded and its source path go into each episode's
@@ -146,27 +146,41 @@ block are listed in procedures.md: [safety](procedures.md#25-safety-settings-to-
 ## Robot arm
 
 `robot/arm.py`. One `Arm` interface: `connect(receive_only)`, `read_state`, `servo_j`,
-`servo_stop`, `move_j`, and `init_period`/`wait_period` around each tick. `make_arm` returns the
-real arm or the simulated one, from `robot.dry_run`.
+`servo_stop`, `move_j`, `recover`, `robot_info`, `within_robot_limits`, and
+`init_period`/`wait_period` around each tick. `make_arm` returns the real arm or the simulated
+one, from `robot.dry_run`.
 
 - **Real arm (`RTDEArm`).** ur_rtde's receive and control interfaces at `robot.rate_hz` (125 Hz,
   the CB3 maximum). The control interface uploads ur_rtde's own control script, so no External
   Control URCap program may be playing on the pendant.
 - **Read-only connection.** `receive_only=True` (`state`, `policy-check`) opens only the receive
   interface: nothing is uploaded, and nothing can move.
-- **State per tick:** joints and joint speeds, TCP pose, TCP wrench, and the protective-stop and
-  emergency-stop flags, stamped with the host clock. On a CB3 the wrench is the controller's
-  estimate from joint currents, not a sensor.
+- **Connecting to a stopped robot.** The receive interface connects first. If the robot isn't
+  running in normal or reduced mode, `connect` raises `RobotNotReady` instead of letting the
+  control interface time out waiting for its script; the CLI then waits for the robot
+  ([Command line](#command-line)).
+- **State per tick:** joints and joint speeds, TCP pose, TCP wrench, the robot's safety mode
+  (normal, reduced, protective stop, …), its arm mode (running, power off, …), whether our
+  control script runs, the speed scaling (below 1 the controller is slowing the arm) and the
+  controller's own timestamp, all stamped with the host clock. On a CB3 the wrench is the
+  controller's estimate from joint currents, not a sensor.
 - **Streaming.** `servo_j` calls `servoJ(q, 0, 0, period, lookahead, gain)`; servoJ ignores the
-  speed and acceleration arguments. If the controller refuses (control script stopped, usually by
-  a protective stop), it raises `ArmError`, which ends the episode as `error`.
+  speed and acceleration arguments. If the controller refuses, it raises `ArmError`. ur_rtde
+  refuses only when its script isn't running or the robot has stopped, so the loops treat a
+  refusal as a robot stop, reading the reason from the state.
+- **After a robot stop.** Any robot stop ends ur_rtde's control script. Once the stop is cleared
+  on the pendant, `recover()` reconnects if the link dropped and uploads the script again.
+- **Pendant settings.** `robot_info()` reads the TCP offset, the payload and the speed slider, for
+  the checks at connect. `within_robot_limits(q)` asks the controller whether its own limits
+  allow a pose; it is a round trip, so it is used before `moveJ`, not every tick.
 - **Tick timing.** `init_period`/`wait_period` are RTDE's `initPeriod`/`waitPeriod`, which hold an
   accurate 8 ms cadence.
-- **Closing** runs servoStop, stopScript and disconnect, each guarded so one failure doesn't skip
-  the rest.
+- **Closing** runs servoStop and stopScript if the script still runs, then disconnect, each
+  guarded so one failure doesn't skip the rest; failures are one-line warnings.
 - **Simulated arm (`SimArm`).** Follows servo targets with a 30 ms first-order lag, starting at
   `robot.start_q_deg` or [0, −90, 90, −90, −90, 0]°. Its wrench and TCP pose read zero, and `moveJ`
-  jumps straight to the target.
+  jumps straight to the target. `simulate_stop(mode)` acts out a robot stop (the arm halts, the
+  script ends, servoJ is refused until `recover()`), for dry runs and tests.
 
 ## Kinematics
 
@@ -372,17 +386,18 @@ watches for the end. Tuned by `control:` and `safety:`.
   inference before the first episode, so the model is loaded before anything moves.
 - **Execution thread, every 8 ms:**
   1. read the arm and the gripper position;
-  2. check for a stop: the e-stop, the robot's own protective or emergency stop, the force limit,
-     a gripper fault;
+  2. check for a stop: the e-stop, the robot's own state (any stop, power, its control script,
+     its data), the force limit, a gripper fault ([Safety layer](#safety-layer));
   3. check for a hold: a stale policy camera, or an overdue chunk (the watchdog);
-  4. otherwise take this tick's target from the buffer and check it (joint limits, step size,
-     workspace box);
+  4. otherwise take this tick's target from the buffer and check it (a number, joint limits, step
+     size, TCP speed, workspace box, distance from the arm);
   5. send it with servoJ, and the gripper target with it. If the buffer has run dry, re-send the
-     last target, so the arm settles on it;
+     last target, so the arm settles on it. If the controller refuses it, that is a stop;
   6. log the tick, and sleep out the rest of the period.
 - **Modes.** IDLE (no trajectory yet), SERVO, HOLD and STOPPED. A **hold** calls servoStop, resets
   the buffer to the current pose and resumes by itself when fresh frames and a chunk arrive. A
-  **stop** calls servoStop and ends the episode. Steps are never clipped to stay within a limit.
+  **stop** calls servoStop and ends the episode as `safety` (or `estop`), with the reason in words
+  in the log. Steps are never clipped to stay within a limit.
 - **Inference thread.** Asks for the next chunk when less than `refill_fraction` of the last
   chunk's duration is left (the first one at once). It builds the observation from the execution
   thread's latest state and each policy camera's latest frame. If any frame is older than
@@ -428,22 +443,83 @@ into it. The same merge runs for every backend.
 
 ## Safety layer
 
-`control/safety.py`. The checks run in the execution thread before every command, in policy runs
-and teleop alike. Configured under `safety:`; what to set before the arm moves is in
-[procedures.md](procedures.md#25-safety-settings-to-set-before-the-arm-moves).
+`control/safety.py`. The checks run in the execution thread every tick, in policy runs and teleop
+alike. Configured under `safety:`; what to set, in `cell.yaml` and on the pendant, is in
+[procedures.md](procedures.md#25-safety-limits-the-pendant-and-cellyaml-together).
 
-- **State checks:** the robot's own protective or emergency stop, and the force limit
-  (`ft_limit_n` on |F| after a tare at the start of each episode).
-- **Command checks:** joint limits (`joint_min_deg`/`joint_max_deg`); the per-tick step
-  (`max_step_rad`); and the workspace box (`workspace_min_m`/`workspace_max_m`), checked at the
-  TCP point given by `tcp_offset_m`.
-- **Never clipped.** A violating target is not shrunk into an allowed one: in a policy run the
-  episode ends. In teleop the step is refused instead, so the arm stops at the limit and can be
-  driven back out.
+- **State checks** (`check_state`): is the robot fit to move?
+  - its safety mode is normal or reduced: not a protective, safeguard or emergency stop,
+    recovery mode, a violation or a fault;
+  - it is powered with the brakes released, and our control script runs;
+  - its data are numbers, and the controller's timestamp advances (none new for 0.1 s means the
+    link is down);
+  - the force limit (`ft_limit_n` on |F| after a tare at the start of each episode).
+- **Command checks** (`check_command`), on every target before it is sent:
+  - it is a number (NaN passes every comparison, so this comes first);
+  - joint limits (`joint_min_deg`/`joint_max_deg`);
+  - joint speed, as the per-tick step (`max_step_rad`; 0.02 rad per 8 ms is 143°/s);
+  - TCP speed (`max_tcp_speed_m_s`) from the last target to this one;
+  - the workspace box (`workspace_min_m`/`workspace_max_m`);
+  - tracking (`max_tracking_error_deg`): how far the target is from where the arm is. A large gap
+    means the robot is slowing itself, near one of its own limits.
+
+  The TCP speed and the box are checked at the TCP point given by `tcp_offset_m`. Joint steps
+  alone don't bound the TCP speed: 0.01 rad on every joint in one tick moves the flange at about
+  1.5 m/s.
+- **Never clipped, never sent.** A violating target is not shrunk into an allowed one, and it is
+  not sent: in a policy run the episode ends. In teleop the step is refused instead, so the arm
+  stops at the limit and can be driven back out.
+- **In words.** `describe()` turns each violation into one line for the operator, saying which
+  limit and which key, and for a robot stop what to do on the pendant. The logs and teleop's
+  display use it.
 - **Holds live in the loop**, not here: stale cameras and the watchdog resume on their own, while
   violations end the episode.
 - **The CB3 force reading** is an estimate from joint currents, with an offset and swings during
   fast motion: a collision backstop, not a contact sensor.
+
+### Our limits and the robot's
+
+The robot enforces its own limits, set on the pendant (Installation → Safety), whatever this
+program does. They act in two stages, with a tolerance between them that the pendant shows next
+to each field:
+
+1. **The controller** keeps motion within each set value minus its tolerance. For speed, force,
+   power and momentum it slows the arm (the speed scaling in the robot state). Where slowing
+   can't keep motion inside a limit (a joint range, a safety plane, the tool orientation), it
+   protective-stops: the program stops, and the stop is cleared on the pendant.
+2. **The safety system** monitors the arm on its own. If a limit is actually exceeded it cuts
+   power (stop category 0): the pendant reports a violation, and the arm must be powered on
+   again.
+
+Other robot stops: a collision, or the arm falling too far behind its target, usually ends in a
+protective stop; an open safety input is a safeguard stop; an e-stop powers the arm off, and is
+cleared by releasing the button, powering on and releasing the brakes.
+
+So ours sit inside the robot's. Ours then act first, by refusing a target and saying why, and the
+robot's are a backstop that a correct setup doesn't reach. Two settings must match rather than
+nest:
+- **The TCP.** The robot checks its speed, force and planes at the pendant's TCP; we check ours at
+  `tcp_offset_m`.
+- **The payload.** The robot uses it to tell its own load from a collision.
+
+At connect the CLI warns if the TCPs differ by more than 5 mm, if a gripper is configured but the
+payload is under 0.3 kg, if the speed slider is below 100 %, or if the robot is in reduced mode
+(our limits don't change with it). Which of ours pairs with which pendant limit:
+[procedures.md](procedures.md#25-safety-limits-the-pendant-and-cellyaml-together).
+
+### When the robot stops anyway
+
+A robot stop, the force limit or a gripper fault:
+
+| Command | What happens |
+|---|---|
+| `teleop` | **Pauses.** servoStop, a bell, and the status says why and what to do. While the cause lasts the status follows it; once it clears, a fresh deadman press (or `r`) restarts the control script if the stop ended it, takes the arm's actual pose as the new command and tares the force reading again (as a new session would). The e-stop key, done and an unplugged controller still end the session. |
+| `demo` | Ends that demo as `safety` (saved, not offered for labelling), waits for the robot, then goes on to the next. |
+| `run` | Ends that episode as `safety`, waits for the robot, then goes on to the next. |
+| any, at connect | Waits for the robot, printing what the pendant must show, instead of failing. |
+
+"Waits for the robot" polls the state every 0.2 s until it is ready, says each new reason once,
+and uploads the control script again; Ctrl-C gives up.
 
 ## Gamepad and teleop
 
@@ -469,12 +545,19 @@ Configured under `teleop:`. Using it, the controls and the legend:
   4. Damped least squares on the Jacobian of the TCP turns it into a joint step:
      dq = Jᵀ(JJᵀ + λ²I)⁻¹ ξ dt, which stays bounded near singularities. A step faster than
      `max_joint_speed_deg_s` is scaled down.
-  5. The safety layer checks the step. A refused step isn't taken and a `blocked` event is logged:
-     the arm stops at the wall and can be driven back out.
+  5. The safety layer checks the step, against where the arm actually is too. A refused step isn't
+     taken, a `blocked` event is logged and the status says why: the arm stops at the wall and can
+     be driven back out.
   6. servoJ streams the target, with the same call, rate, lookahead and gain as policy runs.
 - **Gripper.** While A or B is held, the gripper target ramps at `gripper_speed`.
-- **Display.** The session publishes its latest robot state; `teleop` draws its live pose line
-  from it, and with `--view` the window shows the legend and the pose.
+- **Pauses.** With `pause_on_stop` (the `teleop` command) a robot stop, the force limit or a
+  gripper fault pauses the session rather than ending it
+  ([When the robot stops anyway](#when-the-robot-stops-anyway)). `demo` records, so it ends the
+  demo instead.
+- **Display.** The session publishes its latest robot state and a status (paused or blocked, and
+  why). `teleop` draws its live pose line from them, tagged PAUSED, BLOCKED, REDUCED mode or
+  "robot slowing to N %", and rings the bell on a pause. With `--view` the window shows the
+  status, the legend and the pose.
 - **Demonstrations.** `demo` runs the same session with a recorder: every tick logs the measured
   state and the commanded target, which becomes the demonstration's action.
 
@@ -557,5 +640,12 @@ and its flow around episodes are in [procedures.md](procedures.md).
 | `demo [--view]` | arm, gripper, controller, cameras, recorder | Yes, recorded |
 | `to-lerobot` | recordings | No |
 
+- **Connecting.** `run`, `teleop` and `demo` connect the arm through `_connect_arm`: it waits for
+  a stopped robot ([When the robot stops anyway](#when-the-robot-stops-anyway)), then checks the
+  pendant's settings against ours ([Our limits and the robot's](#our-limits-and-the-robots)).
+- **Start pose.** Before `moveJ` to `start_q_deg`, the pose is checked against our joint limits
+  and box, then against the robot's own limits; a refused pose or a failed move ends the run with
+  the reason, without a traceback.
+- **Ctrl-C** at a prompt or while waiting for the robot exits with code 130, without a traceback.
 - **Shutdown order.** Backend, gripper and arm are closed first, then the window and the cameras,
   so nothing slow can delay stopping the arm.

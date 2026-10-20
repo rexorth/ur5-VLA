@@ -44,6 +44,7 @@ These act without pressing Enter.
 |---|---|
 | space or `e` | Software e-stop: servoStop, and the run ends |
 | `d` | End the episode normally |
+| `r` | `teleop` only: resume after a pause, like a fresh deadman press |
 | Ctrl-C | Same as e-stop |
 
 With `--view` the keys also work in the camera window. Prompts that need Enter (starting an
@@ -138,21 +139,57 @@ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
   URCap may be running. ur_rtde uploads its own control script, and two scripts fight over the
   controller.
 - **Network:** this PC must reach `robot.ip` (192.168.10.125).
-- **Safety planes:** configure them on the pendant (Installation → Safety). They are the first line
-  of defence; the software limits below are a second.
+- **Safety limits, TCP and payload:** set on the pendant, together with ours ([2.5](#25-safety-limits-the-pendant-and-cellyaml-together)).
 
-### 2.5 Safety settings to set before the arm moves
+### 2.5 Safety limits: the pendant and cell.yaml together
 
-In `configs/cell.yaml`:
+There are two layers: ours, under `safety:` in `configs/cell.yaml`, checked before every command;
+and the robot's own, set on the pendant. Set ours inside the robot's, so ours act first (the
+target is refused and you're told why) and the robot's stay a backstop. How the two interact:
+[architecture.md](architecture.md#our-limits-and-the-robots).
 
-| Key | Set to | Why |
+**On the pendant** (PolyScope 3 on the CB3):
+1. **TCP and payload:** Installation → TCP Configuration. Set the TCP to the point between the
+   gripper's fingertips, and the payload to the gripper's mass and centre of gravity (from its
+   datasheet). Put the same TCP offset in `safety.tcp_offset_m`.
+2. **Safety:** Installation → Safety, unlocked with the safety password.
+   - **General limits:** the preset slider, or Advanced for TCP speed, force, power and momentum.
+     Each has a Normal and a Reduced value.
+   - **Joint limits:** maximum speed and position range, per joint.
+   - **Boundaries:** safety planes, and optionally the tool orientation.
+3. **Apply** and confirm. The safety checksum shown on the pendant changes: note it, so a later
+   change is noticed.
+4. **Speed slider** at 100 %. Below it the arm can lag the commands.
+
+The pendant shows each limit's tolerance next to its field. "Above ours" in the table means above
+by that tolerance plus a margin.
+
+| Ours (`safety:`) | Its pendant counterpart | Set |
 |---|---|---|
-| `safety.joint_min_deg` / `joint_max_deg` | The task's joint range | The shipped ±360° is no limit at all |
-| `safety.workspace_min_m` / `workspace_max_m` | The task box, in the UR base frame (as the pendant shows it) | The shipped box is loose |
-| `safety.tcp_offset_m` | Flange-to-fingertip offset, once a gripper is mounted | The box is checked at this point |
-| `robot.start_q_deg` | A taught start pose ([3.6](#36-teleop-on-the-arm)) | Every episode `moveJ`s here first |
-| `safety.max_step_rad` | Keep 0.02 | Per-8 ms-tick jump that stops a run; never clipped |
-| `safety.ft_limit_n` | 30 to start | On a CB3 this is a joint-current estimate, tared each episode |
+| `joint_min_deg` / `joint_max_deg` | Joint limits → position range | Ours: the task's range (the shipped ±360° is no limit). Pendant: wider than ours |
+| `workspace_min_m` / `workspace_max_m` | Boundaries → safety planes | Ours: the task box, UR base frame as the pendant shows it (the shipped box is loose). Pendant: a plane a few cm outside each face that matters, normal pointing into the box |
+| `max_step_rad` (any joint, per 8 ms tick) | Joint limits → maximum speed | Pendant above `max_step_rad` / 0.008 s: 0.02 rad is 143°/s. For a pendant limit of 120°/s, use at most 0.016 (115°/s) |
+| `max_tcp_speed_m_s` | General limits → TCP speed | Pendant above ours |
+| `ft_limit_n` | General limits → force | Pendant above ours, with a wide margin: ours is a joint-current estimate, tared each episode. 30 N is a start |
+| `tcp_offset_m` | TCP Configuration | **Equal**, not nested: both layers must check the same point |
+| `max_tracking_error_deg` | none | 15°. Lower catches a slowing robot sooner, but servoJ lags by up to a few degrees at speed |
+
+Also set `robot.start_q_deg` to a taught start pose ([3.6](#36-teleop-on-the-arm)); every
+episode `moveJ`s there first, after checking it against both layers. Teleop's speeds
+(`teleop.max_linear_m_s` and the others, [4.4](#44-teleop-settings)) should stay below the
+`safety:` limits, so normal jogging never meets them.
+
+Our limits don't change in reduced mode. If you use reduced mode, set ours inside its values;
+otherwise the robot slows the arm there (teleop shows `REDUCED mode` and `robot slowing`).
+
+**Check each layer** once, slowly, after any change:
+1. **Modes:** `ur5vla state` ([3.2](#32-robot-state-read-only)) shows the safety mode. Press the
+   e-stop: it reads `robot emergency stop`; release it and power on: `normal`.
+2. **Ours:** jog slowly into a box face with `ur5vla teleop`. The pose line shows `BLOCKED`, the
+   log names the face, and the robot doesn't stop.
+3. **The robot's:** enlarge our box past a safety plane for this test only, and jog slowly into
+   the plane. The robot protective-stops and teleop shows `PAUSED: Protective stop…`. Clear it on
+   the pendant, press LB, and teleop carries on. Put the box back.
 
 ---
 
@@ -193,7 +230,9 @@ pendant program. Twice a second until Ctrl-C, it prints:
 - joints in degrees;
 - TCP position in m, in the UR base frame;
 - force magnitude |F| in N;
-- the protective-stop and emergency-stop flags;
+- the robot's safety mode (`normal`, `reduced`, `protective stop`, `robot emergency stop`, …);
+- the arm's mode (`running`, `power off`, `idle (brakes on)`, …);
+- the speed scaling: below 100 % the controller is slowing the arm;
 - with a gripper configured, its status (read-only).
 
 **Check.**
@@ -284,7 +323,8 @@ you expect.
 Run `ur5vla teleop -c configs/cell.yaml` ([4.2](#42-ur5vla-teleop)). On the first run, verify:
 - the deadman: nothing moves unless LB is held;
 - motion in both the base and the tool frame;
-- that the workspace box stops the arm where you expect.
+- that the workspace box stops the arm where you expect, and the other checks in
+  [2.5](#25-safety-limits-the-pendant-and-cellyaml-together).
 
 Then jog to a good start pose and end with Menu or `d`. Teleop prints the pose as a
 `start_q_deg: [...]` line; paste it under `robot:` in the cell file. Add `--view` to watch the
@@ -337,8 +377,15 @@ ur5vla teleop -c configs/cell.yaml [--view] [--dry-run]
 
 How jogging works, tick by tick: [architecture.md](architecture.md#gamepad-and-teleop).
 
-**Ending.** Menu or `d`. A robot stop, the force limit, the e-stop, a gripper fault or an unplugged
-controller also end it.
+**Ending.** Menu or `d`. The e-stop or an unplugged controller also end it.
+
+**Pauses.** A robot stop (protective, safeguard or emergency stop, …), the force limit or a
+gripper fault pauses teleop instead of ending it. The arm stops, the terminal bell rings, and the
+log says why and what to do on the pendant. Do that; when the log says the stop is cleared, press
+LB (or `r`) and carry on from where the arm is. ([How](architecture.md#when-the-robot-stops-anyway))
+
+**Limits.** A move that would break one of our limits ([2.5](#25-safety-limits-the-pendant-and-cellyaml-together))
+isn't sent: the arm stops at it, the log names the limit and its key, and you can drive back out.
 
 **Legend.** At the start, teleop prints the controls for the configured mapping: which control
 moves along or rotates about each axis, and which way is +. Rotations are about axes through the
@@ -349,7 +396,9 @@ and the pose. Control names assume the `xpad` numbering ([4.4](#44-teleop-settin
 
 **Output.**
 - While it runs, one terminal line shows the joints (degrees), the TCP point (mm, UR base frame,
-  at `safety.tcp_offset_m`: the point the workspace box checks) and the jog frame.
+  at `safety.tcp_offset_m`: the point the workspace box checks) and the jog frame, tagged
+  `PAUSED`, `BLOCKED`, `REDUCED mode` or `robot slowing to N %` when they apply. With `--view`
+  the window shows the full status above the legend.
 - On exit, it prints the final pose and a `start_q_deg:` line to paste into the cell file.
 
 **Default controls** ([4.4](#44-teleop-settings)):
@@ -399,8 +448,10 @@ ur5vla demo -c configs/cell.yaml --prompt "pick up the red block" \
    - `f`: fail;
    - `d`: discard.
 
-A safety stop, e-stop or lost controller ends both the demo and the session, without the label
-prompt.
+A robot stop, the force limit or a gripper fault ends the demo, which is saved without the label
+prompt; `demo` then waits until the robot is ready (the terminal says what to clear on the
+pendant) and goes on to the next demo. The e-stop, an error or a lost
+controller end the session.
 
 **Tips.**
 - Use the same start pose, scene reset and prompt wording for every demo of a task.
@@ -619,14 +670,17 @@ ur5vla run -c configs/cell.yaml -p configs/policy/<file>.yaml --prompt "..." \
 
 **Flow.**
 1. **Connect:** starts the cameras, connects the policy backend, then connects the arm (which
-   uploads ur_rtde's control script).
+   uploads ur_rtde's control script). If the robot is stopped it waits, saying what to clear on
+   the pendant; then it warns about pendant settings that don't match ours
+   ([2.5](#25-safety-limits-the-pendant-and-cellyaml-together)).
 2. **Warm up:** runs one inference and discards it, so the model loads and compiles before anything
    moves.
-3. **For each episode:** optional `moveJ` to `start_q_deg` (after asking), then Enter to start (`q`
-   quits). It records the episode (`kind: rollout`) while the control loop runs
+3. **For each episode:** optional `moveJ` to `start_q_deg` (after asking; refused if the pose is
+   outside our limits or the robot's), then Enter to start (`q` quits). It records the episode (`kind: rollout`) while the control loop runs
    ([how](architecture.md#control-loop)).
 4. **End:** `d`, the time limit, the e-stop, a safety stop, the policy finishing (replay), or an
-   error.
+   error. After a safety stop it waits until the robot is ready before the next episode; an
+   e-stop or an error ends the run.
 5. **Label:** after a normal end, success / fail / discard, the number of interventions, and a
    note. After an e-stop it saves without asking.
 
@@ -890,6 +944,11 @@ ignores adapters. There's no merge script in this repo yet.
 | `Permission denied` on the gripper port | No access to the serial device | `sudo usermod -aG dialout $USER`, then log in again |
 | An episode ends with `violation: gripper` | Lost link, a gripper fault, or lost activation | `ur5vla gripper -c configs/cell.yaml` shows it; `--activate` clears a major fault |
 | `--view needs a display` | No desktop session (`DISPLAY` unset), e.g. over SSH | Run from the desktop, or leave out `--view` |
-| `blocked by workspace` during teleop | The TCP reached the workspace box | Intended; drive back in, or adjust `safety.workspace_*_m` |
-| `servoJ refused`, or the arm won't move | Protective stop, or another control script running | Clear the stop on the pendant; stop any External Control program |
+| `teleop: blocked: …` | A move would break one of our limits; the message names it and its key | Intended; drive back. If it blocks where it shouldn't, adjust that key ([2.5](#25-safety-limits-the-pendant-and-cellyaml-together)) |
+| `PAUSED: Protective stop…`, or an episode ends with `violation: robot_stopped` | The robot stopped itself: a pendant limit, a collision, or the arm behind its target | Read the cause on the pendant, fix it, clear the stop; teleop resumes on LB. If a pendant limit tripped before ours, set ours inside it ([2.5](#25-safety-limits-the-pendant-and-cellyaml-together)) |
+| `waiting for the robot: …` | The robot is stopped, powered off or has its brakes on | Do what the line says on the pendant; it carries on by itself |
+| `robot slowing to N %`, or `blocked: … behind the command` | The controller is slowing the arm near one of its limits, or the speed slider is below 100 % | Set ours inside the pendant's; slider to 100 % |
+| `the pendant's TCP is … mm from the flange but safety.tcp_offset_m is …` | The two layers check different points | Set the pendant TCP and `safety.tcp_offset_m` to the same point |
+| An episode ends with `violation: tcp_speed` | The policy moved the TCP faster than `safety.max_tcp_speed_m_s` | Intended; raise it only within the pendant's TCP speed limit |
+| The arm won't move and nothing is paused | Another control script is running | Stop any External Control program on the pendant |
 | `overruns` > 0 in `meta.json` | Another process starved the 125 Hz loop | Avoid heavy work (model loading, training) on this PC during runs, or limit its threads |
