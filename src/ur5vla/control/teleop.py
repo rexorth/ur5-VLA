@@ -96,7 +96,7 @@ class TeleopSession:
         self.gripper = gripper
         self.pad = pad
         self.mapping = cfg.teleop.mapping()
-        self.safety = SafetyLayer(cfg.safety)
+        self.safety = SafetyLayer(cfg.safety, cfg.robot.period_s)
         self.jog = CartesianJogger(cfg.teleop, np.asarray(cfg.safety.tcp_offset_m))
         self.frame = cfg.teleop.frame
         self.state: RobotState | None = None     # latest read by the execution thread, for display

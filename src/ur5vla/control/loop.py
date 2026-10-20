@@ -12,8 +12,9 @@ What stops the arm:
       a chunk overdue (watchdog: none within safety.watchdog_factor x the expected gap between
       chunks, capped at safety.watchdog_max_s); a policy camera older than safety.max_frame_age_s.
   STOPPED (servoStop, episode ends):
-      any SafetyLayer violation, the robot's own protective/emergency stop, the software e-stop,
-      an arm error.
+      any SafetyLayer violation (a target that breaks our limits is never sent), the robot's own
+      stops (protective, safeguard, emergency, ...; also a servoJ the controller refuses), the
+      software e-stop. These end as `safety` (or `estop`); anything unexpected as `error`.
 If the buffer runs dry without tripping either, the last target is re-sent: the arm settles on
 it and stays in servo mode until the next chunk or the watchdog.
 """
@@ -34,11 +35,11 @@ from ..cameras.base import CameraSource
 from ..config import RunConfig
 from ..policy.base import PolicyBackend, PolicyDone
 from ..recording import EpisodeRecorder
-from ..robot.arm import Arm
+from ..robot.arm import Arm, ArmError
 from ..robot.gripper import Gripper
 from ..types import Observation, PolicyInfo, RobotState
 from .chunks import ChunkBuffer
-from .safety import SafetyLayer, Violation
+from .safety import SafetyLayer, Violation, describe
 
 log = logging.getLogger(__name__)
 
@@ -75,7 +76,7 @@ class ControlLoop:
         self.cameras = cameras
         self.backend = backend
         self.policy_info = policy_info
-        self.safety = SafetyLayer(cfg.safety)
+        self.safety = SafetyLayer(cfg.safety, cfg.robot.period_s)
         self.buffer = ChunkBuffer(cfg.robot.period_s, cfg.control.crossfade_steps)
         self.estop = threading.Event()          # software e-stop: set from any thread
         self.end_request = threading.Event()    # operator ends the episode normally
@@ -219,16 +220,14 @@ class ControlLoop:
                         target = self.buffer.sample(now)
                         if target is not None:
                             ref = q_cmd if mode == Mode.SERVO else state.q
-                            violation = self.safety.check_command(target[0], ref)
+                            violation = self.safety.check_command(target[0], ref, state.q)
 
                 sent = None
                 if violation is not None:
                     if mode == Mode.SERVO:
                         self.arm.servo_stop()
                     mode = Mode.STOPPED
-                    rec.log_event('safety', reason=violation.reason, **violation.detail)
-                    reason = 'estop' if violation.reason == 'estop' else 'safety'
-                    self._end(reason, {'violation': violation.reason, **violation.detail})
+                    self._stop(violation)
                 elif hold_reason is not None:
                     if mode == Mode.SERVO:
                         self.arm.servo_stop()
@@ -236,16 +235,21 @@ class ControlLoop:
                         self._holds += 1
                         mode = Mode.HOLD
                         rec.log_event('hold', reason=hold_reason)
-                elif target is not None:
-                    if mode == Mode.HOLD:
+                elif target is not None or mode == Mode.SERVO:
+                    if target is None:
+                        target = q_cmd, g_cmd   # buffer ran dry: settle on the last target
+                    elif mode == Mode.HOLD:
                         rec.log_event('resume')
-                    q_cmd, g_cmd = target
-                    self.arm.servo_j(q_cmd)
-                    self.gripper.command(g_cmd)
-                    mode, sent = Mode.SERVO, q_cmd
-                elif mode == Mode.SERVO:
-                    self.arm.servo_j(q_cmd)     # buffer ran dry: settle on the last target
-                    sent = q_cmd
+                    try:
+                        self.arm.servo_j(target[0])
+                    except ArmError:
+                        violation = self.safety.refusal(self.arm.read_state())
+                        mode = Mode.STOPPED
+                        self._stop(violation)
+                    else:
+                        q_cmd, g_cmd = target
+                        self.gripper.command(g_cmd)
+                        mode, sent = Mode.SERVO, q_cmd
 
                 rec.log_tick(now, state.q, state.qd, state.tcp_pose, state.wrench, state.gripper,
                              sent, g_cmd if sent is not None else None, int(mode), loop_dt)
@@ -261,6 +265,12 @@ class ControlLoop:
                     self.arm.servo_stop()
                 except Exception:
                     log.exception('servo_stop failed')
+
+    def _stop(self, violation: Violation) -> None:
+        log.warning('stopped: %s', describe(violation))
+        self._recorder.log_event('safety', reason=violation.reason, **violation.detail)
+        reason = 'estop' if violation.reason == 'estop' else 'safety'
+        self._end(reason, {'violation': violation.reason, **violation.detail})
 
     # ---- inference thread ----
 

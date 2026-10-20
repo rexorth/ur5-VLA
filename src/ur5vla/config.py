@@ -85,6 +85,11 @@ class ControlConfig:
 @dataclass
 class SafetyConfig:
     max_step_rad: float = 0.02      # per 8 ms tick; a larger jump stops, it is never clipped
+    # Speed of the tool point (tcp_offset_m) between consecutive targets; None disables.
+    max_tcp_speed_m_s: float | None = 0.5
+    # How far a target may be from where the arm actually is. Larger means the arm isn't keeping
+    # up (the controller slows itself near its own limits); None disables.
+    max_tracking_error_deg: float | None = 15.0
     ft_limit_n: float | None = 30.0 # on |F| after a tare at episode start; None disables
     # Hold when a chunk is overdue: none arrived within watchdog_factor x the expected gap
     # between chunks, max((1 - control.refill_fraction) x chunk duration, last latency).
@@ -106,6 +111,11 @@ class SafetyConfig:
             raise ConfigError('safety.watchdog_factor must be > 1 (it is a margin over the expected gap)')
         if self.watchdog_max_s is not None and self.watchdog_max_s <= 0:
             raise ConfigError('safety.watchdog_max_s must be > 0, or null for no cap')
+        for key in ('max_tcp_speed_m_s', 'max_tracking_error_deg'):
+            if getattr(self, key) is not None and getattr(self, key) <= 0:
+                raise ConfigError(f'safety.{key} must be > 0, or null to disable')
+        if self.max_step_rad <= 0:
+            raise ConfigError('safety.max_step_rad must be > 0')
         for key in ('joint_min_deg', 'joint_max_deg'):
             if len(getattr(self, key)) != 6:
                 raise ConfigError(f'safety.{key} needs 6 values')

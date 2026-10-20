@@ -8,7 +8,7 @@ import pytest
 from ur5vla import config as config_mod
 from ur5vla.config import ConfigError, SafetyConfig
 from ur5vla.control.chunks import ChunkBuffer
-from ur5vla.control.safety import SafetyLayer
+from ur5vla.control.safety import SafetyLayer, describe
 from ur5vla.policy.base import ActionMapping
 from ur5vla.robot.kinematics import fk, tool_point
 from ur5vla.types import ActionChunk, Observation, RobotState
@@ -90,33 +90,90 @@ def _state(**kw):
 
 
 def test_safety_accepts_small_step_at_home():
-    s = SafetyLayer(SafetyConfig())
-    assert s.check_command(HOME + 0.01, HOME) is None
+    s = SafetyLayer(SafetyConfig(), TICK)
+    assert s.check_command(HOME + 0.002, HOME) is None          # ~0.3 m/s at the flange
 
 
 def test_safety_rejects_large_step_instead_of_clipping():
-    s = SafetyLayer(SafetyConfig(max_step_rad=0.02))
+    s = SafetyLayer(SafetyConfig(max_step_rad=0.02), TICK)
     v = s.check_command(HOME + np.array([0, 0, 0.05, 0, 0, 0]), HOME)
     assert v.reason == 'step' and v.detail['joint'] == 2
 
 
 def test_safety_joint_limits_and_workspace():
     s = SafetyLayer(SafetyConfig(joint_min_deg=[-10, -180, -180, -180, -180, -180],
-                                 joint_max_deg=[10, 180, 180, 180, 180, 180]))
+                                 joint_max_deg=[10, 180, 180, 180, 180, 180]), TICK)
     q = HOME.copy()
     q[0] = np.deg2rad(15)
     assert s.check_command(q, q).reason == 'joint_limit'
-    tight = SafetyLayer(SafetyConfig(workspace_min_m=[-0.1, -0.1, 0.5], workspace_max_m=[0.1, 0.1, 0.6]))
+    tight = SafetyLayer(SafetyConfig(workspace_min_m=[-0.1, -0.1, 0.5], workspace_max_m=[0.1, 0.1, 0.6]), TICK)
     assert tight.check_command(HOME, HOME).reason == 'workspace'
 
 
 def test_safety_force_is_tared_and_robot_stops_are_caught():
-    s = SafetyLayer(SafetyConfig(ft_limit_n=30))
+    s = SafetyLayer(SafetyConfig(ft_limit_n=30), TICK)
     offset = np.array([20.0, 0, 0, 0, 0, 0])
     s.tare(offset)
     assert s.check_state(_state(wrench=offset + [25, 0, 0, 0, 0, 0])) is None
     assert s.check_state(_state(wrench=offset + [0, 0, 31, 0, 0, 0])).reason == 'force'
     assert s.check_state(_state(protective_stop=True)).reason == 'robot_stopped'
+
+
+def test_safety_refuses_nan_and_too_fast_tcp_before_sending():
+    s = SafetyLayer(SafetyConfig(max_step_rad=0.05, max_tcp_speed_m_s=0.5), TICK)
+    q = HOME.copy()
+    q[2] = np.nan
+    assert s.check_command(q, HOME).reason == 'invalid_target'     # NaN compares False everywhere
+    fast = HOME + np.array([0, 0.012, 0, 0, 0, 0])                    # shoulder: ~1 m/s at the flange
+    v = s.check_command(fast, HOME)
+    assert v.reason == 'tcp_speed' and v.detail['speed_m_s'] > 0.5
+    assert SafetyLayer(SafetyConfig(max_step_rad=0.05, max_tcp_speed_m_s=None), TICK).check_command(fast, HOME) is None
+    assert 'safety.max_tcp_speed_m_s' in describe(v)
+
+
+def test_safety_tracking_and_step_report_in_words():
+    s = SafetyLayer(SafetyConfig(max_tracking_error_deg=10), TICK)
+    ahead = HOME + np.deg2rad([0, 0, 0, 0, 0, 12])
+    v = s.check_command(ahead, ahead, q_actual=HOME)
+    assert v.reason == 'tracking' and v.detail['joint'] == 5
+    assert describe(v).startswith('Wrist 3 is 12.0 deg behind')
+    assert s.check_command(ahead, ahead) is None                       # no q_actual: not checked
+    step = s.check_command(HOME + np.array([0, 0, 0.05, 0, 0, 0]), HOME)
+    assert 'Elbow would move at 358 deg/s, over the 143 deg/s allowed' in describe(step)
+
+
+@pytest.mark.parametrize('mode, words', [(3, 'Protective stop'), (5, 'Safeguard stop'),
+                                         (7, 'release the e-stop button'), (4, 'Recovery mode'),
+                                         (8, 'Safety violation'), (9, 'Safety fault')])
+def test_robot_stop_modes_are_caught_and_explained(mode, words):
+    s = SafetyLayer(SafetyConfig(), TICK)
+    v = s.check_state(_state(safety_mode=mode))
+    assert v.reason == 'robot_stopped' and words in describe(v)
+    assert s.robot_condition(_state(safety_mode=mode)) is not None
+
+
+def test_robot_power_script_link_and_data_checks():
+    s = SafetyLayer(SafetyConfig(), TICK)
+    assert s.check_state(_state(safety_mode=2)) is None                # reduced mode still moves
+    assert 'power it on' in describe(s.check_state(_state(robot_mode=5)))
+    v = s.check_state(_state(program_running=False))
+    assert v.detail['program'] == 'stopped' and s.robot_condition(_state(program_running=False)) is None
+    assert s.check_state(_state(wrench=np.array([np.nan] * 6))).reason == 'robot_data'
+    assert s.check_state(_state(t=0.0, t_robot=5.0)) is None
+    assert s.check_state(_state(t=0.05, t_robot=5.0)) is None          # same packet: fine for a while
+    assert s.check_state(_state(t=0.2, t_robot=5.0)).reason == 'robot_link'
+    assert s.check_state(_state(t=0.21, t_robot=5.008)) is None        # data again
+    # A refused command with nothing showing yet in the state: blamed on the control script.
+    assert s.refusal(_state()).detail['program'] == 'stopped'
+    assert s.refusal(_state(safety_mode=3)).detail['safety_mode'] == 'protective stop'
+
+
+def test_new_safety_keys_validate():
+    with pytest.raises(ConfigError, match='max_tcp_speed_m_s'):
+        SafetyConfig(max_tcp_speed_m_s=0)
+    with pytest.raises(ConfigError, match='max_tracking_error_deg'):
+        SafetyConfig(max_tracking_error_deg=-1)
+    assert SafetyConfig(max_tcp_speed_m_s=None, max_tracking_error_deg=None)
 
 
 # ---- action mapping ----

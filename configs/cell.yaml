@@ -30,8 +30,13 @@ control:
   crossfade_steps: 5
   max_episode_s: 120
 
+# Our limits act first and gently (a refused target is never sent); the pendant's safety
+# configuration is the backstop. Keep each of these inside its pendant counterpart:
+# docs/procedures.md#25-safety-limits-the-pendant-and-cellyaml-together
 safety:
-  max_step_rad: 0.02          # per 8 ms tick
+  max_step_rad: 0.02          # per 8 ms tick, any joint: 0.02 rad = 143 deg/s
+  max_tcp_speed_m_s: 0.5      # at tcp_offset_m; null = off
+  max_tracking_error_deg: 15  # target vs. where the arm is: larger = the robot is slowing itself
   ft_limit_n: 30              # CB3: on the controller's joint-current wrench ESTIMATE, tared per episode
   # Watchdog: hold if the next chunk is overdue. After each chunk the next is expected
   # ~(1 - refill_fraction) * chunk duration later (or after one latency, if the server is slower
