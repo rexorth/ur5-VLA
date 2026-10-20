@@ -32,12 +32,14 @@ import numpy as np
 from . import config as config_mod
 from . import convert
 from .cameras import CameraSource, build_cameras
-from .control import ControlLoop
+from .control import ControlLoop, SafetyLayer
+from .control.safety import describe
 from .keys import KeyListener
 from .policy import build_backend
 from .recording import EpisodeRecorder
-from .robot import make_arm, make_gripper
+from .robot import ArmError, RobotNotReady, make_arm, make_gripper
 from .robot.kinematics import tool_point
+from .types import ROBOT_MODES, SAFETY_MODES
 
 log = logging.getLogger('ur5vla')
 
@@ -79,16 +81,94 @@ def _ask(prompt: str, assume_yes: bool, default: str = '') -> str:
 
 
 def _move_to_start(cfg: config_mod.RunConfig, arm, assume_yes: bool) -> bool:
-    """moveJ to robot.start_q_deg after confirmation. False if the operator declines."""
+    """moveJ to robot.start_q_deg after confirmation. False if the operator declines, or the pose
+    is outside our limits or the robot's, or the move doesn't complete."""
     if cfg.robot.start_q_deg is None:
         return True
+    q = np.deg2rad(cfg.robot.start_q_deg)
+    refused = SafetyLayer(cfg.safety, cfg.robot.period_s).check_command(q, q)
+    if refused is not None:
+        print(f'start pose refused: {describe(refused)}')
+        return False
+    try:
+        inside = arm.within_robot_limits(q)
+    except Exception as exc:                # a check, not a requirement
+        log.debug('within_robot_limits: %s', exc)
+        inside = True
+    if not inside:
+        print("start pose refused: it is outside the robot's own safety limits (the pendant's joint "
+              "limits or safety planes) or out of reach")
+        return False
     q_now = np.rad2deg(arm.read_state().q)
     print(f'start pose {cfg.robot.start_q_deg} deg (now {np.round(q_now, 1).tolist()})')
     if _ask(f'move there at {cfg.robot.move_speed_deg_s} deg/s? [y/N] ', assume_yes, 'y') != 'y':
         return False
-    arm.move_j(np.deg2rad(cfg.robot.start_q_deg), np.deg2rad(cfg.robot.move_speed_deg_s),
-               np.deg2rad(cfg.robot.move_accel_deg_s2))
+    try:
+        arm.move_j(q, np.deg2rad(cfg.robot.move_speed_deg_s), np.deg2rad(cfg.robot.move_accel_deg_s2))
+    except ArmError as exc:
+        print(f'move to the start pose failed: {exc}')
+        return False
     return True
+
+
+def _wait_until_ready(cfg: config_mod.RunConfig, arm) -> None:
+    """Until the robot can move again: any stop cleared on the pendant, powered, brakes released,
+    and its control script running (uploaded again if a stop ended it). Ctrl-C gives up."""
+    check = SafetyLayer(cfg.safety, cfg.robot.period_s)
+    said = None
+    while True:
+        v = check.robot_condition(arm.read_state())
+        if v is None:
+            try:
+                if arm.recover():
+                    if said is not None:
+                        print('robot ready', flush=True)
+                    return
+                text = "the robot's control script didn't start: check the pendant"
+            except RobotNotReady as exc:    # stopped again in between
+                text = str(exc)
+        else:
+            text = describe(v)
+            if v.reason == 'robot_link':        # fresh data is what clears it: reconnect
+                try:
+                    arm.recover()
+                except Exception as exc:
+                    log.warning('reconnecting to the robot failed: %s', exc)
+        if text != said:
+            print(f'waiting for the robot: {text} (Ctrl-C to quit)', flush=True)
+            said = text
+        time.sleep(0.2)
+
+
+def _connect_arm(cfg: config_mod.RunConfig, arm) -> None:
+    """Connect with control, waiting first if the robot is stopped; then check its settings."""
+    try:
+        arm.connect()
+    except RobotNotReady:
+        _wait_until_ready(cfg, arm)
+    _check_robot_settings(cfg, arm)
+
+
+def _check_robot_settings(cfg: config_mod.RunConfig, arm) -> None:
+    """Warn where the pendant's settings don't match what our limits assume."""
+    info, state = arm.robot_info(), arm.read_state()
+    if info['tcp_offset'] is not None:
+        theirs = np.asarray(info['tcp_offset'][:3]) * 1000
+        ours = np.asarray(cfg.safety.tcp_offset_m) * 1000
+        if np.linalg.norm(theirs - ours) > 5:
+            log.warning("the pendant's TCP is %s mm from the flange but safety.tcp_offset_m is %s mm. "
+                        "The robot checks its speed, force and plane limits at its TCP and we check "
+                        "ours at tcp_offset_m: set both to the same point.",
+                        np.round(theirs).tolist(), np.round(ours).tolist())
+    if info['payload_kg'] is not None and cfg.gripper.type != 'none' and info['payload_kg'] < 0.3:
+        log.warning("the pendant's payload is %.2f kg with a gripper mounted: set it to the gripper's "
+                    "mass, or the robot misjudges forces and may protective-stop on its own.",
+                    info['payload_kg'])
+    if info['speed_slider'] is not None and info['speed_slider'] < 0.999:
+        log.warning("the pendant's speed slider is at %.0f%%: the arm may lag the commands. Set it "
+                    "to 100%%.", info['speed_slider'] * 100)
+    if state.safety_mode == 2:
+        log.warning('the robot is in REDUCED mode: its reduced safety limits apply')
 
 
 def _ask_outcome(assume_yes: bool, interventions: bool = True) -> dict:
@@ -117,9 +197,12 @@ def _close_viewer(viewer) -> None:
         viewer.close()
 
 
-def _episode_keys(estop: threading.Event, end: threading.Event) -> dict:
+def _episode_keys(estop: threading.Event, end: threading.Event, resume: threading.Event | None = None) -> dict:
     # '\x03' is Ctrl-C pressed in the camera window; in the terminal, Ctrl-C raises SIGINT instead.
-    return {' ': estop.set, 'e': estop.set, '\x03': estop.set, 'd': end.set}
+    keys = {' ': estop.set, 'e': estop.set, '\x03': estop.set, 'd': end.set}
+    if resume is not None:
+        keys['r'] = resume.set
+    return keys
 
 
 @contextlib.contextmanager
@@ -149,16 +232,22 @@ def _teleop_display(session, tcp_offset_m, viewer, terminal: bool):
     stop = threading.Event()
 
     def show():
+        was_paused = False
         while not stop.wait(0.2):
-            if session.state is None:
+            state = session.state
+            if state is None:
                 continue
-            pose = _pose_text(session.state.q, tcp_offset_m)
+            pose = _pose_text(state.q, tcp_offset_m)
+            flags = _robot_flags(session, state)
             if terminal:
                 # The cursor is left at the start of the line, so a log message overwrites it
-                # rather than being appended to it.
-                print(f'{pose}  {session.frame:4} frame\r', end='', flush=True)
+                # rather than being appended to it. Pauses ring the bell.
+                bell = '\a' if session.paused and not was_paused else ''
+                print(f'{bell}{pose}  {session.frame:4} frame{flags}\r', end='', flush=True)
             if viewer is not None:
-                viewer.set_info(f'{session.mapping.legend(session.frame)}\n\n{pose}')
+                status = f'{session.status}\n\n' if session.status else ''
+                viewer.set_info(f'{status}{session.mapping.legend(session.frame)}\n\n{pose}{flags}')
+            was_paused = session.paused
 
     thread = threading.Thread(target=show, name='teleop-display', daemon=True)
     thread.start()
@@ -169,6 +258,20 @@ def _teleop_display(session, tcp_offset_m, viewer, terminal: bool):
         thread.join()
         if terminal:
             print('\x1b[K', end='', flush=True)    # clear it: the caller prints the final pose
+
+
+def _robot_flags(session, state) -> str:
+    """Short tags for the pose line: paused, blocked, the robot in reduced mode or slowing itself."""
+    flags = []
+    if session.paused:
+        flags.append('PAUSED')
+    elif session.status:
+        flags.append('BLOCKED')
+    if state.safety_mode == 2:
+        flags.append('REDUCED mode')
+    if state.speed_scaling < 0.99 and not session.paused:
+        flags.append(f'robot slowing to {state.speed_scaling:.0%}')
+    return ''.join(f'  {f}' for f in flags)
 
 
 # ---- commands ----
@@ -185,7 +288,8 @@ def cmd_state(args) -> int:
             print(f'q_deg {np.array2string(np.rad2deg(s.q), precision=2, suppress_small=True)}  '
                   f'tcp {np.array2string(s.tcp_pose[:3], precision=4)}  '
                   f'|F| {np.linalg.norm(s.wrench[:3]):6.1f} N  '
-                  f'pstop {s.protective_stop}  estop {s.emergency_stop}'
+                  f'safety {SAFETY_MODES.get(s.safety_mode, s.safety_mode)}  '
+                  f'arm {ROBOT_MODES.get(s.robot_mode, s.robot_mode)}  speed {s.speed_scaling:.0%}'
                   + (f'  {gripper.status_text()}' if cfg.gripper.type != 'none' else ''), flush=True)
             time.sleep(0.5)
     except KeyboardInterrupt:
@@ -305,7 +409,7 @@ def cmd_run(args) -> int:
         viewer = _start_viewer(args, cameras, f'ur5vla run {run_name}')
         info = backend.connect()
         log.info('policy: %s', info)
-        arm.connect()
+        _connect_arm(cfg, arm)
         gripper.connect()
         loop = ControlLoop(cfg, arm, gripper, cameras, backend, info)
         log.info('warm-up inference: %.2f s', loop.warmup(prompt))
@@ -335,6 +439,8 @@ def cmd_run(args) -> int:
             print(f'saved {recorder.dir}')
             if result.end_reason in ('estop', 'error'):
                 break
+            if result.end_reason == 'safety':
+                _wait_until_ready(cfg, arm)
     finally:
         backend.close()
         gripper.close()
@@ -386,14 +492,17 @@ def cmd_teleop(args) -> int:
     viewer = None
     try:
         viewer = _start_viewer(args, cameras, 'ur5vla teleop')
-        arm.connect()
+        _connect_arm(cfg, arm)
         gripper.connect()
         session = TeleopSession(cfg, arm, gripper, pad)
         tcp_offset = cfg.safety.tcp_offset_m
-        print(f'{session.mapping.legend(session.frame)}\n{TELEOP_KEYS}', flush=True)
-        with _operator_keys(_episode_keys(session.estop, session.end_request), viewer), \
+        deadman = session.mapping.button_name('deadman')
+        print(f'{session.mapping.legend(session.frame)}\n{TELEOP_KEYS}, [r] resume\n'
+              f'If the robot stops itself the arm pauses: clear the stop on the pendant, then press '
+              f'{deadman} (or r).', flush=True)
+        with _operator_keys(_episode_keys(session.estop, session.end_request, session.resume_request), viewer), \
                 _teleop_display(session, tcp_offset, viewer, terminal=True):
-            result = session.run_episode()
+            result = session.run_episode(pause_on_stop=True)
         print(f'teleop ended: {result.end_reason} {result.detail or ""} ({result.duration_s:.0f} s)')
         q = arm.read_state().q
         print(f'arm at {_pose_text(q, tcp_offset)}\n'
@@ -424,7 +533,7 @@ def cmd_demo(args) -> int:
     viewer = None
     try:
         viewer = _start_viewer(args, cameras, f'ur5vla demo {run_name}')
-        arm.connect()
+        _connect_arm(cfg, arm)
         gripper.connect()
         session = TeleopSession(cfg, arm, gripper, pad)
         print(session.mapping.legend(session.frame), flush=True)
@@ -447,7 +556,9 @@ def cmd_demo(args) -> int:
                 outcome.update(_ask_outcome(args.yes, interventions=False))
             recorder.finish(outcome)
             print(f'saved {recorder.dir}')
-            if result.end_reason not in ('operator', 'timeout'):
+            if result.end_reason == 'safety':
+                _wait_until_ready(cfg, arm)     # then on to the next demo
+            elif result.end_reason not in ('operator', 'timeout'):
                 break
     finally:
         gripper.close()
@@ -520,7 +631,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format='%(asctime)s %(levelname).1s %(name)s: %(message)s')
-    return args.fn(args)
+    try:
+        return args.fn(args)
+    except KeyboardInterrupt:           # Ctrl-C at a prompt or while waiting for the robot
+        print()
+        return 130
 
 
 if __name__ == '__main__':

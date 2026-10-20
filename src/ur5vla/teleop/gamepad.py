@@ -264,12 +264,13 @@ class GamepadMapping:
     def held(self, role: str, pad: GamepadState) -> bool:
         return pad.button(self.buttons.get(role))
 
+    def button_name(self, role: str) -> str:
+        b = self.buttons.get(role)
+        return 'unmapped' if b is None else XPAD_BUTTONS[b] if b < len(XPAD_BUTTONS) else f'button {b}'
+
     def legend(self, frame: str) -> str:
         """The controls, one robot axis per line, for the terminal and the camera window."""
-        def button(role: str) -> str:
-            b = self.buttons.get(role)
-            return 'unmapped' if b is None else XPAD_BUTTONS[b] if b < len(XPAD_BUTTONS) else f'button {b}'
-
+        button = self.button_name
         lines = [f'{frame.upper()} frame: {FRAME_TEXT[frame]} ({button("toggle_frame")} switches)']
         lines += [f'  {label:<5} {what:<15} {describe_terms(self.axes[axis])}'
                   for axis, label, what in LEGEND_ROWS]
