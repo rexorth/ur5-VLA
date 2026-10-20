@@ -1,8 +1,9 @@
 # UR5-VLA operating procedures
 
 Commands for bring-up, teleoperation and demonstrations, datasets, inference and fine-tuning. Each
-entry gives the command, its options, and what it does underneath. The README covers the
-architecture; [design.md](design.md) covers the reasoning behind it.
+entry gives the command, its options, and what it does underneath.
+[architecture.md](architecture.md) explains how each module works; [design.md](design.md) covers
+the reasoning behind it.
 
 1. [Conventions](#1-conventions)
 2. [One-time setup](#2-one-time-setup)

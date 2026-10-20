@@ -5,8 +5,9 @@ Intelligence's π models) or **LeRobot** (any policy its async server supports: 
 SmolVLA, π₀, π₀.₅, GR00T, ...). Which one is chosen per run by a config file. Robot I/O, safety,
 cameras, chunk handling and logging are shared code, so a difference between openpi and LeRobot
 runs comes from the policy stack and not from the plumbing. The design is in
-[docs/design.md](docs/design.md); step-by-step commands for bring-up, teleoperation, inference and
-fine-tuning are in [docs/procedures.md](docs/procedures.md).
+[docs/design.md](docs/design.md); how each module works is in
+[docs/architecture.md](docs/architecture.md); step-by-step commands for bring-up, teleoperation,
+inference and fine-tuning are in [docs/procedures.md](docs/procedures.md).
 
 ```
 cameras ──latest frame──┐
@@ -249,6 +250,8 @@ See [src/ur5vla/recording.py](src/ur5vla/recording.py). The `replay` camera and 
 format back.
 
 ## Layout
+
+Each module is explained in [docs/architecture.md](docs/architecture.md).
 
 ```
 configs/        cell.yaml, dry_run.yaml, policy/{openpi,lerobot,lerobot_pi05_base,replay_sine}.yaml
