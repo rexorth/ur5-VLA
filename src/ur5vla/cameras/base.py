@@ -15,9 +15,23 @@ from collections import deque
 
 import numpy as np
 
+from ..config import ConfigError
 from ..types import CameraHealth, Frame
 
 log = logging.getLogger(__name__)
+
+# Automatic exposure and white balance take about this long after a camera starts to settle
+# (an OAK's ISO falls from ~290 to its level within a second), so startup waits it out.
+AUTO_SETTLE_S = 2.0
+
+
+def check_range(where: str, values: dict[str, float | None], ranges: dict[str, tuple[float, float]]) -> None:
+    """ConfigError for a set value outside its range."""
+    for key, (lo, hi) in ranges.items():
+        v = values.get(key)
+        if v is not None and not lo <= v <= hi:
+            raise ConfigError(f'{where}.{key} {v} outside [{lo}, {hi}]')
+
 
 
 class CameraSource(ABC):
@@ -36,6 +50,12 @@ class CameraSource(ABC):
     @abstractmethod
     def health(self) -> CameraHealth: ...
 
+    def settings(self) -> dict[str, float] | None:
+        """The image settings in use (focus, exposure, gain or ISO, white balance), under the
+        config keys that fix them: as the latest frame reports them (Frame.settings), or as read
+        back from the device. Only what the camera reports; None if nothing."""
+        return None
+
 
 class ThreadedCamera(CameraSource):
     """Owns the capture thread, the latest-frame slot and fps/drop accounting.
@@ -45,6 +65,10 @@ class ThreadedCamera(CameraSource):
     """
 
     rotate_deg = 0                  # clockwise; set from the camera's `rotate:` key
+    # Set before start() to let the camera choose focus, exposure and white balance itself,
+    # ignoring the configured values: `ur5vla cameras --measure`, to read what it picks.
+    automatic = False
+    settle_s = 0.0                  # after the first frame; drivers set AUTO_SETTLE_S when on automatic
 
     def __init__(self, name: str):
         self.name = name
@@ -100,7 +124,7 @@ class ThreadedCamera(CameraSource):
             k = -self.rotate_deg // 90      # np.rot90 turns counter-clockwise for k > 0
             frame = Frame(np.ascontiguousarray(np.rot90(frame.rgb, k)),
                           None if frame.depth is None else np.ascontiguousarray(np.rot90(frame.depth, k)),
-                          frame.t_capture, frame.seq)
+                          frame.t_capture, frame.seq, frame.settings)
         with self._lock:
             if self._last_seq is not None and frame.seq > self._last_seq + 1:
                 self._drops += frame.seq - self._last_seq - 1

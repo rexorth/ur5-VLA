@@ -63,9 +63,20 @@ class Arm(ABC):
         """Blocking joint move, rad/s and rad/s^2."""
 
     @abstractmethod
+    def freedrive(self, on: bool) -> None:
+        """Hand-guiding: the arm goes limp and is moved by hand (UR freedrive, like the pendant's
+        freedrive button). It drifts if the pendant's payload is wrong."""
+
+    @abstractmethod
+    def reconnect(self) -> None:
+        """The data from the robot went silent: reconnect what dropped. Uploads nothing and moves
+        nothing, so it is what to call while the robot is stopped."""
+
+    @abstractmethod
     def recover(self) -> bool:
         """After a stop is cleared on the pendant: reconnect what dropped and restart the control
-        script if it isn't running. True once it runs."""
+        script if it isn't running. True once it runs. While the robot is still stopped it
+        uploads nothing and returns False; RobotNotReady if it stops again meanwhile."""
 
     @abstractmethod
     def robot_info(self) -> dict[str, Any]:
@@ -91,7 +102,8 @@ class RTDEArm(Arm):
 
     A protective stop (or any other robot stop) ends that script; ur_rtde's commands then return
     False rather than raising. Once the stop is cleared on the pendant, recover() uploads the
-    script again."""
+    script again. Nothing is uploaded while the robot is stopped: it can't run the script, and a
+    controller in trouble doesn't need a 50 KB program pushed at it every second."""
 
     def __init__(self, cfg: RobotConfig):
         self.cfg = cfg
@@ -171,17 +183,32 @@ class RTDEArm(Arm):
         if not self._c.moveJ(list(map(float, q)), speed, accel):
             raise ArmError('moveJ did not complete (robot stopped, or the target is outside its limits)')
 
-    def recover(self) -> bool:
+    def freedrive(self, on: bool) -> None:
+        if not (self._c.teachMode() if on else self._c.endTeachMode()):
+            raise ArmError(f'the controller refused to {"start" if on else "end"} freedrive (robot stopped?)')
+
+    def reconnect(self) -> None:
         if self._r is not None and not self._r.isConnected():
             log.info('arm: reconnecting the receive interface')
             self._r.reconnect()
+        if self._c is not None and not self._c.isConnected():
+            # ur_rtde's own reconnect() uploads the control script and waits up to 5 s for it to
+            # start, stopped robot or not. Close it instead; recover() opens a new one once the
+            # robot is ready.
+            log.info('arm: the control interface dropped; it is opened again once the robot is ready')
+            try:
+                self._c.disconnect()
+            except Exception as exc:
+                log.warning('arm: closing the control interface failed: %s', exc)
+            self._c = None
+
+    def recover(self) -> bool:
+        self.reconnect()
+        if not robot_ready(self.read_state()):
+            return False
         if self._c is None:
-            self.connect()
-            return self._program_running()
-        if not self._c.isConnected():
-            log.info('arm: reconnecting the control interface')
-            self._c.reconnect()
-        if not self._program_running():
+            self.connect()                  # uploads the script
+        elif not self._program_running():
             log.info('arm: uploading the control script again')
             self._c.reuploadScript()
         return self._program_running()
@@ -201,10 +228,14 @@ class RTDEArm(Arm):
         return bool(self._c.isJointsWithinSafetyLimits(list(map(float, q))))
 
     def init_period(self) -> Any:
-        return self._c.initPeriod()
+        return self._c.initPeriod() if self._c is not None else time.monotonic()
 
     def wait_period(self, token: Any) -> None:
-        self._c.waitPeriod(token)
+        if self._c is not None and not isinstance(token, float):
+            self._c.waitPeriod(token)
+        else:   # no control interface (reconnect() closed it): sleep out the tick
+            start = token if isinstance(token, float) else time.monotonic()
+            time.sleep(max(0.0, start + self.cfg.period_s - time.monotonic()))
 
 
 class SimArm(Arm):
@@ -222,9 +253,11 @@ class SimArm(Arm):
         self._target = self._q.copy()
         self._t = time.monotonic()
         self.n_servo = 0
+        self.n_reconnect = 0
         self.n_recover = 0
         self.safety_mode = 1
         self.program_running = True
+        self.in_freedrive = False
 
     def simulate_stop(self, safety_mode: int = 3) -> None:
         """Act out a robot stop: the arm halts where it is and the script ends."""
@@ -273,6 +306,14 @@ class SimArm(Arm):
             raise ArmError('moveJ did not complete (robot stopped, or the target is outside its limits)')
         self._q = np.asarray(q, dtype=float).copy()
         self._target = self._q.copy()
+
+    def freedrive(self, on: bool) -> None:
+        if not self.program_running:
+            raise ArmError(f'the controller refused to {"start" if on else "end"} freedrive (robot stopped?)')
+        self.in_freedrive = on
+
+    def reconnect(self) -> None:
+        self.n_reconnect += 1
 
     def recover(self) -> bool:
         self.n_recover += 1

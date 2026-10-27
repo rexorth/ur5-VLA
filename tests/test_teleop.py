@@ -194,7 +194,8 @@ def test_teleop_command_shows_the_pose_records_nothing_and_prints_a_start_pose(t
     assert 'base frame\r' in out and 'deg  tcp [' in out                 # the live line
     start = yaml.safe_load(out.rstrip().splitlines()[-1])['start_q_deg']
     assert len(start) == 6 and all(isinstance(v, float) for v in start)
-    assert not (tmp_path / 'runs').exists()                             # nothing recorded
+    saved = [p for p in (tmp_path / 'runs').rglob('*') if p.is_file()]
+    assert len(saved) == 1 and saved[0].match('*_teleop/session.log')  # nothing recorded but the log
 
 
 def test_legend_names_each_axis_its_controls_and_direction():
@@ -203,9 +204,9 @@ def test_legend_names_each_axis_its_controls_and_direction():
     rows = {line.split()[0]: line for line in lines[1:7]}
     assert rows['x'].endswith('move along x    left stick up +, down -')
     assert rows['z'].endswith('RT +, LT -')
-    assert rows['roll'].endswith('rotate about x  right stick up +, down -')
-    assert rows['tilt'].endswith('rotate about y  right stick left +, right -')
-    assert rows['yaw'].endswith('rotate about z  d-pad left +, right -')
+    assert rows['pitch'].endswith('rotate about x  right stick up +, down -')
+    assert rows['yaw'].endswith('rotate about y  right stick left +, right -')
+    assert rows['roll'].endswith('rotate about z  d-pad left +, right -')
     assert lines[-1] == '  hold LB to move, RB slow, Menu done, gripper A close, B open'
     # Remapped: buttons and an axis xpad has no name for; an axis left out.
     remapped = config_mod.TeleopConfig(axes={'x': [{'button': 3}, {'button': 0, 'sign': -1}],
@@ -213,3 +214,80 @@ def test_legend_names_each_axis_its_controls_and_direction():
     text = remapped.legend('tool')
     assert text.startswith('TOOL frame') and 'Y +, A -' in text
     assert 'axis 9 negative +, positive -' in text and 'not mapped' in text
+
+
+X_BUTTON = 2
+FOUR_DOF = {'axes': {'x': [{'axis': 3}], 'rz': [{'axis': 0}]},
+            'alt_axes': {'rx': [{'axis': 1}], 'ry': [{'axis': 0}], 'rz': []},
+            'buttons': {'deadman': LB, 'alt': X_BUTTON}}
+
+
+def test_alt_button_swaps_only_the_axes_it_lists():
+    m = config_mod.TeleopConfig(curve=1.0, **FOUR_DOF).mapping()
+    right_and_left = pad({3: 1.0, 0: 1.0})                       # right stick right, left stick right
+    np.testing.assert_allclose(m.twist(right_and_left), [1, 0, 0, 0, 0, 1])     # x and roll
+    held = pad({3: 1.0, 0: 1.0}, buttons=[X_BUTTON])
+    np.testing.assert_allclose(m.twist(held), [1, 0, 0, 0, 1, 0])               # x kept; yaw, roll off
+    assert 'while X is held:' in m.legend('tool')
+    assert config_mod.TeleopConfig().mapping().alt_axes == {}                   # default: no alt
+
+
+def test_alt_mistakes_are_config_errors():
+    with pytest.raises(ConfigError, match='alt_axes: unknown robot axis'):
+        config_mod.parse({'teleop': {'alt_axes': {'yaw': []}, 'buttons': {'alt': 2}}})
+    with pytest.raises(ConfigError, match='set teleop.buttons.alt'):
+        config_mod.parse({'teleop': {'alt_axes': {'rz': [{'axis': 3}]}}})
+    with pytest.raises(ConfigError, match='gripper_mode'):
+        config_mod.parse({'teleop': {'gripper_mode': 'toggle'}})
+
+
+def test_holding_alt_switches_the_left_stick_from_yaw_to_roll(tmp_path):
+    # Left stick right with LB held throughout; X held from 0.4 s. Yaw (about the tool's y) moves
+    # the tool's z axis; roll turns about it, so the z axis then stays put.
+    six_dof = {'frame': 'tool', 'angular_accel_deg_s2': 900.0, 'axes': {'ry': [{'axis': 0}]},
+               'alt_axes': {'ry': [], 'rz': [{'axis': 0}]}, 'buttons': {'deadman': LB, 'alt': X_BUTTON}}
+    script = lambda t: pad({0: 1.0}, buttons=[LB, X_BUTTON] if t > 0.4 else [LB])  # noqa: E731
+    _, _, ticks, events = session(tmp_path, script, 0.9, teleop=six_dof)
+    z_axis = np.array([fk(q)[:3, 2] for q in ticks['q_cmd']])
+    t = ticks['t'] - ticks['t'][0]
+    yaw, roll = (t > 0.1) & (t < 0.35), t > 0.5
+    assert np.linalg.norm(z_axis[yaw][-1] - z_axis[yaw][0]) > 0.02
+    assert np.linalg.norm(z_axis[roll][-1] - z_axis[roll][0]) < 1e-3
+    x_axis = np.array([fk(q)[:3, 0] for q in ticks['q_cmd']])
+    assert np.arccos(np.clip(x_axis[roll][0] @ x_axis[-1], -1, 1)) > 0.02     # ...while turning about it
+    assert events.count('alt') == 1
+
+
+def test_snap_gripper_closes_and_opens_fully(tmp_path):
+    A, B = 0, 1
+    script = lambda t: pad(buttons=[LB, A] if 0.1 < t < 0.15 else [LB, B] if 0.4 < t < 0.45 else [LB])  # noqa: E731
+    _, _, ticks, _ = session(tmp_path, script, 0.7, teleop={'gripper_mode': 'snap'})
+    t = ticks['t'] - ticks['t'][0]
+    g = ticks['g_cmd']
+    assert set(np.unique(g[(t > 0.2) & (t < 0.35)])) == {1.0}  # closed after a short press of A
+    assert set(np.unique(g[t > 0.5])) == {0.0}                  # open after a short press of B
+    # The default ramp moves only partway in a 50 ms press.
+    _, _, ticks, _ = session(tmp_path / 'ramp', script, 0.3)
+    assert 0.0 < ticks['g_cmd'].max() < 0.2
+
+
+def test_a_teleop_file_replaces_the_cells_teleop_block(tmp_path):
+    from pathlib import Path
+    configs = Path(__file__).parents[1] / 'configs'
+    cell = tmp_path / 'cell.yaml'
+    cell.write_text('robot: {dry_run: true}\nteleop: {max_linear_m_s: 0.3, frame: tool}\n')
+    pad_file = tmp_path / 'pad.yaml'
+    pad_file.write_text('max_linear_m_s: 0.15\n')
+    cfg = config_mod.load(cell, teleop_path=pad_file)
+    assert cfg.teleop.max_linear_m_s == 0.15 and cfg.teleop.frame == 'base'   # replaced, not merged
+    assert cfg.source == f'{cell} + {pad_file}' and cfg.raw['teleop'] == {'max_linear_m_s': 0.15}
+    # The shipped mappings: 6-DoF in the cell file, 4-DoF in configs/teleop.
+    six = config_mod.load(configs / 'cell.yaml').teleop
+    four = config_mod.load(configs / 'cell.yaml', teleop_path=configs / 'teleop' / '4dof.yaml').teleop
+    assert six.mapping().axes['rz'] == [] and six.alt_axes['rz']
+    assert four.mapping().axes['rx'] == [] and four.alt_axes['rx'] and four.gripper_mode == 'snap'
+    # Both: the right stick translates, and X (sharing the right thumb) changes only the left stick.
+    for m in (six.mapping(), four.mapping()):
+        assert {t.axis for a in ('x', 'y') for t in m.axes[a]} == {3, 4}
+        assert {t.axis for terms in m.alt_axes.values() for t in terms} <= {0, 1}
+        assert m.buttons['alt'] == X_BUTTON and m.buttons['slow'] == 5

@@ -52,6 +52,8 @@ class RobotConfig:
     servoj: ServoJConfig = field(default_factory=ServoJConfig)
     # moveJ here (slowly, after confirmation) before every episode. None = start where the arm is.
     start_q_deg: list[float] | None = None
+    # Named start poses, say one per task; `--start NAME` on run and demo uses one instead.
+    start_poses: dict[str, list[float]] = field(default_factory=dict)
     move_speed_deg_s: float = 20.0
     move_accel_deg_s2: float = 40.0
     dry_run: bool = False           # simulated arm, no connection
@@ -61,6 +63,11 @@ class RobotConfig:
             self.servoj = from_dict(ServoJConfig, self.servoj, 'robot.servoj')
         if self.start_q_deg is not None and len(self.start_q_deg) != 6:
             raise ConfigError('robot.start_q_deg needs 6 values')
+        if not isinstance(self.start_poses, dict):
+            raise ConfigError('robot.start_poses must map names to poses, e.g. {printer: [0, -90, 90, -90, -90, 0]}')
+        for name, q in self.start_poses.items():
+            if not isinstance(q, (list, tuple)) or len(q) != 6:
+                raise ConfigError(f'robot.start_poses.{name} needs 6 values')
 
     @property
     def period_s(self) -> float:
@@ -90,7 +97,10 @@ class SafetyConfig:
     # How far a target may be from where the arm actually is. Larger means the arm isn't keeping
     # up (the controller slows itself near its own limits); None disables.
     max_tracking_error_deg: float | None = 15.0
-    ft_limit_n: float | None = 30.0 # on |F| after a tare at episode start; None disables
+    # On |F| and |T|, as read, untared: the F/T sensor's reading from its zero at the calibration
+    # pose if there is one (ft_sensor), else the CB3's joint-current estimate. None disables.
+    ft_limit_n: float | None = 30.0
+    ft_limit_nm: float | None = None
     # Hold when a chunk is overdue: none arrived within watchdog_factor x the expected gap
     # between chunks, max((1 - control.refill_fraction) x chunk duration, last latency).
     watchdog_factor: float = 1.5
@@ -111,7 +121,7 @@ class SafetyConfig:
             raise ConfigError('safety.watchdog_factor must be > 1 (it is a margin over the expected gap)')
         if self.watchdog_max_s is not None and self.watchdog_max_s <= 0:
             raise ConfigError('safety.watchdog_max_s must be > 0, or null for no cap')
-        for key in ('max_tcp_speed_m_s', 'max_tracking_error_deg'):
+        for key in ('max_tcp_speed_m_s', 'max_tracking_error_deg', 'ft_limit_n', 'ft_limit_nm'):
             if getattr(self, key) is not None and getattr(self, key) <= 0:
                 raise ConfigError(f'safety.{key} must be > 0, or null to disable')
         if self.max_step_rad <= 0:
@@ -126,6 +136,15 @@ class SafetyConfig:
             raise ConfigError('safety.joint_min_deg must be below joint_max_deg')
         if any(lo >= hi for lo, hi in zip(self.workspace_min_m, self.workspace_max_m, strict=True)):
             raise ConfigError('safety.workspace_min_m must be below workspace_max_m')
+        # Metres. A UR5 reaches 0.85 m and a tool is a few tens of cm long: anything far beyond is
+        # almost certainly millimetres, and would put every target outside the box.
+        if max(map(abs, self.tcp_offset_m)) > 1.0:
+            raise ConfigError(f'safety.tcp_offset_m is in metres: {self.tcp_offset_m} puts the TCP '
+                              f'{max(map(abs, self.tcp_offset_m)):g} m from the flange. From millimetres, '
+                              f'divide by 1000: {[round(v / 1000, 6) for v in self.tcp_offset_m]}')
+        if max(map(abs, self.workspace_min_m + self.workspace_max_m)) > 3.0:
+            raise ConfigError('safety.workspace_min_m / workspace_max_m are in metres (a UR5 reaches '
+                              '0.85 m); from millimetres, divide by 1000')
 
 
 def _xbox_axes() -> dict[str, list[dict]]:
@@ -154,8 +173,11 @@ class TeleopConfig:
     deadzone: float = 0.12
     curve: float = 1.5              # stick response: |x|^curve
     damping: float = 0.02           # damped least squares near singularities
-    gripper_speed: float = 1.0      # full open-close range per second
+    gripper_mode: str = 'ramp'      # ramp: A/B move the target at gripper_speed | snap: A closes, B opens fully
+    gripper_speed: float = 1.0      # full open-close range per second (ramp)
     axes: dict[str, list[dict]] = field(default_factory=_xbox_axes)
+    # While buttons.alt is held, these replace the robot axes they name ([] = off). Empty = no alt.
+    alt_axes: dict[str, list[dict]] = field(default_factory=dict)
     gripper: list[dict] = field(default_factory=lambda: [{'button': 0}, {'button': 1, 'sign': -1}])  # A / B
     # Xbox buttons (xpad): 0 A, 1 B, 2 X, 3 Y, 4 LB, 5 RB, 6 View, 7 Menu, 8 Xbox, 9/10 stick clicks
     buttons: dict[str, int | None] = field(default_factory=lambda: {
@@ -168,15 +190,17 @@ class TeleopConfig:
             raise ConfigError('teleop.deadzone must be in [0, 1)')
         if self.curve <= 0:
             raise ConfigError('teleop.curve must be > 0')
-        from .teleop.gamepad import GamepadMapping   # validates the mapping now, not mid-run
+        if self.gripper_mode not in ('ramp', 'snap'):
+            raise ConfigError("teleop.gripper_mode must be 'ramp' or 'snap'")
         try:
-            GamepadMapping.from_config(self.axes, self.gripper, self.buttons, self.deadzone, self.curve)
+            self.mapping()                          # validates the mapping now, not mid-run
         except (TypeError, ValueError) as exc:
             raise ConfigError(str(exc)) from exc
 
     def mapping(self):
         from .teleop.gamepad import GamepadMapping
-        return GamepadMapping.from_config(self.axes, self.gripper, self.buttons, self.deadzone, self.curve)
+        return GamepadMapping.from_config(self.axes, self.gripper, self.buttons, self.deadzone, self.curve,
+                                          self.alt_axes)
 
 
 GRIPPER_TYPES = ('none', 'robotiq_2f85')
@@ -204,6 +228,98 @@ class GripperConfig:
             raise ConfigError('gripper.rate_hz, timeout_s and activate_timeout_s must be > 0')
 
 
+FT_SENSOR_TYPES = ('none', 'axia80')
+
+
+@dataclass
+class FTSensorConfig:
+    type: str = 'none'              # none | axia80
+    host: str | None = None         # the sensor's IP address
+    rdt_port: int = 49152           # UDP streaming (the sensor's default)
+    http_port: int = 80             # its XML pages, read once for the counts-per-unit scaling
+    timeout_s: float = 0.1          # no data for this long ends the episode: the force limits rely on it
+    connect_timeout_s: float = 2.0
+    # The calibration pose, joint degrees: before each demo (and `ur5vla prepare`) the arm moves
+    # here, still and touching nothing, and the sensor is zeroed. Required with a sensor.
+    tare_q_deg: list[float] | None = None
+
+    def __post_init__(self):
+        if self.type not in FT_SENSOR_TYPES:
+            raise ConfigError(f'ft_sensor.type must be one of {FT_SENSOR_TYPES}, got {self.type!r}')
+        if self.timeout_s <= 0 or self.connect_timeout_s <= 0:
+            raise ConfigError('ft_sensor.timeout_s and connect_timeout_s must be > 0')
+        if self.tare_q_deg is not None and len(self.tare_q_deg) != 6:
+            raise ConfigError('ft_sensor.tare_q_deg needs 6 values')
+
+
+LEADER_TYPES = ('none', 'gello_as5600')
+LEADER_DEADMAN = ('keyboard', 'gamepad', 'button', 'none')
+OPERATOR_KEYS = ('e', 'd', 'r')     # keys.py commands: a keyboard deadman can't be one of them
+GELLO_UR_SIGNS = [1, 1, -1, 1, 1, 1]
+GELLO_UR_CALIBRATION_DEG = [0.0, -90.0, 90.0, -90.0, -90.0, 0.0]
+
+
+@dataclass
+class LeaderConfig:
+    """A GELLO leader arm for `teleop --leader` and `demo --leader`: the arm follows its joints.
+    gello_as5600: AS5600 encoders on a TCA9548A, read by an ESP32 (third_party/gello_software,
+    firmware/as5600_leader)."""
+    type: str = 'none'              # none | gello_as5600
+    port: str | None = None         # the ESP32, by id: /dev/serial/by-id/usb-Espressif_...
+    channels: list[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5])   # per UR joint, base first
+    joint_signs: list[int] = field(default_factory=lambda: list(GELLO_UR_SIGNS))
+    # From `ur5vla leader --calibrate`, with the leader in calibration_q_deg. None = not
+    # calibrated: the arm won't follow it.
+    joint_offsets_deg: list[float] | None = None
+    calibration_q_deg: list[float] = field(default_factory=lambda: list(GELLO_UR_CALIBRATION_DEG))
+    # The trigger's encoder, and its angle released (open) and squeezed (closed), from
+    # --calibrate. No channel: the gamepad's gripper buttons.
+    gripper_channel: int | None = None
+    gripper_open_deg: float | None = None
+    gripper_closed_deg: float | None = None
+    # What must be held for the arm to follow: a key (deadman_key, an X keysym name; read from
+    # the desktop session wherever the focus is), the gamepad's deadman button (teleop.buttons),
+    # a button wired to the ESP32 (deadman_button: its bit, 1 = D1), or nothing.
+    deadman: str = 'keyboard'
+    deadman_key: str = 'space'
+    deadman_button: int = 1
+    done_button: int | None = None  # an ESP32 button that ends the episode, like the gamepad's done
+    engage_deg: float = 10.0        # the arm takes over once every joint is within this of it
+    disengage_deg: float = 30.0     # and lets go if the leader gets this far ahead
+    max_joint_speed_deg_s: float = 90.0
+    catch_up_deg_s: float = 20.0    # the speed it closes the gap at after taking over
+    stale_s: float = 0.1            # an encoder without a good reading this long: let go
+
+    def __post_init__(self):
+        if self.type not in LEADER_TYPES:
+            raise ConfigError(f'leader.type must be one of {LEADER_TYPES}, got {self.type!r}')
+        if self.deadman not in LEADER_DEADMAN:
+            raise ConfigError(f'leader.deadman must be one of {LEADER_DEADMAN}, got {self.deadman!r}')
+        if self.deadman_key.lower() in OPERATOR_KEYS:
+            raise ConfigError(f'leader.deadman_key {self.deadman_key!r} is an operator key '
+                              f'({", ".join(OPERATOR_KEYS)}: e-stop, done, resume); pick another')
+        for key in ('channels', 'joint_signs', 'calibration_q_deg'):
+            if len(getattr(self, key)) != 6:
+                raise ConfigError(f'leader.{key} needs 6 values')
+        if self.joint_offsets_deg is not None and len(self.joint_offsets_deg) != 6:
+            raise ConfigError('leader.joint_offsets_deg needs 6 values')
+        if any(s not in (1, -1) for s in self.joint_signs):
+            raise ConfigError('leader.joint_signs must each be 1 or -1')
+        used = list(self.channels) + ([self.gripper_channel] if self.gripper_channel is not None else [])
+        if len(set(used)) != len(used) or any(not 0 <= c <= 7 for c in used):
+            raise ConfigError('leader.channels and gripper_channel must be distinct channels 0..7')
+        if self.gripper_channel is not None and (self.gripper_open_deg is None) != (self.gripper_closed_deg is None):
+            raise ConfigError('leader.gripper_open_deg and gripper_closed_deg go together')
+        if not 0 < self.engage_deg < self.disengage_deg:
+            raise ConfigError('leader.engage_deg must be > 0 and below disengage_deg')
+        if self.max_joint_speed_deg_s <= 0 or self.catch_up_deg_s <= 0 or self.stale_s <= 0:
+            raise ConfigError('leader.max_joint_speed_deg_s, catch_up_deg_s and stale_s must be > 0')
+
+    @property
+    def gripper_calibrated(self) -> bool:
+        return self.gripper_channel is not None and self.gripper_open_deg is not None
+
+
 @dataclass
 class LoggingConfig:
     root: str = 'runs'
@@ -225,12 +341,15 @@ class RunConfig:
     logging: LoggingConfig
     teleop: TeleopConfig = field(default_factory=TeleopConfig)
     gripper: GripperConfig = field(default_factory=GripperConfig)
+    ft_sensor: FTSensorConfig = field(default_factory=FTSensorConfig)
+    leader: LeaderConfig = field(default_factory=LeaderConfig)
     prompt: str = ''
     source: str | None = None           # path the config was loaded from
     raw: dict[str, Any] = field(default_factory=dict)  # as loaded, saved with every episode
 
 
-SECTIONS = ('robot', 'cameras', 'policy', 'control', 'safety', 'logging', 'teleop', 'gripper', 'prompt')
+SECTIONS = ('robot', 'cameras', 'policy', 'control', 'safety', 'logging', 'teleop', 'gripper', 'ft_sensor',
+            'leader', 'prompt')
 ROTATIONS = (0, 90, 180, 270)       # cameras.<name>.rotate, degrees clockwise
 
 
@@ -257,22 +376,26 @@ def parse(raw: dict[str, Any], source: str | None = None) -> RunConfig:
         logging=from_dict(LoggingConfig, raw.get('logging'), 'logging'),
         teleop=from_dict(TeleopConfig, raw.get('teleop'), 'teleop'),
         gripper=from_dict(GripperConfig, raw.get('gripper'), 'gripper'),
+        ft_sensor=from_dict(FTSensorConfig, raw.get('ft_sensor'), 'ft_sensor'),
+        leader=from_dict(LeaderConfig, raw.get('leader'), 'leader'),
         prompt=str(raw.get('prompt') or ''),
         source=source,
         raw=raw,
     )
 
 
-def load(path: str | Path, policy_path: str | Path | None = None) -> RunConfig:
+def load(path: str | Path, policy_path: str | Path | None = None,
+         teleop_path: str | Path | None = None) -> RunConfig:
     """Load a cell config. `policy_path` names a file holding just a policy block, which replaces
     the cell's `policy:`. That way openpi and LeRobot runs share one cell file and can differ in
-    nothing else."""
+    nothing else. `teleop_path` does the same for `teleop:` (e.g. a 4-DoF gamepad mapping)."""
     path = Path(path)
     with path.open() as f:
         raw = yaml.safe_load(f) or {}
     source = str(path)
-    if policy_path is not None:
-        with Path(policy_path).open() as f:
-            raw['policy'] = yaml.safe_load(f) or {}
-        source += f' + {policy_path}'
+    for section, block_path in (('policy', policy_path), ('teleop', teleop_path)):
+        if block_path is not None:
+            with Path(block_path).open() as f:
+                raw[section] = yaml.safe_load(f) or {}
+            source += f' + {block_path}'
     return parse(raw, source=source)

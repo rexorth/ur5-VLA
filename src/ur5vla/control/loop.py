@@ -13,8 +13,9 @@ What stops the arm:
       chunks, capped at safety.watchdog_max_s); a policy camera older than safety.max_frame_age_s.
   STOPPED (servoStop, episode ends):
       any SafetyLayer violation (a target that breaks our limits is never sent), the robot's own
-      stops (protective, safeguard, emergency, ...; also a servoJ the controller refuses), the
-      software e-stop. These end as `safety` (or `estop`); anything unexpected as `error`.
+      stops (protective, safeguard, emergency, ...; also a servoJ the controller refuses), a
+      gripper or F/T sensor fault, the software e-stop. These end as `safety` (or `estop`);
+      anything unexpected as `error`.
 If the buffer runs dry without tripping either, the last target is re-sent: the arm settles on
 it and stays in servo mode until the next chunk or the watchdog.
 """
@@ -36,6 +37,7 @@ from ..config import RunConfig
 from ..policy.base import PolicyBackend, PolicyDone
 from ..recording import EpisodeRecorder
 from ..robot.arm import Arm, ArmError
+from ..robot.ft_sensor import FTSensor, NoFTSensor
 from ..robot.gripper import Gripper
 from ..types import Observation, PolicyInfo, RobotState
 from .chunks import ChunkBuffer
@@ -66,13 +68,14 @@ class EpisodeResult:
 
 class ControlLoop:
     def __init__(self, cfg: RunConfig, arm: Arm, gripper: Gripper, cameras: dict[str, CameraSource],
-                 backend: PolicyBackend, policy_info: PolicyInfo):
+                 backend: PolicyBackend, policy_info: PolicyInfo, ft_sensor: FTSensor | None = None):
         missing = set(policy_info.cameras) - set(cameras)
         if missing:
             raise ValueError(f'policy wants camera(s) {sorted(missing)} that are not configured')
         self.cfg = cfg
         self.arm = arm
         self.gripper = gripper
+        self.ft = ft_sensor or NoFTSensor()
         self.cameras = cameras
         self.backend = backend
         self.policy_info = policy_info
@@ -92,9 +95,7 @@ class ControlLoop:
         """Read the arm and wait for fresh policy-camera frames. Outside an episode only."""
         deadline = time.monotonic() + timeout_s
         while True:
-            state = self.arm.read_state()
-            state.gripper = self.gripper.position()
-            self._state = state
+            self._state = self._read_state()
             obs, why = self._build_observation(prompt, time.monotonic())
             if obs is not None:
                 return obs
@@ -115,10 +116,8 @@ class ControlLoop:
         self._reset_episode_state()
         self._recorder = recorder
         max_s = max_episode_s if max_episode_s is not None else self.cfg.control.max_episode_s
-        state = self.arm.read_state()
-        state.gripper = self.gripper.position()
+        state = self._read_state()
         self._state = state
-        self.safety.tare(state.wrench)
         self.buffer.reset(state.q, state.gripper)
         self.backend.reset()
         self.end_request.clear()
@@ -160,6 +159,13 @@ class ControlLoop:
 
     # ---- shared state ----
 
+    def _read_state(self) -> RobotState:
+        """The arm's state with the gripper and F/T sensor merged in."""
+        state = self.arm.read_state()
+        state.gripper = self.gripper.position()
+        state.ft = self.ft.wrench()
+        return state
+
     def _reset_episode_state(self) -> None:
         self._done = threading.Event()
         self._end_lock = threading.Lock()
@@ -197,8 +203,7 @@ class ControlLoop:
             while running.is_set():
                 token = self.arm.init_period()
                 now = time.monotonic()
-                state = self.arm.read_state()
-                state.gripper = self.gripper.position()
+                state = self._read_state()
                 self._state = state
                 loop_dt = np.nan if t_prev is None else now - t_prev
                 t_prev = now
@@ -208,6 +213,8 @@ class ControlLoop:
                 violation = Violation('estop') if self.estop.is_set() else self.safety.check_state(state)
                 if violation is None and (gripper_fault := self.gripper.fault()) is not None:
                     violation = Violation('gripper', {'fault': gripper_fault})
+                if violation is None and (ft_fault := self.ft.fault()) is not None:
+                    violation = Violation('ft_sensor', {'fault': ft_fault})
                 hold_reason = None
                 target = None
                 if violation is None:
@@ -252,7 +259,7 @@ class ControlLoop:
                         mode, sent = Mode.SERVO, q_cmd
 
                 rec.log_tick(now, state.q, state.qd, state.tcp_pose, state.wrench, state.gripper,
-                             sent, g_cmd if sent is not None else None, int(mode), loop_dt)
+                             sent, g_cmd if sent is not None else None, int(mode), loop_dt, state.ft)
                 if mode == Mode.STOPPED:
                     return
                 self.arm.wait_period(token)
@@ -287,7 +294,8 @@ class ControlLoop:
                 return None, {'camera': cam, 'age_s': age}
             images[cam] = frame
         wrench = None if state.wrench is None else state.wrench.copy()
-        return Observation(images, state.q.copy(), state.gripper, wrench, prompt, state.t), {}
+        ft = None if state.ft is None else np.asarray(state.ft, dtype=float).copy()
+        return Observation(images, state.q.copy(), state.gripper, wrench, prompt, state.t, ft), {}
 
     def _expected_gap(self, chunk_s: float, infer_s: float) -> float:
         """When the next chunk should land after this one.

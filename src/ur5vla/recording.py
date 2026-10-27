@@ -4,7 +4,8 @@
     ticks.npz                 every execution tick: state read, command sent, loop mode
     chunks.jsonl              every chunk received: t_obs, latency, targets, frames it saw
     events.jsonl              safety stops, holds, resumes, backend errors
-    cameras/<name>/index.csv  seq, t_capture, rgb, depth  (paths relative to this file)
+    cameras/<name>/index.csv  seq, t_capture, rgb, depth (paths relative to this file), and the
+                              frame's image settings where the camera reports them
     cameras/<name>/rgb/       native-resolution frames
     cameras/<name>/depth/     uint16 PNG, millimetres (only for cameras that deliver depth)
 
@@ -40,10 +41,11 @@ CHUNKS = 'chunks.jsonl'
 EVENTS = 'events.jsonl'
 CAMERAS = 'cameras'
 INDEX = 'index.csv'
-INDEX_FIELDS = ('seq', 't_capture', 'rgb', 'depth')
+SETTING_FIELDS = ('focus', 'exposure_us', 'iso', 'gain', 'white_balance_k')   # Frame.settings
+INDEX_FIELDS = ('seq', 't_capture', 'rgb', 'depth', *SETTING_FIELDS)
 
 # Columns of ticks.npz, in the order log_tick() receives them.
-TICK_FIELDS = ('t', 'q', 'qd', 'tcp_pose', 'wrench', 'gripper', 'q_cmd', 'g_cmd', 'mode', 'loop_dt')
+TICK_FIELDS = ('t', 'q', 'qd', 'tcp_pose', 'wrench', 'gripper', 'q_cmd', 'g_cmd', 'mode', 'loop_dt', 'ft')
 
 
 def _jsonable(x: Any) -> Any:
@@ -78,7 +80,8 @@ class EpisodeRecorder:
     """
 
     def __init__(self, ep_dir: str | Path, cameras: dict[str, CameraSource], cfg: LoggingConfig,
-                 writers: int = 2):
+                 writers: int | None = None):
+        """`writers`: frame-encoding threads; default one per camera, at least 2."""
         self.dir = Path(ep_dir)
         self.cameras = cameras
         self.cfg = cfg
@@ -88,7 +91,7 @@ class EpisodeRecorder:
         self._dropped_frames = 0
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
-        self._n_writers = writers
+        self._n_writers = writers or max(2, len(cameras))
         self._file_lock = threading.Lock()
         self._chunks_f = None
         self._events_f = None
@@ -103,6 +106,8 @@ class EpisodeRecorder:
             (self.dir / CAMERAS / name / 'rgb').mkdir(parents=True)
         self._meta = {
             **meta,
+            # What each camera reports of its focus, exposure, gain and white balance (cameras/).
+            'camera_settings': {name: cam.settings() for name, cam in self.cameras.items()},
             'clock': {'monotonic': time.monotonic(), 'wall': time.time()},
             'git_commit': git_commit(),
             'tick_fields': list(TICK_FIELDS),
@@ -136,6 +141,11 @@ class EpisodeRecorder:
                           frames={n: len(r) for n, r in self._index.items()},
                           frames_dropped_by_recorder=self._dropped_frames)
         self._write_meta()
+
+    @property
+    def frames_dropped(self) -> int:
+        """Frames left out because the writers fell behind (CPU or disk too slow for the cameras)."""
+        return self._dropped_frames
 
     # ---- called from the control threads ----
 
@@ -196,8 +206,10 @@ class EpisodeRecorder:
                 depth_rel = f'depth/{frame.seq:08d}.png'
                 mm = np.clip(np.nan_to_num(frame.depth) * 1000.0, 0, 65535).astype(np.uint16)
                 Image.fromarray(mm).save(cam_dir / depth_rel)
+            settings = frame.settings or {}
             self._index[name].append({'seq': frame.seq, 't_capture': f'{frame.t_capture:.6f}',
-                                      'rgb': rgb_rel, 'depth': depth_rel})
+                                      'rgb': rgb_rel, 'depth': depth_rel,
+                                      **{k: settings.get(k, '') for k in SETTING_FIELDS}})
 
     def _save_ticks(self) -> None:
         rows = self._ticks

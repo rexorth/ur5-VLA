@@ -29,6 +29,9 @@ openpi = ["openpi-client", "typing-extensions", "websockets>=17"]
 # torch/torchvision are listed so the CPU-index source below applies: the client only unpickles
 # action tensors. The LeRobot policy server runs from its own environment.
 lerobot = ["lerobot[async,dataset]>=0.6,<0.7", "torch", "torchvision"]
+# A GELLO leader arm (`teleop --leader`): GELLO's own hardware layer, from its as5600-encoders
+# branch in third_party/gello_software. It needs only numpy, so both venvs take it.
+leader = ["gello"]
 
 [project.scripts]
 ur5vla = "ur5vla.cli:main"
@@ -46,6 +49,7 @@ conflicts = [[{ extra = "openpi" }, { extra = "lerobot" }]]
 [tool.uv.sources]
 # The PyPI "openpi-client" has no listed maintainer; take it from Physical Intelligence's repo.
 openpi-client = { git = "https://github.com/Physical-Intelligence/openpi.git", subdirectory = "packages/openpi-client" }
+gello = { path = "third_party/gello_software", editable = true }
 torch = [{ index = "pytorch-cpu", extra = "lerobot" }]
 torchvision = [{ index = "pytorch-cpu", extra = "lerobot" }]
 

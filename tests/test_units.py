@@ -110,12 +110,10 @@ def test_safety_joint_limits_and_workspace():
     assert tight.check_command(HOME, HOME).reason == 'workspace'
 
 
-def test_safety_force_is_tared_and_robot_stops_are_caught():
-    s = SafetyLayer(SafetyConfig(ft_limit_n=30), TICK)
-    offset = np.array([20.0, 0, 0, 0, 0, 0])
-    s.tare(offset)
-    assert s.check_state(_state(wrench=offset + [25, 0, 0, 0, 0, 0])) is None
-    assert s.check_state(_state(wrench=offset + [0, 0, 31, 0, 0, 0])).reason == 'force'
+def test_safety_checks_the_force_as_it_is_and_robot_stops_are_caught():
+    s = SafetyLayer(SafetyConfig(ft_limit_n=30), TICK)                  # nothing tares it
+    assert s.check_state(_state(wrench=[25.0, 0, 0, 0, 0, 0])) is None
+    assert s.check_state(_state(wrench=[20.0, 0, 25, 0, 0, 0])).reason == 'force'   # |F| 32 N
     assert s.check_state(_state(protective_stop=True)).reason == 'robot_stopped'
 
 
@@ -228,3 +226,45 @@ def test_camera_rotate_turns_frames_clockwise_and_bad_values_are_errors():
         assert out.depth[top_left_goes_to] == depth[0, 0]
     with pytest.raises(ConfigError, match='rotate'):
         config_mod.parse({'cameras': {'base': {'type': 'synthetic', 'rotate': 45}}})
+
+
+# A moveJ turning only the base, by 120 deg: the TCP swings round an arc whose middle bulges out of
+# the box that holds both of its ends.
+SWEEP_FROM = np.deg2rad([-60.0, -90.0, 90.0, -90.0, -90.0, 0.0])
+SWEEP_TO = np.deg2rad([60.0, -90.0, 90.0, -90.0, -90.0, 0.0])
+TOOL = [0.0, 0.0, 0.2147]
+
+
+def _box_around_the_ends(margin=0.01):
+    a, b = tool_point(SWEEP_FROM, np.array(TOOL)), tool_point(SWEEP_TO, np.array(TOOL))
+    return (np.minimum(a, b) - margin).tolist(), (np.maximum(a, b) + margin).tolist()
+
+
+def test_a_movej_swinging_the_tcp_out_of_the_box_is_refused_though_both_ends_are_inside():
+    lo, hi = _box_around_the_ends()
+    s = SafetyLayer(SafetyConfig(workspace_min_m=lo, workspace_max_m=hi, tcp_offset_m=TOOL), TICK)
+    assert s.check_command(SWEEP_FROM, SWEEP_FROM) is None and s.check_command(SWEEP_TO, SWEEP_TO) is None
+    v = s.check_path(SWEEP_FROM, SWEEP_TO)
+    assert v.reason == 'path' and 0 < v.detail['fraction'] < 1
+    assert 'On the way there the TCP would leave the workspace box' in describe(v)
+    assert SafetyLayer(SafetyConfig(tcp_offset_m=TOOL), TICK).check_path(SWEEP_FROM, SWEEP_TO) is None
+
+
+def test_a_path_from_outside_the_box_says_the_tcp_is_outside_now():
+    lo, hi = _box_around_the_ends()
+    s = SafetyLayer(SafetyConfig(workspace_min_m=lo, workspace_max_m=hi, tcp_offset_m=TOOL), TICK)
+    outside = np.deg2rad([0.0, -90.0, 90.0, -90.0, -90.0, 0.0])          # the bulge itself
+    v = s.check_path(outside, SWEEP_TO)
+    assert v.detail['fraction'] == 0 and 'outside the workspace box now' in describe(v)
+
+
+def test_move_to_refuses_the_swing_before_asking_or_moving(capsys):
+    from ur5vla import cli
+    from ur5vla.robot import SimArm
+    lo, hi = _box_around_the_ends()
+    cfg = config_mod.parse({'robot': {'dry_run': True, 'start_q_deg': np.rad2deg(SWEEP_FROM).tolist()},
+                            'safety': {'workspace_min_m': lo, 'workspace_max_m': hi, 'tcp_offset_m': TOOL}})
+    arm = SimArm(cfg.robot)
+    assert cli._move_to(cfg, arm, np.rad2deg(SWEEP_TO).tolist(), 'start pose', assume_yes=True) is False
+    assert 'start pose refused: On the way there' in capsys.readouterr().out
+    assert np.allclose(arm.read_state().q, SWEEP_FROM)                    # it never moved

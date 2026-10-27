@@ -27,7 +27,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..config import GripperConfig
-from .gripper import Gripper
+from .gripper import Gripper, GripperReading
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +42,7 @@ FAULTS = {0x05: 'action delayed: activation must finish first', 0x07: 'activatio
 # 0x05/0x07 show up as "not activated"; 0x09 clears itself once we talk to it.
 FATAL = {0x08, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F}
 OBJECT = ('moving', 'contact while opening', 'contact while closing', 'at target')
+FORCE_N = (20.0, 235.0)                     # grip force at rFR 0 and 255
 
 
 def stroke_per_s(speed: float) -> float:
@@ -107,18 +108,36 @@ class RobotiqGripper(Gripper):
         if not read_only and (not status.activated or status.fault in FATAL):
             status = self._activate()       # a major fault clears only on a new activation
         self._status, self._t_status = status, time.monotonic()
+        self._start_io()
+        log.info('Robotiq gripper: %s', self.status_text())
+
+    def _start_io(self) -> None:
         self._stop.clear()
         self._thread = threading.Thread(target=self._io_loop, name='robotiq', daemon=True)
         self._thread.start()
-        log.info('Robotiq gripper: %s', self.status_text())
 
-    def close(self) -> None:
+    def _stop_io(self) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+
+    def close(self) -> None:
+        self._stop_io()
         if self._inst is not None:
             self._inst.serial.close()
+
+    def activate(self) -> None:
+        """Activation opens and closes the fingers fully. The I/O thread pauses meanwhile."""
+        s = self._status
+        if self._read_only or (s is not None and s.activated and s.fault not in FATAL):
+            return
+        self._stop_io()
+        try:
+            self._status, self._t_status = self._activate(), time.monotonic()
+        finally:
+            self._start_io()
+        log.info('Robotiq gripper: %s', self.status_text())
 
     def position(self) -> float:
         s = self._status
@@ -153,6 +172,19 @@ class RobotiqGripper(Gripper):
     @property
     def status(self) -> RobotiqStatus | None:
         return self._status
+
+    def reading(self) -> GripperReading:
+        """The 2F-85 reports position, its motion and object detection (gOBJ), faults and the motor
+        current; not the grip force. The force setting is the most it squeezes with."""
+        s = self._status
+        force_n = FORCE_N[0] + (FORCE_N[1] - FORCE_N[0]) * self._force / 255
+        if s is None:
+            return GripperReading(0.0, force_limit_n=force_n, fault=self.fault())
+        motion = OBJECT[s.object] if s.activated and s.go_to else 'idle'
+        return GripperReading(
+            s.position / 255, requested=s.requested / 255, motion=motion,
+            object_detected=s.activated and s.go_to and s.object in (1, 2),
+            current_ma=s.current_ma, force_limit_n=force_n, activated=s.activated, fault=self.fault())
 
     # ---- Modbus ----
 

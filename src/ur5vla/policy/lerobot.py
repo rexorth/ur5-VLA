@@ -35,6 +35,7 @@ from .base import ActionMapping, PolicyBackend
 log = logging.getLogger(__name__)
 
 JOINT_NAMES = ('shoulder_pan', 'shoulder_lift', 'elbow', 'wrist_1', 'wrist_2', 'wrist_3')
+FT_NAMES = ('ft.fx', 'ft.fy', 'ft.fz', 'ft.tx', 'ft.ty', 'ft.tz')     # N, N·m, from the calibration-pose zero
 
 
 @dataclass
@@ -49,6 +50,7 @@ class LeRobotConfig:
     actions_per_chunk: int = 50
     image_size: list[int] | None = None   # H, W; None = native, the server resizes
     include_gripper_state: bool = True    # observation.state = 6 joints (+ gripper)
+    include_ft_state: bool = False        # (+ the F/T sensor's 6 readings): to-lerobot --ft
     rename_map: dict[str, str] = field(default_factory=dict)
     timeout_s: float = 10.0         # per observation / action call
     load_timeout_s: float = 600.0   # loading the checkpoint, and the first inference after it
@@ -63,7 +65,9 @@ class LeRobotBackend(PolicyBackend):
         self.cfg = from_dict(LeRobotConfig, params, 'policy (lerobot)')
         c = self.cfg
         self.mapping = ActionMapping(c.action_mode, c.gripper_open, c.gripper_closed, c.gripper_index)
-        self.state_names = [f'{j}.pos' for j in JOINT_NAMES] + (['gripper.pos'] if c.include_gripper_state else [])
+        self.state_names = ([f'{j}.pos' for j in JOINT_NAMES]
+                            + (['gripper.pos'] if c.include_gripper_state else [])
+                            + (list(FT_NAMES) if c.include_ft_state else []))
         self._channel = None
         self._stub = None
         self._instructed = False
@@ -88,6 +92,11 @@ class LeRobotBackend(PolicyBackend):
 
     def raw_observation(self, obs: Observation) -> dict:
         state = list(obs.q) + ([self.mapping.gripper_to_policy(obs.gripper)] if self.cfg.include_gripper_state else [])
+        if self.cfg.include_ft_state:
+            if obs.ft is None:
+                raise RuntimeError('include_ft_state is set, but there is no F/T reading: set ft_sensor in the '
+                                   'cell file')
+            state += list(obs.ft)
         raw: dict = {name: float(v) for name, v in zip(self.state_names, state, strict=True)}
         for cam, policy_name in self.cfg.camera_map.items():
             img = obs.images[cam].rgb

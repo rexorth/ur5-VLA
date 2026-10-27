@@ -11,6 +11,9 @@ Mapping: each robot input is a list of terms whose values are summed and clipped
     {button: i}                  0 or 1
     any term may add  sign: -1
 e.g. RT up / LT down:  [{axis: 5, trigger: true}, {axis: 2, trigger: true, sign: -1}]
+
+While the `alt` button is held, each robot axis listed in `alt_axes` takes those terms instead
+([] turns it off); unlisted axes keep theirs. One stick can then drive yaw or roll, say.
 """
 
 from __future__ import annotations
@@ -163,7 +166,7 @@ def find_joystick() -> str:
 # ---- mapping ----
 
 ROBOT_AXES = ('x', 'y', 'z', 'rx', 'ry', 'rz')
-BUTTON_ROLES = ('deadman', 'slow', 'toggle_frame', 'done')
+BUTTON_ROLES = ('deadman', 'slow', 'toggle_frame', 'done', 'alt')
 
 # Control names under xpad (Xbox pads over USB), for the legend only: under another driver the
 # numbers mean other controls, so check them with `ur5vla gamepad`. Axes: (name, at -1, at +1).
@@ -173,8 +176,8 @@ XPAD_AXES = {0: ('left stick', 'left', 'right'), 1: ('left stick', 'up', 'down')
 XPAD_BUTTONS = ('A', 'B', 'X', 'Y', 'LB', 'RB', 'View', 'Menu', 'Xbox', 'left stick click',
                 'right stick click')
 LEGEND_ROWS = (('x', 'x', 'move along x'), ('y', 'y', 'move along y'), ('z', 'z', 'move along z'),
-               ('rx', 'roll', 'rotate about x'), ('ry', 'tilt', 'rotate about y'),
-               ('rz', 'yaw', 'rotate about z'))
+               ('rx', 'pitch', 'rotate about x'), ('ry', 'yaw', 'rotate about y'),
+               ('rz', 'roll', 'rotate about z'))   # named as in the tool frame: z out of the flange
 FRAME_TEXT = {'base': "x y z are the robot base's axes, as on the pendant",
               'tool': "x y z are the tool's own axes; z points out of the flange"}
 
@@ -237,18 +240,25 @@ class GamepadMapping:
     buttons: dict[str, int | None]
     deadzone: float = 0.12
     curve: float = 1.5              # output = sign(x)|x|^curve: finer control near center
+    alt_axes: dict[str, list[Term]] = field(default_factory=dict)  # replace these while `alt` is held
 
     @classmethod
-    def from_config(cls, axes: dict, gripper: list, buttons: dict, deadzone: float, curve: float):
-        unknown = set(axes) - set(ROBOT_AXES)
-        if unknown:
-            raise ValueError(f'teleop.axes: unknown robot axis {sorted(unknown)}; use {ROBOT_AXES}')
+    def from_config(cls, axes: dict, gripper: list, buttons: dict, deadzone: float, curve: float,
+                    alt_axes: dict | None = None):
+        alt_axes = alt_axes or {}
+        for where, spec in (('teleop.axes', axes), ('teleop.alt_axes', alt_axes)):
+            unknown = set(spec) - set(ROBOT_AXES)
+            if unknown:
+                raise ValueError(f'{where}: unknown robot axis {sorted(unknown)}; use {ROBOT_AXES}')
         unknown = set(buttons) - set(BUTTON_ROLES)
         if unknown:
             raise ValueError(f'teleop.buttons: unknown role {sorted(unknown)}; use {BUTTON_ROLES}')
+        if alt_axes and buttons.get('alt') is None:
+            raise ValueError('teleop.alt_axes needs a button to hold: set teleop.buttons.alt')
         return cls({a: parse_terms(axes.get(a, []), f'teleop.axes.{a}') for a in ROBOT_AXES},
                    parse_terms(gripper, 'teleop.gripper'),
-                   {r: buttons.get(r) for r in BUTTON_ROLES}, deadzone, curve)
+                   {r: buttons.get(r) for r in BUTTON_ROLES}, deadzone, curve,
+                   {a: parse_terms(t, f'teleop.alt_axes.{a}') for a, t in alt_axes.items()})
 
     def _combine(self, terms: list[Term], pad: GamepadState) -> float:
         x = float(np.clip(sum(t.value(pad, self.deadzone) for t in terms), -1.0, 1.0))
@@ -256,7 +266,8 @@ class GamepadMapping:
 
     def twist(self, pad: GamepadState) -> np.ndarray:
         """Normalised [x y z rx ry rz], each in -1..1."""
-        return np.array([self._combine(self.axes[a], pad) for a in ROBOT_AXES])
+        alt = self.alt_axes if self.held('alt', pad) else {}
+        return np.array([self._combine(alt.get(a, self.axes[a]), pad) for a in ROBOT_AXES])
 
     def gripper_rate(self, pad: GamepadState) -> float:
         return float(np.clip(sum(t.value(pad, self.deadzone) for t in self.gripper), -1.0, 1.0))
@@ -274,6 +285,10 @@ class GamepadMapping:
         lines = [f'{frame.upper()} frame: {FRAME_TEXT[frame]} ({button("toggle_frame")} switches)']
         lines += [f'  {label:<5} {what:<15} {describe_terms(self.axes[axis])}'
                   for axis, label, what in LEGEND_ROWS]
+        if self.alt_axes:
+            lines.append(f'  while {button("alt")} is held:')
+            lines += [f'  {label:<5} {what:<15} {describe_terms(terms) if terms else "off"}'
+                      for axis, label, what in LEGEND_ROWS if (terms := self.alt_axes.get(axis)) is not None]
         lines += ['  rotations turn the tool in place about the TCP; + is counter-clockwise seen from the',
                   '  + end of the axis (right-hand rule)',
                   f'  hold {button("deadman")} to move, {button("slow")} slow, {button("done")} done, '

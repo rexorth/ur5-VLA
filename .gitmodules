@@ -1,0 +1,4 @@
+[submodule "third_party/gello_software"]
+	path = third_party/gello_software
+	url = https://github.com/rexorth/gello_software
+	branch = as5600-encoders

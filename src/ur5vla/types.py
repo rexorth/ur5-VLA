@@ -20,6 +20,9 @@ class Frame:
     depth: np.ndarray | None        # HxW float32 metres, optional
     t_capture: float                # host monotonic clock, seconds
     seq: int                        # device frame counter, for drop detection
+    # The image settings it was taken with (focus, exposure_us, iso or gain, white_balance_k), as
+    # far as the camera reports them; None if it reports none.
+    settings: dict[str, float] | None = None
 
 
 @dataclass
@@ -46,6 +49,15 @@ class RobotState:
     program_running: bool = True    # the ur_rtde control script on the controller
     speed_scaling: float = 1.0      # below 1: the controller is slowing the arm (e.g. near a limit)
     t_robot: float | None = None    # controller clock, s; None if unknown (simulated arm)
+    # (6,) the F/T sensor between flange and gripper, in its own frame, N / N·m, from its zero at the
+    # calibration pose (ur5vla prepare). None
+    # without one. Merged in each tick like `gripper`; the arm itself doesn't read it.
+    ft: np.ndarray | None = None
+
+    @property
+    def contact_wrench(self) -> np.ndarray | None:
+        """What the force limits check: the F/T sensor if there is one, else the CB3 estimate."""
+        return self.ft if self.ft is not None else self.wrench
 
 
 # RTDE safety_mode and robot_mode values.
@@ -64,9 +76,10 @@ class Observation:
     images: dict[str, Frame]        # by logical camera name
     q: np.ndarray                   # 6 joint positions, rad
     gripper: float                  # 0 open .. 1 closed
-    wrench: np.ndarray | None       # F/T, 6, base frame
+    wrench: np.ndarray | None       # the CB3's estimate, 6, base frame
     prompt: str
     t: float                        # when the robot state in it was read
+    ft: np.ndarray | None = None    # the F/T sensor, from its zero at the calibration pose; None without one
 
 
 @dataclass

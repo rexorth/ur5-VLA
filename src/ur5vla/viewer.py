@@ -1,4 +1,6 @@
-"""Live camera window (`--view`): every camera's latest frame, side by side.
+"""Live camera window (`--view`): every camera's latest frame, side by side (in rows of up to three,
+and smaller, beyond three cameras). The images scale with the window: drag it larger, or maximise
+it, and they grow to fill it, keeping their aspect ratio.
 
 The window is a separate, spawned process running Tk, so drawing never competes with the 125 Hz
 execution thread for the GIL. Here, a sender thread passes each camera's newest frame down a pipe.
@@ -9,8 +11,9 @@ The window has focus whenever the operator clicks on it, so keys pressed there a
 dispatched like the terminal's (keys.py): the e-stop key works whichever window is in front.
 Prompts that need Enter (start, labels) are still answered in the terminal.
 
-Below the images, the window can show a text panel (set_info): teleop puts the controls legend
-and the arm's pose there.
+Below the images, the window can show columns of text (set_info): teleop puts its status and the
+controls legend in the first, and the gripper, the forces and the limits in the next (panels.py).
+A line that starts with WARN, ALERT or GOOD is drawn yellow, red or green.
 """
 
 from __future__ import annotations
@@ -36,22 +39,25 @@ log = logging.getLogger(__name__)
 
 STALE_S = 0.5               # caption turns red when a camera's newest frame is older than this
 POLL_S = 0.005              # how often the sender looks for new frames
+# Line prefixes in set_info text: the line is drawn in that colour, without the prefix.
+WARN, ALERT, GOOD = '\x01', '\x02', '\x03'
+COLOURS = {WARN: '#ffcc00', ALERT: '#ff4040', GOOD: '#40e040'}
 
 
 class CameraViewer:
     def __init__(self, cameras: dict[str, CameraSource], title: str = 'ur5vla', fps: float = 30.0,
                  width: int = 640, window: Callable[..., None] | None = None):
-        """`fps`: at most this many frames a second per camera. `width`: each camera is shown at
-        most this wide. `window` replaces the Tk window (tests); it is called in the child process
-        as window(frames, keys, names, title, width)."""
+        """`fps`: at most this many frames a second per camera. `width`: each camera starts at
+        most this wide; resizing the window then scales them. `window` replaces the Tk window
+        (tests); it is called in the child process as window(frames, keys, names, title, width)."""
         self.cameras = cameras
         self.title = title
         self.period = 1.0 / fps
         self.width = width
         self._window = window or _window
         self._bindings: dict[str, Callable[[], None]] | None = None
-        self._info: str | None = None
-        self._info_sent: str | None = None
+        self._info: tuple[str, ...] | None = None
+        self._info_sent: tuple[str, ...] | None = None
         self._stop = threading.Event()
         self._proc = None
         self._frames = None         # our end: frames to the window
@@ -79,9 +85,10 @@ class CameraViewer:
     def is_open(self) -> bool:
         return self._proc is not None and self._proc.is_alive()
 
-    def set_info(self, text: str) -> None:
-        """Show `text` (monospace, may be several lines) under the images."""
-        self._info = text
+    def set_info(self, *columns: str) -> None:
+        """Show these texts (monospace, several lines each) side by side under the images. A line
+        starting with WARN, ALERT or GOOD is drawn yellow, red or green."""
+        self._info = columns
 
     @contextlib.contextmanager
     def keys(self, bindings: dict[str, Callable[[], None]]) -> Iterator[None]:
@@ -156,9 +163,26 @@ class CameraViewer:
             pass
 
 
-def drain(conn, limit: int) -> tuple[dict[str, tuple[tuple[int, ...], float, bytes]], str | None]:
+def grid_layout(n: int, width: int) -> tuple[int, int, int | None]:
+    """How to lay out n cameras: (columns, the widest and tallest each image starts at; None = no
+    height limit). Up to three side by side at `width`; more in rows, small enough to fit a screen."""
+    if n <= 3:
+        return max(n, 1), width, None
+    return (2 if n == 4 else 3), min(width, 480), 400
+
+
+def fit(width: int, height: int, box_w: float, box_h: float, upscale: bool = True) -> tuple[int, int]:
+    """The size to show a width x height image at: as large as fits in box_w x box_h, with its
+    aspect ratio kept, and no larger than it is unless `upscale`."""
+    scale = min(box_w / width, box_h / height)
+    if not upscale:
+        scale = min(scale, 1.0)
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
+def drain(conn, limit: int) -> tuple[dict[str, tuple[tuple[int, ...], float, bytes]], tuple[str, ...] | None]:
     """Read up to `limit` messages waiting in the pipe. Returns each camera's newest frame as
-    {name: (shape, t_capture, rgb bytes)}, and the newest info text (None if none came).
+    {name: (shape, t_capture, rgb bytes)}, and the newest info columns (None if none came).
     Raises EOFError once the sender has closed."""
     fresh, info = {}, None
     for _ in range(limit):
@@ -185,16 +209,51 @@ def _window(frames, keys, names: list[str], title: str, width: int) -> None:
     root = tk.Tk()
     root.title(title)
     root.configure(bg='black')
-    captions, panels, photos = {}, {}, {}
+    captions, views, items, photos = {}, {}, {}, {}
+    latest = {}                                 # name: the last frame, to redraw on a resize
+    drawn: dict[str, tuple[int, int]] = {}      # name: the view size it was drawn for
     arrivals = {name: collections.deque(maxlen=60) for name in names}
     t_capture: dict[str, float] = {}
+    n_cols, max_w, max_h = grid_layout(len(names), width)
+    # Each image is drawn on a canvas that fills its grid cell. The image rows and columns take
+    # any extra space, so the views grow and shrink with the window; captions and text don't.
     for i, name in enumerate(names):
+        row, col = 2 * (i // n_cols), i % n_cols
         captions[name] = tk.Label(root, text=f'{name}: waiting for frames', fg='white', bg='black',
                                   anchor='w', font='TkFixedFont')
-        captions[name].grid(row=0, column=i, sticky='we', padx=4)
-        panels[name] = tk.Label(root, bg='black')
-        panels[name].grid(row=1, column=i, padx=2, pady=(0, 2))
-    info_panel = tk.Label(root, fg='white', bg='black', justify='left', anchor='w', font='TkFixedFont')
+        captions[name].grid(row=row, column=col, sticky='we', padx=4)
+        views[name] = tk.Canvas(root, bg='black', highlightthickness=0, width=max_w,
+                                height=max_h or round(max_w * 3 / 4))
+        views[name].grid(row=row + 1, column=col, sticky='nsew', padx=2, pady=(0, 2))
+        items[name] = views[name].create_image(0, 0, anchor='center')
+        root.rowconfigure(row + 1, weight=1)
+        root.columnconfigure(col, weight=1)
+    info_row = 2 * math.ceil(len(names) / n_cols)
+    info_frame = tk.Frame(root, bg='black')
+    info_columns: list[tk.Text] = []
+
+    def show_info(columns: tuple[str, ...]) -> None:
+        if not info_frame.grid_info():          # only once there is something to show
+            info_frame.grid(row=info_row, column=0, columnspan=n_cols, sticky='w', padx=4, pady=(0, 4))
+        while len(info_columns) < len(columns):
+            text = tk.Text(info_frame, fg='white', bg='black', font='TkFixedFont', wrap='none',
+                           borderwidth=0, highlightthickness=0, cursor='arrow', width=1, height=1)
+            text.bindtags((str(text), str(root), 'all'))    # display only: keys go to the window
+            for marker, colour in COLOURS.items():
+                text.tag_configure(marker, foreground=colour)
+            text.grid(row=0, column=len(info_columns), sticky='nw', padx=(0, 24))
+            info_columns.append(text)
+        for i, text in enumerate(info_columns):
+            lines = columns[i].split('\n') if i < len(columns) else ['']
+            text.configure(state='normal')
+            text.delete('1.0', 'end')
+            for k, line in enumerate(lines):
+                marker = line[:1] if line[:1] in COLOURS else ''
+                text.insert('end', line[len(marker):] + ('\n' if k < len(lines) - 1 else ''),
+                            marker or ())
+            # Grow, never shrink: the window keeps its size as the text changes.
+            text.configure(state='disabled', height=max(len(lines), int(text.cget('height'))),
+                           width=max(max(len(line) for line in lines), int(text.cget('width')), 1))
 
     def on_key(event) -> None:
         if event.char:
@@ -204,6 +263,28 @@ def _window(frames, keys, names: list[str], title: str, width: int) -> None:
     root.bind('<Key>', on_key)
     last_caption = 0.0
 
+    def view_size(name: str) -> tuple[int, int]:
+        view = views[name]
+        size = view.winfo_width(), view.winfo_height()
+        if min(size) < 2:                       # not laid out yet: the size it asks for
+            size = int(view.cget('width')), int(view.cget('height'))
+        return size
+
+    def draw(name: str, img) -> None:
+        """Fit the frame to its view, centred."""
+        box = view_size(name)
+        size = fit(img.width, img.height, *box)
+        if size != img.size:
+            img = img.resize(size, Image.BILINEAR)
+        photo = photos.get(name)
+        if photo is not None and (photo.width(), photo.height()) == size:
+            photo.paste(img)
+        else:
+            photos[name] = ImageTk.PhotoImage(img)
+            views[name].itemconfigure(items[name], image=photos[name])
+        views[name].coords(items[name], box[0] / 2, box[1] / 2)
+        drawn[name] = box
+
     def pump() -> None:
         nonlocal last_caption
         try:
@@ -212,22 +293,20 @@ def _window(frames, keys, names: list[str], title: str, width: int) -> None:
             root.destroy()
             return
         if info is not None:
-            if not info_panel.grid_info():      # only once there is something to show
-                info_panel.grid(row=2, column=0, columnspan=len(names), sticky='w', padx=4, pady=(0, 4))
-            info_panel.configure(text=info)
+            show_info(info)
         now = time.monotonic()
         for name, (shape, t, data) in fresh.items():
             img = Image.frombuffer('RGB', (shape[1], shape[0]), data, 'raw', 'RGB', 0, 1)
-            if img.width > width:
-                img = img.resize((width, round(img.height * width / img.width)), Image.BILINEAR)
-            photo = photos.get(name)
-            if photo is not None and (photo.width(), photo.height()) == img.size:
-                photo.paste(img)
-            else:
-                photos[name] = ImageTk.PhotoImage(img)
-                panels[name].configure(image=photos[name])
+            if name not in latest:              # the window opens with each image at its start size
+                w, h = fit(img.width, img.height, max_w, max_h or math.inf, upscale=False)
+                views[name].configure(width=w, height=h)
+            latest[name] = img
+            draw(name, img)
             arrivals[name].append(now)
             t_capture[name] = t
+        for name, img in latest.items():        # resized: redraw, even a camera that has stalled
+            if name not in fresh and view_size(name) != drawn[name]:
+                draw(name, img)
         if now - last_caption > 0.5:
             last_caption = now
             for name in names:

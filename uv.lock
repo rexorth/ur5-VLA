@@ -426,6 +426,18 @@ http = [
 ]
 
 [[package]]
+name = "gello"
+version = "0.0.1"
+source = { editable = "third_party/gello_software" }
+dependencies = [
+    { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-6-ur5vla-openpi'" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-6-ur5vla-lerobot' or extra != 'extra-6-ur5vla-openpi'" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "numpy" }]
+
+[[package]]
 name = "grpcio"
 version = "1.84.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1371,6 +1383,9 @@ cameras = [
     { name = "opencv-python-headless" },
     { name = "pyrealsense2" },
 ]
+leader = [
+    { name = "gello" },
+]
 lerobot = [
     { name = "lerobot", extra = ["async", "dataset"], marker = "extra == 'extra-6-ur5vla-lerobot'" },
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-6-ur5vla-lerobot') or (extra == 'extra-6-ur5vla-lerobot' and extra == 'extra-6-ur5vla-openpi')" },
@@ -1392,6 +1407,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "depthai", marker = "extra == 'cameras'", specifier = ">=3.0" },
+    { name = "gello", marker = "extra == 'leader'", editable = "third_party/gello_software" },
     { name = "lerobot", extras = ["async", "dataset"], marker = "extra == 'lerobot'", specifier = ">=0.6,<0.7" },
     { name = "minimalmodbus", specifier = ">=2.1" },
     { name = "numpy", specifier = ">=1.26" },
@@ -1407,7 +1423,7 @@ requires-dist = [
     { name = "ur-rtde", specifier = ">=1.6" },
     { name = "websockets", marker = "extra == 'openpi'", specifier = ">=17" },
 ]
-provides-extras = ["cameras", "openpi", "lerobot"]
+provides-extras = ["cameras", "openpi", "lerobot", "leader"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8" }]

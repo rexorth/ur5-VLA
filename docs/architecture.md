@@ -13,20 +13,22 @@ commands, their options and what to check are in [procedures.md](procedures.md);
 | [Robot arm](#robot-arm) | `robot/arm.py` |
 | [Kinematics](#kinematics) | `robot/kinematics.py` |
 | [Gripper](#gripper) | `robot/gripper.py`, `robot/robotiq.py` |
+| [F/T sensor](#ft-sensor) | `robot/ft_sensor.py`, `robot/axia80.py` |
 | [Cameras](#cameras) | `cameras/` |
 | [Live camera window](#live-camera-window) | `viewer.py` |
 | [Policy backends](#policy-backends) | `policy/` |
 | [Control loop](#control-loop) | `control/loop.py` |
 | [Chunk buffer](#chunk-buffer) | `control/chunks.py` |
 | [Safety layer](#safety-layer) | `control/safety.py` |
-| [Gamepad and teleop](#gamepad-and-teleop) | `teleop/gamepad.py`, `control/teleop.py` |
+| [Gamepad and teleop](#gamepad-and-teleop) | `teleop/gamepad.py`, `control/teleop.py`, `panels.py` |
+| [Workspace box](#workspace-box) | `workspace.py` |
 | [Operator keys](#operator-keys) | `keys.py` |
 | [Recording](#recording) | `recording.py` |
 | [Dataset conversion](#dataset-conversion) | `convert.py` |
 | [Command line](#command-line) | `cli.py` |
 
-Code paths are relative to `src/ur5vla/`. Cell files (`cell.yaml`, `dry_run.yaml`) and policy files
-(`policy/*.yaml`) are in `configs/`; tests are in `tests/`.
+Code paths are relative to `src/ur5vla/`. Cell files (`cell.yaml`, `dry_run.yaml`), policy files
+(`policy/*.yaml`) and teleop files (`teleop/*.yaml`) are in `configs/`; tests are in `tests/`.
 
 ---
 
@@ -110,7 +112,8 @@ gripper I/O thread ◄─target/status─► execution thread, 8 ms ──► sa
 teleop and demo replace the two middle threads with one:
 gamepad thread ──latest state──► teleop thread, 8 ms ──► safety ──► servoJ ──► UR5
 
-also: recorder (1 poll + 2 writer threads), key listener thread, camera window (a separate process)
+also: recorder (1 poll + 2 writer threads), key listener thread, session log thread (copies
+stderr), camera window (a separate process)
 ```
 
 - **GIL hand-off.** The loop and teleop set `sys.setswitchinterval(0.0005)`, so another thread's
@@ -125,8 +128,9 @@ also: recorder (1 poll + 2 writer threads), key listener thread, camera window (
 ## Configuration
 
 `config.py` turns one YAML cell file into a `RunConfig`: `robot`, `cameras`, `policy`, `control`,
-`safety`, `logging`, `teleop`, `gripper` and `prompt`. `-p <policy file>` replaces only the
-`policy:` block, so an openpi run and a LeRobot run share every other setting. The keys of each
+`safety`, `logging`, `teleop`, `gripper`, `ft_sensor` and `prompt`. `-p <policy file>` replaces only the
+`policy:` block, so an openpi run and a LeRobot run share every other setting; `-t <teleop file>`
+does the same for `teleop:`. The keys of each
 block are listed in procedures.md: [safety](procedures.md#25-safety-limits-the-pendant-and-cellyaml-together),
 [gripper](procedures.md#34-gripper), [teleop](procedures.md#44-teleop-settings),
 [policy files](procedures.md#63-policy-files) and [timing](procedures.md#66-timing-settings).
@@ -136,7 +140,8 @@ block are listed in procedures.md: [safety](procedures.md#25-safety-limits-the-p
   falling back to a default.
 - **Values are checked at load:** servoJ lookahead and gain within ur_rtde's ranges,
   `refill_fraction` in (0, 1], `watchdog_factor` > 1, six joint limits and three workspace bounds
-  with min < max, positive speed and tracking limits, camera `rotate` in 0/90/180/270, gripper speed and force in [0, 1].
+  with min < max, positive speed and tracking limits, `tcp_offset_m` within 1 m and the box
+  within 3 m (both are metres; larger values are millimetres by mistake), camera `rotate` in 0/90/180/270, gripper speed and force in [0, 1].
 - **Cameras and the policy stay plain dicts here.** Each driver and backend validates its own keys
   the same way when it is built, so a key meant for a different driver is also an error.
 - **Saved with every episode.** The config as loaded and its source path go into each episode's
@@ -146,7 +151,7 @@ block are listed in procedures.md: [safety](procedures.md#25-safety-limits-the-p
 ## Robot arm
 
 `robot/arm.py`. One `Arm` interface: `connect(receive_only)`, `read_state`, `servo_j`,
-`servo_stop`, `move_j`, `recover`, `robot_info`, `within_robot_limits`, and
+`servo_stop`, `move_j`, `freedrive`, `reconnect`, `recover`, `robot_info`, `within_robot_limits`, and
 `init_period`/`wait_period` around each tick. `make_arm` returns the real arm or the simulated
 one, from `robot.dry_run`.
 
@@ -163,18 +168,31 @@ one, from `robot.dry_run`.
   (normal, reduced, protective stop, …), its arm mode (running, power off, …), whether our
   control script runs, the speed scaling (below 1 the controller is slowing the arm) and the
   controller's own timestamp, all stamped with the host clock. On a CB3 the wrench is the
-  controller's estimate from joint currents, not a sensor.
+  controller's estimate from joint currents, not a sensor. The loops merge in the gripper and the
+  F/T sensor ([F/T sensor](#ft-sensor)) each tick.
 - **Streaming.** `servo_j` calls `servoJ(q, 0, 0, period, lookahead, gain)`; servoJ ignores the
   speed and acceleration arguments. If the controller refuses, it raises `ArmError`. ur_rtde
   refuses only when its script isn't running or the robot has stopped, so the loops treat a
   refusal as a robot stop, reading the reason from the state.
-- **After a robot stop.** Any robot stop ends ur_rtde's control script. Once the stop is cleared
-  on the pendant, `recover()` reconnects if the link dropped and uploads the script again.
+- **Freedrive.** `freedrive(True)` is ur_rtde's `teachMode`: the arm goes limp and is moved by
+  hand, as with the pendant's freedrive button, until `freedrive(False)`.
+- **After a robot stop.** Any robot stop ends ur_rtde's control script. Nothing is sent to a
+  stopped robot:
+  - `reconnect()`, for data that went silent, reconnects what dropped and uploads nothing. A
+    dropped control interface is closed rather than reconnected, because ur_rtde's own reconnect
+    uploads the script and waits up to 5 s for it to start.
+  - `recover()`, once the stop is cleared on the pendant, reconnects, opens the control
+    interface again if it was closed, and uploads the script again. While the robot is still
+    stopped it uploads nothing.
+
+  ur_rtde's control interface still reconnects by itself if its connection fails, uploading its
+  script. It says so on stderr (`RTDEControlInterface: …`), which the session log keeps
+  ([Command line](#command-line)).
 - **Pendant settings.** `robot_info()` reads the TCP offset, the payload and the speed slider, for
   the checks at connect. `within_robot_limits(q)` asks the controller whether its own limits
   allow a pose; it is a round trip, so it is used before `moveJ`, not every tick.
 - **Tick timing.** `init_period`/`wait_period` are RTDE's `initPeriod`/`waitPeriod`, which hold an
-  accurate 8 ms cadence.
+  accurate 8 ms cadence. While the control interface is closed they sleep out the tick instead.
 - **Closing** runs servoStop and stopScript if the script still runs, then disconnect, each
   guarded so one failure doesn't skip the rest; failures are one-line warnings.
 - **Simulated arm (`SimArm`).** Follows servo targets with a 30 ms first-order lag, starting at
@@ -201,9 +219,9 @@ one, from `robot.dry_run`.
 the Robotiq 2F-85 driver. Commands, setup and settings are in
 [procedures.md](procedures.md#34-gripper).
 
-- **Interface.** `connect(read_only)`, `close`, `position`, `command`, `fault` and `status_text`.
-  The loop and teleop call `position`, `command` and `fault` every tick, so none of them may
-  block. Values are 0 open … 1 closed everywhere; policy outputs are mapped onto that range by the
+- **Interface.** `connect(read_only)`, `close`, `position`, `command`, `fault`, `status_text` and
+  `reading`. The loop and teleop call `position`, `command` and `fault` every tick, so none of
+  them may block. Values are 0 open … 1 closed everywhere; policy outputs are mapped onto that range by the
   backend's `gripper_open`/`gripper_closed`.
 - **Which gripper.** `make_gripper`: `type: none` gives `NoGripper` (reads 0, ignores commands);
   `robotiq_2f85` gives `RobotiqGripper` on the arm and `SimGripper` with `--dry-run`.
@@ -215,12 +233,20 @@ the Robotiq 2F-85 driver. Commands, setup and settings are in
   detection, fault, requested and actual position, current). Position, speed and force are counts
   0–255: speed 20–150 mm/s, force 20–235 N. Closing on nothing, a 2F-85 stops near 230/255, so it
   reads about 0.9.
+- **What it reports** (`reading()`, shown in teleop's window): the finger position, the position it
+  was asked for, its motion and object detection (moving; stopped by contact while opening or
+  closing, that is holding something; at the target), the activation state, a fault code, and the
+  motor current. It doesn't report the grip force: the force setting (`gripper.force`, 20–235 N)
+  is the most it squeezes with, and the current rises with the actual force without being a
+  calibrated reading of it. Nothing else is readable over its Modbus interface.
 - **Background thread.** It sends the latest target when it changes and reads the status 100 times
   a second (`rate_hz`). The 125 Hz loop only touches the latest values, so it never waits on the
   serial port. The FTDI adapter is put in low-latency mode (1 ms per reply instead of 16 ms).
 - **Activation** happens automatically when needed, with a timeout (`activate_timeout_s`): it
   clears and sets the activate bit, and the fingers open and close fully, once per power-up. After
-  a major fault, the gripper is reactivated.
+  a major fault, the gripper is reactivated. At connect, and again before each demo through
+  `activate()` (`ur5vla prepare`), which pauses the I/O thread while it runs: so a gripper that
+  lost power or activation between demos comes back.
 - **Faults stop the episode.** No status for `timeout_s` (0.5 s), a gripper fault (overcurrent,
   undervoltage, overheating, …) or lost activation ends it as `safety` with `violation: gripper`,
   in both policy runs and teleop.
@@ -229,6 +255,46 @@ the Robotiq 2F-85 driver. Commands, setup and settings are in
 - **On exit** the gripper keeps its last command, so it keeps holding.
 - **Dry runs.** `SimGripper` follows commands at the configured speed:
   (20 + 130 × `speed`) / 85 full strokes a second.
+
+## F/T sensor
+
+`robot/ft_sensor.py` is the interface; `robot/axia80.py` drives an ATI Ethernet Axia80 between the
+flange and the gripper. Configured under `ft_sensor:`; setting it up:
+[procedures.md](procedures.md#39-ft-sensor).
+
+- **A trimmed copy of Axia80Monitor's client.** `~/abhay_ws/Axia80Monitor` sets the sensor up
+  (rate, filter, range, IP) and plots it; `axia80.py` keeps only what the loop needs, with the
+  standard library: the scaling from `netftapi2.xml` (counts per N and per N·m, refused unless
+  the units are N and N·m) and the UDP "RDT" stream.
+- **Streaming.** A thread asks for buffered streaming (several records per packet) and adds up
+  each record, scaled to N and N·m. `wrench()` returns the mean of the samples since its last call:
+  at the sensor's ~1 kHz, about 8 per 8 ms tick, which averages out noise. With nothing new, it
+  returns the last mean.
+- **In the sensor's frame, zeroed at the calibration pose.** `tare()` sends RDT command 0x0042
+  (the sensor's own bias, as Axia80Monitor's `bias`), so the sensor reports readings relative to
+  the load at that moment until the next tare or a power cycle. Before the bias it averages the
+  reading for 0.5 s and refuses if any 20 ms mean strays more than 0.3 N or 0.03 N·m; after it,
+  it checks the sensor reads zero. `ur5vla prepare`, which each demo and each policy episode runs
+  first, does it at `ft_sensor.tare_q_deg`. That zero is the only one: nothing tares the readings
+  again, at an episode's start or anywhere else, so the limits, the recording, `to-lerobot --ft`
+  and a policy all get them as the sensor sends them, until the next tare at that pose. Each tare
+  is saved to `<logging.root>/ft_tare.json` with the zero the sensor then reports (`zero()`, its
+  `setbias` read back). `--reuse-tare` on `demo` and `run` skips the move and the tare while
+  `zero()` still matches that record for the same sensor and calibration pose; a power cycle or
+  another program's zero changes it, so there is no way to keep a stale record by mistake. Readings
+  aren't rotated either, so with the wrist turned away from the calibration pose part of the
+  gripper's weight shows.
+- **Faults** (`fault()`): no packet for `timeout_s` (0.1 s), an error bit in any record's status
+  word since the last look (temperature, supply voltage, broken gage, out of range, …), or a
+  network error. Like a gripper fault, a sensor fault ends a policy episode as `safety` with
+  `violation: ft_sensor`, and pauses or ends teleop: the force limits can't be checked without it.
+- **One client at a time.** The sensor streams to whoever asked last. After a second without data
+  the thread asks again, so it recovers from a cable or power blip, or from another program
+  having taken the stream once that program stops.
+- **Merged each tick.** The loop and teleop put `wrench()` into `RobotState.ft`, next to the
+  gripper's position. A policy observation carries it as read (`Observation.ft`); the LeRobot
+  adapter sends it with `include_ft_state` ([Policy backends](#policy-backends)).
+- **Dry runs.** `SimFTSensor` reads zero.
 
 ## Cameras
 
@@ -241,7 +307,7 @@ the model's camera names. Finding device IDs and checking the cameras:
 |---|---|---|---|
 | `realsense` | pyrealsense2 | `serial` | The RGB sensor as `rgb8`; depth aligned to colour only with `depth: true` |
 | `oak` | depthai v3 | `device_id` | The sensor on `socket` (`CAM_A`, the colour camera on an OAK-D), resized and converted to RGB on the device |
-| `mcu_uvc` | OpenCV / V4L2 | `device` | UVC frames (MJPG by default), converted to RGB |
+| `uvc` (also `mcu_uvc`) | OpenCV / V4L2 | `device` | Any USB webcam, or an MCU board that enumerates as UVC: frames (MJPG by default), converted to RGB |
 | `replay` | recorded files | `episode` | A recorded episode's frames at their recorded spacing |
 | `synthetic` | none | — | A moving test pattern |
 
@@ -261,6 +327,21 @@ the model's camera names. Finding device IDs and checking the cameras:
 - **`rotate`** (0/90/180/270, clockwise) turns every frame, and its depth, as it is published, so
   the loop, recorder, policy and viewer all see the turned frame. Sensor `width`/`height` are
   unchanged, so 90 and 270 give frames `width` tall.
+- **Image settings.** Each driver sets the camera up when it opens it (the keys:
+  [procedures.md](procedures.md#image-settings)):
+  - OAK: the Camera node's `initialControl`. Autofocus is off with the lens at `focus`;
+    anti-banding (`mains_hz`) and the auto-exposure limit (`max_exposure_us`) apply; exposure and
+    ISO, or white balance, are fixed where set. The device boots fresh each time.
+  - RealSense: every colour option back to its default, the power-line frequency from
+    `mains_hz`, then auto exposure and auto white balance off where values are set.
+  - UVC: `v4l2.py` lists the controls by ioctl and puts each back to its default. Then autofocus
+    goes off with the lens at `focus`, and the power-line frequency and any fixed values are set.
+
+  Each frame carries its settings (`Frame.settings`): the OAK's from its metadata, automatic ones
+  included. The D415 and webcams carry only fixed values, since neither reports what its
+  automatic modes chose. `settings()` returns the latest. With automatic exposure or white
+  balance a driver sets `settle_s` (2 s), which startup waits out after the first frames. Setting
+  `automatic` before `start()` leaves everything to the camera, for `cameras --measure`.
 - **Native resolution.** Drivers never resize for a model; each policy backend does its own
   resizing, so recordings stay usable for other models.
 - **Lazy imports.** A driver's library is imported only when a config names that driver, so a
@@ -274,15 +355,30 @@ the model's camera names. Finding device IDs and checking the cameras:
 latest frame side by side. `teleop` doesn't otherwise use the cameras; with `--view` it starts
 them.
 
+- **Choosing cameras.** `--view wrist base` shows only those cameras, in that order; a name not
+  in the config is refused before anything starts. `cameras` and `teleop` then start only
+  those. `run` and `demo` still start and record every camera, since the policy and the
+  dataset need them.
 - **A separate process.** The window is a spawned (not forked) process running Tk, so drawing never
   competes with the execution thread for the GIL. The headless OpenCV in both venvs can't open
   windows; Tk and Pillow can, with no extra dependency.
 - **Frames.** A sender thread looks for new frames every 5 ms and passes each camera's newest one
   down a pipe, at most about 30 a second per camera. If the window falls behind, the pipe fills
   and the sender waits, then sends whatever frame is newest, so nothing queues up.
-- **Window.** Each camera is scaled to at most 640 px wide. Its caption shows the display rate and
-  the frame's age, and turns red when a camera has sent no new frame for 0.5 s. A text panel under
-  the images shows the controller legend and the pose during teleop and demos.
+- **Window.** Each camera starts at most 640 px wide, side by side. Beyond three cameras they go
+  in rows (2 × 2, then rows of three), each starting at most 480 × 400, so the window still
+  fits a screen (`grid_layout`).
+- **Resizing.** Each image is drawn on a canvas that fills its grid cell, and the image rows
+  and columns take any extra space. So when the window is dragged larger or maximised, the
+  images grow to fill it, and shrink with it, keeping their aspect ratio (`fit`). A camera
+  whose frames have stalled is redrawn at the new size too. Enlarging costs the window's
+  process CPU: at 1500 × 950 with two cameras it showed about 22 of their 30 fps. It never
+  slows the run, which only ever sends the newest frame.
+- **Captions and text.** Each caption shows the display rate and
+  the frame's age, and turns red when a camera has sent no new frame for 0.5 s. Under the images,
+  `set_info(*columns)` shows columns of text side by side; a line starting with `WARN`, `ALERT` or
+  `GOOD` is drawn yellow, red or green. Columns only grow, so the window keeps its size as the
+  text changes. Teleop and demos fill them ([Gamepad and teleop](#gamepad-and-teleop)).
 - **Keys work in the window.** While an episode runs, keys pressed in the window are sent back and
   act as in the terminal; Ctrl-C there is an e-stop too. So the e-stop key works whichever window
   has focus.
@@ -347,7 +443,8 @@ names and unit conversion; the server applies its own checkpoint's normalisation
   `load_timeout_s` (600 s). The instructions go with the first call because the image shapes are
   known only once frames exist.
 - **Observation.** `<joint>.pos` for the six joints (plus `gripper.pos` with
-  `include_gripper_state`), each camera under its `camera_map` name, and the prompt as the task. The
+  `include_gripper_state`, and `ft.fx` … `ft.tz`, the F/T reading from its calibration-pose zero, with `include_ft_state`),
+  each camera under its `camera_map` name, and the prompt as the task. The
   names match what `to-lerobot` writes, so a model fine-tuned on this cell's data gets what it
   trained on.
 - **`must_go=True` on every observation.** Otherwise the server skips any observation whose state is
@@ -381,7 +478,7 @@ names and unit conversion; the server applies its own checkpoint's normalisation
 `control/loop.py`. One episode is two threads sharing a chunk buffer. The calling thread only
 watches for the end. Tuned by `control:` and `safety:`.
 
-- **Episode start.** Read the state, tare the force reading, reset the buffer to the current pose
+- **Episode start.** Read the state, reset the buffer to the current pose
   (so the first chunk crossfades from where the arm is), and reset the backend. `warmup()` runs one
   inference before the first episode, so the model is loaded before anything moves.
 - **Execution thread, every 8 ms:**
@@ -453,19 +550,27 @@ alike. Configured under `safety:`; what to set, in `cell.yaml` and on the pendan
   - it is powered with the brakes released, and our control script runs;
   - its data are numbers, and the controller's timestamp advances (none new for 0.1 s means the
     link is down);
-  - the force limit (`ft_limit_n` on |F| after a tare at the start of each episode).
+  - the force and torque limits (`ft_limit_n` on |F|, `ft_limit_nm` on |T|). They check
+    `RobotState.contact_wrench` as it is, with no tare: the F/T sensor, from its zero at the
+    calibration pose, when there is one, else the controller's estimate.
 - **Command checks** (`check_command`), on every target before it is sent:
   - it is a number (NaN passes every comparison, so this comes first);
   - joint limits (`joint_min_deg`/`joint_max_deg`);
   - joint speed, as the per-tick step (`max_step_rad`; 0.02 rad per 8 ms is 143°/s);
   - TCP speed (`max_tcp_speed_m_s`) from the last target to this one;
-  - the workspace box (`workspace_min_m`/`workspace_max_m`);
+  - the workspace box: two opposite corners, `workspace_min_m` and `workspace_max_m`, of an
+    axis-aligned box in the UR base frame ([Workspace box](#workspace-box));
   - tracking (`max_tracking_error_deg`): how far the target is from where the arm is. A large gap
     means the robot is slowing itself, near one of its own limits.
 
   The TCP speed and the box are checked at the TCP point given by `tcp_offset_m`. Joint steps
   alone don't bound the TCP speed: 0.01 rad on every joint in one tick moves the flange at about
   1.5 m/s.
+- **The path of a moveJ** (`check_path`), before every move to a pose (calibration, start): a
+  moveJ turns every joint at once, in a straight line in joint space, so the joint limits hold
+  along it if they hold at both ends. The TCP, though, swings in a curve, and may leave the box
+  between two poses that are both inside it. Its point is checked every 1° of the farthest-moving
+  joint. Nothing checks obstacles, or the tool and camera hitting the arm itself.
 - **Never clipped, never sent.** A violating target is not shrunk into an allowed one, and it is
   not sent: in a policy run the episode ends. In teleop the step is refused instead, so the arm
   stops at the limit and can be driven back out.
@@ -475,7 +580,11 @@ alike. Configured under `safety:`; what to set, in `cell.yaml` and on the pendan
 - **Holds live in the loop**, not here: stale cameras and the watchdog resume on their own, while
   violations end the episode.
 - **The CB3 force reading** is an estimate from joint currents, with an offset and swings during
-  fast motion: a collision backstop, not a contact sensor.
+  fast motion: a collision backstop, not a contact sensor. With the F/T sensor the limits use it
+  instead, so they can be much tighter. The sensor's zero at the calibration pose takes out the
+  gripper's weight in that orientation; turned away from it, part of the weight shows, so leave
+  the limits that much margin. Without the sensor the estimate is used as it is: the controller
+  takes out the pendant's payload, but an offset that varies with the pose remains.
 
 ### Our limits and the robot's
 
@@ -513,18 +622,21 @@ A robot stop, the force limit or a gripper fault:
 
 | Command | What happens |
 |---|---|
-| `teleop` | **Pauses.** servoStop, a bell, and the status says why and what to do. While the cause lasts the status follows it; once it clears, a fresh deadman press (or `r`) restarts the control script if the stop ended it, takes the arm's actual pose as the new command and tares the force reading again (as a new session would). The e-stop key, done and an unplugged controller still end the session. |
+| `teleop` | **Pauses.** servoStop, a bell, and the status says why and what to do. While the cause lasts the status follows it, and the log records each change (another stop mode, silent data, the stop cleared). Nothing is sent to the robot meanwhile; silent data only reconnects the link. Once the stop clears, a fresh deadman press (or `r`) restarts the control script if the stop ended it, takes the arm's actual pose as the new command; force readings carry on as they are, untared. The e-stop key, done and an unplugged controller still end the session. |
 | `demo` | Ends that demo as `safety` (saved, not offered for labelling), waits for the robot, then goes on to the next. |
 | `run` | Ends that episode as `safety`, waits for the robot, then goes on to the next. |
 | any, at connect | Waits for the robot, printing what the pendant must show, instead of failing. |
 
-"Waits for the robot" polls the state every 0.2 s until it is ready, says each new reason once,
-and uploads the control script again; Ctrl-C gives up.
+"Waits for the robot" polls the state every 0.2 s until it is ready and logs each new reason
+once. Silent data only reconnects the link. Once the robot is ready it uploads the control script
+again; Ctrl-C gives up.
 
 ## Gamepad and teleop
 
 `teleop/gamepad.py` reads the controller and maps it; `control/teleop.py` turns it into arm motion.
-Configured under `teleop:`. Using it, the controls and the legend:
+Configured under `teleop:`. The session (`TeleopSession`) owns the loop: the safety checks,
+pauses, servoJ and recording. An input object decides each tick's target: `GamepadInput` here,
+or a leader arm's `LeaderInput` ([Leader arm](#leader-arm)). Using it, the controls and the legend:
 [procedures.md](procedures.md#4-teleoperation-and-demonstrations).
 
 - **Reading.** The Linux joystick device (`/dev/input/js*`), with no extra library. A thread reads
@@ -534,7 +646,11 @@ Configured under `teleop:`. Using it, the controls and the legend:
   −1…1: stick axes, triggers or buttons, each with an optional sign (the syntax is in
   [procedures.md](procedures.md#44-teleop-settings)). Stick axes get a deadzone, and the sum a
   response curve (|x|^`curve`), finer near the centre. Buttons have roles: deadman, slow, frame
-  toggle and done; the gripper has its own terms.
+  toggle, done and alt; the gripper has its own terms.
+- **Alt.** While the alt button is held, the robot axes listed in `alt_axes` take those terms
+  instead, so one stick can drive yaw or roll. Pressing or releasing it resets the twist, the
+  same as the frame toggle, so the arm starts from rest under the new mapping, and logs an `alt`
+  event.
 - **Legend.** `GamepadMapping.legend()` writes it from the mapping, so it follows any remapping.
 - **Jogging, every 8 ms:**
   1. The deadman gates motion; releasing it stops the arm at once.
@@ -549,17 +665,112 @@ Configured under `teleop:`. Using it, the controls and the legend:
      taken, a `blocked` event is logged and the status says why: the arm stops at the wall and can
      be driven back out.
   6. servoJ streams the target, with the same call, rate, lookahead and gain as policy runs.
-- **Gripper.** While A or B is held, the gripper target ramps at `gripper_speed`.
+- **Gripper.** `ramp` (the default): while A or B is held, the gripper target ramps at
+  `gripper_speed`. `snap`: A sets it to 1 (closed), B to 0, so demonstrations record clean 0/1
+  gripper actions.
 - **Pauses.** With `pause_on_stop` (the `teleop` command) a robot stop, the force limit or a
   gripper fault pauses the session rather than ending it
   ([When the robot stops anyway](#when-the-robot-stops-anyway)). `demo` records, so it ends the
   demo instead.
-- **Display.** The session publishes its latest robot state and a status (paused or blocked, and
-  why). `teleop` draws its live pose line from them, tagged PAUSED, BLOCKED, REDUCED mode or
-  "robot slowing to N %", and rings the bell on a pause. With `--view` the window shows the
-  status, the legend and the pose.
+- **Display.** The session publishes its latest robot state, the joint target it sent and a
+  status (paused or blocked, and why). `teleop` draws its live pose line from them, tagged PAUSED,
+  BLOCKED, REDUCED mode or "robot slowing to N %", and rings the bell on a pause.
+- **Window columns** (`--view`, `panels.py`), five times a second:
+  1. the status and the legend;
+  2. the gripper (`reading()`: how closed, whether it holds an object, the force setting and the
+     motor current); the arm: the TCP force (the CB3's estimate, as the force limit sees it; only
+     without an F/T sensor), the TCP speed (from the joint speeds and the Jacobian), the
+     fastest joint, the tracking error, and the robot's mode and speed scaling; and with an F/T
+     sensor, its block: samples per second, dropped samples and when this program last zeroed it
+     (`FTSensor.info()`, which unlike `fault()` consumes nothing), |F| and |T| against
+     `ft_limit_n` and `ft_limit_nm`, and each axis from the calibration-pose zero, as the limits
+     and a policy see it, with a warning when the sensor hasn't been zeroed since it powered up;
+  3. the workspace box (where the TCP point is on each axis), every joint's range, and the F/T
+     sensor's range: each axis of the load on it (its reading plus the zero it subtracts, from
+     its `setbias`) within ± its calibration's rated range (`cfgmr`). Past an end the sensor
+     reports out of range, a fault.
+
+  Each value with a limit gets a bar: a filled bar for a one-sided limit, as a fraction of it,
+  and a marker on a track for a range, with the distance to the nearer end. A line turns yellow
+  at 80 % of a one-sided limit or within 10 % of the range from an end, and red at or past it.
+  The bars use only characters as wide as a letter in X's core fonts, which may be all Tk has,
+  so the columns stay aligned.
 - **Demonstrations.** `demo` runs the same session with a recorder: every tick logs the measured
   state and the commanded target, which becomes the demonstration's action.
+
+## Leader arm
+
+A GELLO leader arm (`leader:`), whose joints the arm follows: `teleop/leader.py` reads it,
+`control/leader.py` follows it, inside the same `TeleopSession` as the gamepad. Using it:
+[procedures.md](procedures.md#45-leader-arm).
+
+- **Hardware layer: GELLO's own.** `third_party/gello_software` is a git submodule: GELLO on a
+  branch of the fork rexorth/gello_software, `as5600-encoders`, that reads AS5600 magnetic
+  encoders instead of Dynamixels. Installed editable by the `leader` extra:
+  - `firmware/as5600_leader`, on a XIAO ESP32C3: it reads every multiplexer channel about 1000
+    times a second, counts whole turns from the change between reads, and streams a frame 200
+    times a second over USB serial. Each frame has every channel's position (4096 counts a
+    turn), which channels read with their magnet detected, the ESP32's buttons, and a checksum;
+    a status line once a second gives each magnet's state.
+  - `gello.encoder.EncoderDriver` reads that stream on a thread. Standing in for
+    `DynamixelDriver`, `get_joints()` raises once a joint has had no good reading for `stale_s`.
+  - GELLO's `DynamixelRobot` takes the driver and applies the offsets, signs and trigger range,
+    as it does for Dynamixels. `EncoderRobotConfig` describes such an arm.
+
+  `LeaderArm.read()` never blocks or raises: it returns the joints (the UR's convention), the
+  trigger (0..1), the buttons, or the fault; `lost` when the ESP32 is gone.
+- **Whole turns.** An encoder knows its angle at power-up only within a turn, then counts turns.
+  So at each take-over every joint is read on the turn nearest the arm's, and the encoders'
+  own counting keeps it while following. A reset ESP32 shows up as the leader jumping a turn
+  ahead, which lets go.
+- **Following, every 8 ms** (`LeaderInput.step`):
+  1. Not following: if every joint is within `engage_deg` of the command (with the deadman
+     held), take over (`engage` event); otherwise hold and say which joint is how far off.
+  2. Following: if a joint is more than `disengage_deg` from the command, let go (`let_go`
+     event) and hold.
+  3. Step toward the leader, each joint at most at the speed limit: `catch_up_deg_s` at take-over,
+     rising to `max_joint_speed_deg_s` over the time the catch-up speed takes to cross
+     `engage_deg`; never above 95 % of `safety.max_step_rad`.
+  4. If the step would move the TCP faster than 90 % of `safety.max_tcp_speed_m_s`, shrink it.
+  5. The session checks it like any target (`check_command`). A refused step isn't taken and
+     the input stays engaged: the arm holds at the limit and follows again when the leader comes
+     back, or lets go if it gets too far ahead.
+- **Deadman and buttons.** A held key by default (`deadman: keyboard`, space), or the
+  gamepad's deadman, a button wired to the ESP32 (`deadman: button`), or none. Releasing it
+  lets go; a fresh press resumes a pause, as with the gamepad. The key is `keys.HeldKey`: a
+  terminal can't tell a held key (it gets auto-repeats after a 500 ms delay and never a release),
+  so a thread asks the X server which keys are down (`XQueryKeymap`, through libX11 with ctypes)
+  every 5 ms. That works wherever the focus is and needs no permissions; if polling stalls for
+  0.1 s the key counts as released. Space then leaves the e-stop keys. The gamepad, if plugged
+  in, still gives its done button and, without a trigger, the gripper.
+- **Gripper.** The calibrated trigger while following, else the gamepad's gripper terms.
+- **Flange demo** (`ur5vla flange-demo`): `SingleJointSource` puts one encoder on wrist 3 at a
+  ratio. It pairs the joint with the encoder's angle at each take-over, so it is relative and
+  takes over at once; the rest of the follower is the same.
+- **Display.** `panels.leader_lines`: following or not, and each joint's gap against the limit
+  that applies (take over under `engage_deg`, let go over `disengage_deg`), and the encoders'
+  warnings.
+
+## Workspace box
+
+`workspace.py`, and `ur5vla workspace` in `cli.py`: the box the safety layer checks, taught by
+hand. Using it: [procedures.md](procedures.md#36-workspace-box-taught-by-hand).
+
+- **What the box is.** Two opposite corners, `workspace_min_m` and `workspace_max_m`, of an
+  axis-aligned box in the UR base frame (the pendant's Base feature). Teleop's jog frame doesn't
+  enter into it. Each target is checked by the TCP point it would put the tool at: the flange from
+  forward kinematics, plus `tcp_offset_m` in the flange frame.
+- **Teaching.** The arm is put in freedrive, and each Enter records the joint angles. The TCP
+  point comes from the same kinematics and offset as the check, so the box and the check agree.
+- **The box** is the bounding box of the points, grown by `--margin` and rounded outward to the
+  millimetre. One under 1 mm along an axis is refused, since the config needs min < max.
+- **Any tool.** The box is a region of space; the tool comes in through `tcp_offset_m`. The points
+  file keeps the joint angles, so `--points` recomputes the box for another offset. It also keeps
+  the robot's own TCP pose, to compare with the pendant.
+- **Writing.** `--write` replaces the two lines in the cell file in place, keeping comments;
+  otherwise they're printed to paste.
+- **A robot stop in freedrive** ends ur_rtde's script, and freedrive with it. Points are refused
+  until the stop is cleared; then the script is uploaded again and freedrive restarts.
 
 ## Operator keys
 
@@ -571,6 +782,8 @@ Configured under `teleop:`. Using it, the controls and the legend:
 - **No terminal, no keys.** If stdin isn't a terminal, the keys are off (with a warning); Ctrl-C
   still stops.
 - **With `--view`**, the camera window forwards the same keys ([Live camera window](#live-camera-window)).
+- **Held keys.** `HeldKey` reads a key's up/down state from the X server, for the leader arm's
+  deadman ([Leader arm](#leader-arm)). It needs the desktop's X11 session (`DISPLAY`).
 
 ## Recording
 
@@ -579,20 +792,23 @@ Configured under `teleop:`. Using it, the controls and the legend:
 
 | File | Contents |
 |---|---|
-| `meta.json` | Kind (`demo` or `rollout`), prompt, the config as loaded, policy info, git commit, clock anchor, outcome (label, result, interventions, note) and counts |
-| `ticks.npz` | Every execution tick: `t`, `q`, `qd`, `tcp_pose`, `wrench`, `gripper`, `q_cmd`, `g_cmd`, `mode`, `loop_dt` |
+| `meta.json` | Kind (`demo` or `rollout`), prompt, the config as loaded, policy info, the cameras' image settings, git commit, clock anchor, outcome (label, result, interventions, note) and counts |
+| `ticks.npz` | Every execution tick: `t`, `q`, `qd`, `tcp_pose`, `wrench`, `gripper`, `q_cmd`, `g_cmd`, `mode`, `loop_dt`, `ft` (the F/T sensor, raw; NaN without one) |
 | `chunks.jsonl` | Every chunk: observation time, latency, targets, merge result, and the frames it saw |
 | `events.jsonl` | Holds, resumes, stale and fresh cameras, policy errors, timing warnings, safety stops, the end; in teleop also the deadman, frame changes and blocked steps |
-| `cameras/<name>/` | Native-resolution frames (JPEG by default), depth as millimetre PNGs, and `index.csv` (sequence number, capture time, file paths) |
+| `cameras/<name>/` | Native-resolution frames (JPEG by default), depth as millimetre PNGs, and `index.csv` (sequence number, capture time, file paths, and the frame's focus, exposure, ISO or gain and white balance where the camera reports them) |
 
 - **Never blocks the loop.** A tick is one list append; chunks and events are single JSON lines.
-  Frames are picked up from each camera's latest slot by a poll thread and encoded by two writer
-  threads through a queue. If the disk falls behind, frames are dropped from the recording and
-  counted (`frames_dropped_by_recorder`), never queued against the loop.
+  Frames are picked up from each camera's latest slot by a poll thread and encoded by writer
+  threads (one per camera, at least two) through a queue. If the disk or CPU falls behind, frames
+  are dropped from the recording and counted (`frames_dropped_by_recorder`), never queued against
+  the loop; `run` and `demo` warn after an episode that dropped any.
 - **Ticks without a command** (holds, before the first chunk) store NaN in `q_cmd` and `g_cmd`.
 - **Absolute time.** All times are host monotonic seconds; `meta.json` stores one (monotonic,
   wall-clock) pair to place them.
 - **Reproducible.** The git commit is stored, with `-dirty` if the tree had uncommitted changes.
+- **Next to the episodes**, the run directory holds the run's `session.log`
+  ([Command line](#command-line)).
 - **Read back** by the `replay` camera and the `replay` policy, and by `to-lerobot`.
 
 ## Dataset conversion
@@ -610,6 +826,29 @@ fine-tuning either stack. The command and its options:
   - `observation.images.<camera>`: the latest frame captured at or before it, at native
     resolution;
   - `task`: the episode's prompt.
+- **Idle trimmed.** A frame is idle when, since the frame before, no joint target moved by
+  1e-4 rad, the gripper command by 1e-3 and the measured gripper by 0.005 (the 2F-85 reports
+  1/255 steps). Idle frames before the first and after the last motion are dropped, keeping 0.3 s
+  of rest at each end; an episode where nothing moved is skipped. `--squeeze-pauses S` keeps at
+  most S s of each idle stretch in between. Teleop sends a target every tick, deadman or not, so
+  without trimming every demo would start and end with the operator getting ready, and a policy
+  trained on a still arm learns to stand still.
+- **Reports.** Per episode: frames kept and trimmed, the `disable` (deadman released) and
+  `blocked` events from `events.jsonl`, and the grasps: where the gripper command crosses 0.5, at
+  the pendant's TCP (`tcp_pose`). The grasps and releases go to `<root>/coverage.csv`, and a 3×3
+  grid of grasp counts over their bounding box is printed. After writing, it reads
+  `meta/stats.json` back, prints q01/q99 per dimension, and warns when a range is below 1e-3.
+- **Camera sets** (`--camera-set SET=CAM,…`, repeatable): one dataset per set, at `<root>/<SET>`
+  as `<repo-id>_<SET>`, from the same episodes, frames and trimming, to compare camera placements
+  ([procedures.md](procedures.md#74-comparing-camera-sets)). Every camera named must exist in every
+  episode, and no output directory may exist yet; both are checked before anything is written.
+  Cameras keep the order listed, which is the order the policy gets them in. The coverage grid and
+  the statistics are printed once, since every set has the same frames.
+- **F/T in the state** (`--ft`): the sensor's 6 readings as recorded, from its zero at the
+  calibration pose, appended to `observation.state` as `ft.fx` … `ft.tz`. The action keeps its 7.
+  An episode recorded without that zero (no `ft_tare` in its `meta.json`) is refused. Policy files
+  then set `include_ft_state: true`, so the LeRobot adapter sends the same layout: the reading
+  the loop puts in each observation, after `run` has zeroed the sensor at the same pose.
 - **Names match inference.** `observation.state` and `action` are `shoulder_pan.pos`,
   `shoulder_lift.pos`, `elbow.pos`, `wrist_1.pos`, `wrist_2.pos`, `wrist_3.pos` and `gripper.pos`
   (the six joints only with `--no-gripper`). These are the names the LeRobot adapter sends, so a
@@ -636,16 +875,29 @@ and its flow around episodes are in [procedures.md](procedures.md).
 | `policy-check` | cameras, arm and gripper read-only, policy | No |
 | `run [--view]` | everything: control loop, policy, recorder | Yes |
 | `gamepad` | controller only | No |
-| `teleop [--view]` | arm, gripper, controller; cameras with `--view` | Yes, nothing recorded |
+| `teleop [--view]` | arm, gripper, controller; cameras with `--view` | Yes, only the session log recorded |
+| `prepare` | arm, gripper, F/T sensor | Yes: to the calibration pose, where the sensor is zeroed |
+| `workspace` | arm (freedrive), or a saved points file | Only by hand |
 | `demo [--view]` | arm, gripper, controller, cameras, recorder | Yes, recorded |
 | `to-lerobot` | recordings | No |
 
 - **Connecting.** `run`, `teleop` and `demo` connect the arm through `_connect_arm`: it waits for
   a stopped robot ([When the robot stops anyway](#when-the-robot-stops-anyway)), then checks the
   pendant's settings against ours ([Our limits and the robot's](#our-limits-and-the-robots)).
-- **Start pose.** Before `moveJ` to `start_q_deg`, the pose is checked against our joint limits
-  and box, then against the robot's own limits; a refused pose or a failed move ends the run with
-  the reason, without a traceback.
+- **Start pose.** `start_q_deg`, or with `--start NAME` on `run` and `demo`,
+  `robot.start_poses[NAME]`, which `_load` puts in `start_q_deg`. Before `moveJ` there, the pose is
+  checked against our joint limits and box, then against the robot's own limits, then the path
+  from where the arm is (`check_path`); a refused pose or a failed move ends the run with the
+  reason, without a traceback. Each episode's `meta.json`
+  records the pose used (`start`), since the saved config is the file's.
 - **Ctrl-C** at a prompt or while waiting for the robot exits with code 130, without a traceback.
+- **Session log.** `run`, `teleop` and `demo` copy everything written to stderr into
+  `session.log` in their run directory (teleop has one only for this:
+  `runs/<YYYYmmdd-HHMMSS>_teleop/`). That covers our log lines and what native code prints there,
+  such as ur_rtde's `RTDEControlInterface: …` messages, which bypass Python's logging.
+  `sessionlog.py` points file descriptor 2 at a pipe, and a thread copies it to the terminal and
+  to the file. Lines without a timestamp of their own get one, tagged `- stderr:`. An exception
+  that ends the command goes in too. stdout is untouched, so the live pose line and the prompts
+  aren't in it. If writing the file fails, the terminal still gets everything.
 - **Shutdown order.** Backend, gripper and arm are closed first, then the window and the cameras,
   so nothing slow can delay stopping the arm.

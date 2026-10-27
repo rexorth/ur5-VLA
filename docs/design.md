@@ -156,11 +156,20 @@ safety:
 
 **Open questions**
 
-- Does the F/T reading go into the policy state, and if so for both backends? It must match between training and inference.
+- Does the F/T reading go into the policy state, and if so for both backends? It must match between training and inference. For now: the ATI Axia80's reading is always recorded, from the one zero it gets at its calibration pose before every demo and policy episode (`ur5vla prepare`; nothing tares it at an episode's start); `to-lerobot --ft` and the LeRobot adapter's `include_ft_state` add it to the state. The openpi adapter doesn't send it yet. Gravity compensation of the gripper's weight, by orientation, is not done yet.
 - Which camera takes which role? OAK vs RealSense on the wrist affects cable routing, weight and field of view.
-- Joint-space or Cartesian actions? Joint-space avoids IK issues on a 6-DOF arm; Cartesian transfers better across robots.
+- Joint-space or Cartesian actions? Joint-space avoids IK issues on a 6-DOF arm; Cartesian transfers better across robots. For now, demos record absolute joint targets (the TCP pose is logged too); training on absolute joints or on offsets from the current state is chosen at training time ([procedures.md](procedures.md#72-lerobot)).
 - Which MCU boards, and can their firmware enumerate as UVC?
 - Gripper model and interface on the CB3.
+
+**Later**
+
+- Alternating prompts in one `demo` session, each with its own start pose (`--prompts "put the
+  block in the bin" "take the block out of the bin"`), so two tasks that reset each other's scene
+  are recorded turn about.
+- Gravity compensation for the F/T sensor: identify the mass and centre of mass below it from
+  10–15 still poses, and subtract their weight by the wrist's orientation, the same in recording
+  and at run time.
 
 **Milestones**
 

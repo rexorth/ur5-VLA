@@ -156,6 +156,23 @@ def test_connect_activates_then_the_position_follows_commands(fake):
         g.close()
 
 
+def test_activate_restores_a_gripper_that_lost_its_activation(fake):
+    g = robotiq(fake)
+    g.connect()
+    try:
+        n = len(fake.writes())
+        g.activate()                                            # active already: nothing sent
+        assert len(fake.writes()) == n
+        fake.act = 0                                            # say its power dropped
+        wait_for(lambda: g.fault() == 'the gripper is no longer activated')
+        g.activate()
+        assert g.status.activated and g.fault() is None and len(fake.writes()) > n
+        g.command(1.0)
+        wait_for(lambda: g.position() > 0.9)                    # and its I/O thread runs again
+    finally:
+        g.close()
+
+
 def test_read_only_never_writes(fake):
     g = robotiq(fake)
     g.connect(read_only=True)
@@ -237,3 +254,16 @@ def test_a_gripper_fault_ends_teleop(tmp_path):
     s = TeleopSession(cfg, SimArm(cfg.robot), FaultyGripper(after_s=0.3), ScriptedPad(lambda t: pad()))
     result = s.run_episode(None, 5.0)
     assert result.end_reason == 'safety' and result.detail['violation'] == 'gripper'
+
+
+def test_reading_reports_what_the_2f85_does_and_the_force_setting(fake):
+    g = robotiq(fake, force=0.5)
+    g.connect()
+    try:
+        g.command(0.5)
+        wait_for(lambda: g.reading().motion == 'at target' and abs(g.position() - 0.5) < 0.01)
+        r = g.reading()
+        assert r.requested == 128 / 255 and r.activated and r.object_detected is False
+        assert r.current_ma == 120 and round(r.force_limit_n) == 128 and r.fault is None
+    finally:
+        g.close()

@@ -7,7 +7,11 @@ robot:
   ip: 192.168.10.125          # CB3 UR5. No External Control URCap program may be running.
   rate_hz: 125                # CB3 RTDE maximum
   servoj: {lookahead: 0.1, gain: 300}
-  start_q_deg: null           # teach and set before A/B runs: every trial starts here
+  start_q_deg: [-7.19, -5.27, -132.37, -52.44, 82.45, 0.3]         # teach and set before A/B runs: every trial starts here
+  # Named start poses, say one per task: `ur5vla demo ... --start printer` (and run) starts each
+  # episode there instead of start_q_deg. Teleop prints the joints to paste when it ends, e.g.
+  #   printer: [0.0, -90.0, 90.0, -90.0, -90.0, 0.0]
+  start_poses: {pick_table: [-69.13, -60.09, -91.17, -92.88, 111.39, -18.65]}
   move_speed_deg_s: 20
   move_accel_deg_s2: 40
 
@@ -22,8 +26,31 @@ robot:
 # frames are `width` tall. Fix it before recording demos: a model expects the view it was
 # trained on.
 cameras:
-  base:  {type: oak, device_id: "14442C10F10E3BD400", width: 640, height: 480, fps: 30, rotate: 90}  # OAK-D, on its side
-  wrist: {type: realsense, serial: "234422064578", width: 640, height: 480, fps: 30}      # D415
+  # Image settings (docs/procedures.md#image-settings). Focus is fixed, autofocus never runs: the
+  # OAK's 107 was measured with `ur5vla cameras --measure` on 2026-10-23. Exposure and white balance
+  # follow the light, which the skylight changes through the day; every recorded frame keeps the
+  # values it was taken with. Exposure steps with the 50 Hz mains so the lights don't flicker, and
+  # the OAK's stays under 20 ms to limit motion blur (the D415's can't be capped below 33 ms).
+  base:  {type: oak, device_id: "14442C10F10E3BD400", width: 640, height: 480, fps: 30,       # OAK-D
+          focus: 107, max_exposure_us: 20000, mains_hz: 50}
+  wrist: {type: realsense, serial: "234422064578", width: 640, height: 480, fps: 30,         # D415, fixed focus
+          mains_hz: 50}
+  # More scene cameras, to compare placements (docs/procedures.md#74-comparing-camera-sets). Every
+  # camera here is recorded; a policy uses the ones in its camera_map. USB webcams go by their
+  # stable path (ls /dev/v4l/by-id/), never /dev/videoN.
+  # Two webcams in identical bodies, told apart by what they report over USB. Always use the
+  # video-index0 path: index1 is a metadata node with no images.
+  # printer: the printer's front, at table height. Reports itself as "NexiGo N60 FHD Webcam" with
+  # serial 2021030103. Fixed focus; exposure and white balance automatic. Under 50 Hz anti-flicker
+  # it runs at 25 fps (and at 60 Hz it sends no frames at all).
+  printer: {type: uvc, device: /dev/v4l/by-id/usb-2M_UVC_CAMERA_NexiGo_N60_FHD_Webcam_2021030103-video-index0,
+            width: 640, height: 480, fps: 25, mains_hz: 50}
+  # base2: high, looking down over the arm at the table and the printer. Its firmware reports the
+  # generic Linux "USB Webcam gadget" (no serial number, so a second such camera would share this
+  # path: use by-path then). Automatic exposure only, with no focus or white-balance control.
+  base2: {type: uvc, device: /dev/v4l/by-id/usb-Linux_Foundation_USB_Webcam_gadget-video-index0,
+          width: 640, height: 480, fps: 30, mains_hz: 50}
+
 
 control:
   refill_fraction: 0.5        # ask for a chunk when half the last one is left
@@ -37,7 +64,10 @@ safety:
   max_step_rad: 0.02          # per 8 ms tick, any joint: 0.02 rad = 143 deg/s
   max_tcp_speed_m_s: 0.5      # at tcp_offset_m; null = off
   max_tracking_error_deg: 15  # target vs. where the arm is: larger = the robot is slowing itself
-  ft_limit_n: 30              # CB3: on the controller's joint-current wrench ESTIMATE, tared per episode
+  # On |F| and |T|, tared per episode: the F/T sensor when ft_sensor is set, else the CB3's
+  # joint-current ESTIMATE (noisy: hence 90 N). With the sensor, tighten to ~30-40 N.
+  ft_limit_n: 90
+  ft_limit_nm: 4           # N·m; set once the sensor is mounted (the estimate's torque is poor)
   # Watchdog: hold if the next chunk is overdue. After each chunk the next is expected
   # ~(1 - refill_fraction) * chunk duration later (or after one latency, if the server is slower
   # than that); the watchdog allows watchdog_factor times that.
@@ -51,16 +81,21 @@ safety:
   joint_max_deg: [360, 360, 360, 360, 360, 360]
   workspace_min_m: [-0.9, -0.9, -0.05]   # UR base frame, as the pendant shows it
   workspace_max_m: [0.9, 0.9, 1.0]
-  tcp_offset_m: [0, 0, 0]               # flange -> fingertip once a gripper is mounted
+  tcp_offset_m: [0, 0, 0.2147]               # flange -> fingertip: F/T sensor and couplers 72.4 mm + gripper 142.3 mm
 
 # Gamepad teleoperation (`ur5vla teleop`, `ur5vla demo`). Numbers below are an Xbox One pad over
 # USB (xpad driver); run `ur5vla gamepad -c configs/cell.yaml` to see yours live. Each robot axis
 # is a sum of terms, clipped to [-1, 1]: {axis: i}, {axis: i, trigger: true} (0..1), {button: i},
 # each with an optional sign: -1. Listing a robot axis replaces its default; leave one out = unused.
+# While buttons.alt is held, alt_axes replaces the robot axes it names ([] = off).
+# This block is 6-DoF: the right stick and triggers translate, the left stick rotates, and holding
+# X turns the left stick's left/right from yaw into roll. (X shares the right thumb with the right
+# stick, so it only changes the left stick.) For top-down demos, -t configs/teleop/4dof.yaml
+# locks pitch and yaw unless X is held.
 teleop:
   device: null                # /dev/input/jsN; null = the first joystick found
-  frame: base                 # starting frame (base | tool); the toggle_frame button flips it
-  max_linear_m_s: 0.05        # at full deflection; deliberately slow for bring-up
+  frame: tool                 # starting frame (base | tool); the toggle_frame button flips it
+  max_linear_m_s: 0.1        # at full deflection; deliberately slow for bring-up
   max_angular_deg_s: 15
   linear_accel_m_s2: 0.5
   angular_accel_deg_s2: 90
@@ -69,14 +104,17 @@ teleop:
   deadzone: 0.12
   curve: 1.5                  # stick response |x|^curve: finer near the center
   axes:
-    x:  [{axis: 1, sign: -1}]                                         # left stick up/down
-    y:  [{axis: 0, sign: -1}]                                         # left stick left/right
-    z:  [{axis: 5, trigger: true}, {axis: 2, trigger: true, sign: -1}]  # RT up, LT down
-    rx: [{axis: 4, sign: -1}]                                         # right stick up/down
-    ry: [{axis: 3, sign: -1}]                                         # right stick left/right
-    rz: [{axis: 6, sign: -1}]                                         # d-pad left/right
+    x:  [{axis: 3, sign: 1}]                                         # right stick left/right
+    y:  [{axis: 4, sign: 1}]                                         # right stick up/down
+    z:  [{axis: 5, trigger: true}, {axis: 2, trigger: true, sign: -1}]  # RT forward, LT back
+    rx: [{axis: 1, sign: 1}]                                         # left stick up/down: pitch
+    ry: [{axis: 0, sign: 1}]                                         # left stick left/right: yaw
+  alt_axes:                                                          # while X is held:
+    ry: []
+    rz: [{axis: 0, sign: 1}]                                         # left stick left/right: roll
   gripper: [{button: 0}, {button: 1, sign: -1}]                       # A close, B open
-  buttons: {deadman: 4, slow: 5, toggle_frame: 6, done: 7}            # LB (hold), RB, View, Menu
+  gripper_mode: snap                                                 # A closes fully, B opens fully
+  buttons: {deadman: 4, slow: 5, toggle_frame: 6, done: 7, alt: 2}    # LB (hold), RB, View, Menu, X (hold)
 
 # Robotiq 2F-85 on its USB/RS-485 adapter (Modbus RTU), driven every tick like the arm: teleop's
 # A/B and the policy's gripper action both arrive as 0 open .. 1 closed. `ur5vla gripper` tests it.
@@ -87,6 +125,41 @@ gripper:
   speed: 1.0                  # 0..1 = 20..150 mm/s
   force: 0.5                  # 0..1 = 20..235 N
   timeout_s: 0.5              # no status for this long ends the episode
+
+# ATI Axia80 force/torque sensor between the flange and the gripper: Ethernet (UDP streaming), 24 V.
+# Set it up (rate, filter, range, IP) with ~/abhay_ws/Axia80Monitor, then close that program: the
+# sensor streams to one client at a time. Mounting it moves the gripper out from the flange: update
+# safety.tcp_offset_m and the pendant's payload (mass, centre of gravity) first.
+ft_sensor:
+  type: axia80                # none | axia80. Calibration SI-150-8 (cfgcalsel 0): 111 N Fx/Fy, 493 N Fz, 5/5/8 N·m
+  host: 192.168.10.133        # Axia80Monitor's config.yaml has the address
+  # The calibration pose, joint degrees: before each demo (and `ur5vla prepare`) the arm moves here
+  # and the sensor is zeroed, so it must be still and touching nothing, with the gripper empty.
+  # Drive it there with `ur5vla teleop`, which prints the line to paste when it ends.
+  tare_q_deg: [-90.00, -90.00, -90.00, -90.00, 90.00, 0.00]
+
+# GELLO leader arm (`ur5vla teleop --leader`, `demo --leader`): the arm follows its joints. The UR5
+# GELLO's dimensions, with AS5600 magnetic encoders on a TCA9548A multiplexer, read by a XIAO
+# ESP32C3 (third_party/gello_software, firmware/as5600_leader). docs/procedures.md#45-leader-arm.
+# `ur5vla leader -c configs/cell.yaml` shows it live; --calibrate (--write) sets the offsets.
+leader:
+  type: gello_as5600
+  port: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_B0:A6:04:00:EC:C8-if00
+  channels: [0, 1, 2, 3, 4, 5]          # multiplexer channel of each joint, base to wrist 3
+  joint_signs: [1, 1, -1, 1, 1, 1]      # GELLO's for a UR; check each with `ur5vla leader --arm`
+  joint_offsets_deg: null               # from --calibrate, with the leader in calibration_q_deg
+  calibration_q_deg: [0, -90, 90, -90, -90, 0]   # GELLO's UR calibration pose
+  gripper_channel: 6                    # the trigger's encoder (null: the gamepad's A/B)
+  gripper_open_deg: null                # from --calibrate
+  gripper_closed_deg: null
+  # Held to move: keyboard (deadman_key, read from the desktop wherever the focus is; a USB foot
+  # switch that types it works too) | gamepad (teleop.buttons.deadman, LB) | button (ESP32 D1) | none
+  deadman: keyboard
+  deadman_key: space
+  engage_deg: 10                        # the arm takes over once every joint is within this of it
+  disengage_deg: 30                     # and lets go if the leader gets this far ahead
+  max_joint_speed_deg_s: 90
+  catch_up_deg_s: 20
 
 logging:
   root: runs

@@ -1,6 +1,7 @@
 """Robot-side stops on the simulated arm: teleop pauses and resumes, demos and policy runs end the
 episode cleanly, and the CLI waits for the robot instead of crashing."""
 
+import logging
 import sys
 import threading
 import time
@@ -85,6 +86,41 @@ def test_resume_key_works_without_the_deadman(tmp_path):
     assert seen['after'] is False and result.pauses == 1
 
 
+class QuietArm(SimArm):
+    """Its data can go silent: the controller's timestamp stops advancing while `quiet`."""
+    quiet = False
+    _t_robot = 0.0
+
+    def read_state(self):
+        s = super().read_state()
+        if not self.quiet:
+            self._t_robot = s.t
+        s.t_robot = self._t_robot
+        return s
+
+
+def test_a_silent_link_during_a_stop_reconnects_uploads_nothing_and_logs_each_change(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    cfg = _cfg()
+    arm = QuietArm(cfg.robot)
+    result, seen, _ = _teleop(
+        tmp_path, cfg, arm, lambda t: pad(), 1.0,
+        [(0.1, 'stop', lambda s: arm.simulate_stop(3)),
+         (0.3, 'quiet', lambda s: setattr(arm, 'quiet', True)),
+         (0.6, 'status', lambda s: s.status),
+         (0.6, 'back', lambda s: setattr(arm, 'quiet', False)),
+         (0.8, 'clear', lambda s: setattr(arm, 'safety_mode', 1))])
+    assert 'No new data from the robot' in seen['status']
+    assert arm.n_reconnect >= 1 and arm.n_recover == 0      # reconnected; no script for a stopped robot
+    said = [r.getMessage() for r in caplog.records if r.name == 'ur5vla.control.teleop']
+    text = '\n'.join(said)
+    order = [text.index(s) for s in ('teleop paused: Protective stop', 'still paused: No new data',
+                                     'still paused: Protective stop', 'the stop is cleared')]
+    assert order == sorted(order)
+    assert sum('still paused' in m for m in said) == 2      # each change once, not every tick
+    assert result.end_reason == 'timeout' and result.pauses == 1
+
+
 def test_estop_mode_while_paused_waits_for_power_and_brakes(tmp_path):
     cfg = _cfg()
     arm = SimArm(cfg.robot)
@@ -132,17 +168,27 @@ class PushedArm(SimArm):
         return s
 
 
-def test_force_trip_pauses_and_resuming_tares_again(tmp_path):
+def test_force_trip_pauses_and_resumes_once_the_push_is_gone(tmp_path):
     cfg = _cfg(safety={'ft_limit_n': 30})
     arm = PushedArm(cfg.robot)
     result, seen, _ = _teleop(
         tmp_path, cfg, arm, _lb_released_between(0.3, 0.6), 1.0,
         [(0.2, 'push', lambda s: setattr(arm, 'wrench', np.array([0, 0, 50.0, 0, 0, 0]))),
          (0.4, 'status', lambda s: s.status),
+         (0.5, 'release', lambda s: setattr(arm, 'wrench', np.zeros(6))),
          (0.9, 'after', lambda s: s.paused)])
     assert 'Force 50 N' in seen['status'] and 'Cleared' in seen['status']
-    assert seen['after'] is False                           # resumed, and 50 N is the new zero
-    assert result.pauses == 1 and result.end_reason == 'timeout'
+    assert seen['after'] is False and result.pauses == 1 and result.end_reason == 'timeout'
+
+
+def test_resuming_while_still_pushed_pauses_again_since_nothing_is_tared(tmp_path):
+    cfg = _cfg(safety={'ft_limit_n': 30})
+    arm = PushedArm(cfg.robot)
+    result, seen, _ = _teleop(
+        tmp_path, cfg, arm, _lb_released_between(0.3, 0.6), 1.0,
+        [(0.2, 'push', lambda s: setattr(arm, 'wrench', np.array([0, 0, 50.0, 0, 0, 0]))),
+         (0.9, 'after', lambda s: s.paused)])
+    assert seen['after'] is True and result.pauses == 2         # 50 N is still 50 N, not a new zero
 
 
 def test_arm_falling_behind_blocks_the_step(tmp_path):
@@ -172,15 +218,31 @@ def test_refused_servoj_in_a_policy_run_is_not_an_error(tmp_path):
 
 # ---- CLI ----
 
-def test_connect_waits_for_a_stopped_robot_then_starts_the_script(capsys):
+def test_connect_waits_for_a_stopped_robot_then_starts_the_script(caplog):
+    caplog.set_level(logging.INFO)
     cfg = _cfg()
     arm = SimArm(cfg.robot)
     arm.simulate_stop(3)
     threading.Timer(0.3, lambda: setattr(arm, 'safety_mode', 1)).start()
     cli._connect_arm(cfg, arm)
-    out = capsys.readouterr().out
-    assert 'waiting for the robot: Protective stop' in out and 'robot ready' in out
+    assert 'waiting for the robot: Protective stop' in caplog.text and 'robot ready' in caplog.text
     assert arm.program_running
+
+
+def test_waiting_for_the_robot_reconnects_a_silent_link_without_uploading(caplog):
+    caplog.set_level(logging.INFO)
+    cfg = _cfg()
+    arm = QuietArm(cfg.robot)
+    arm.simulate_stop(3)
+    arm.quiet = True
+    seen = _at([(0.5, 'n_recover', lambda: arm.n_recover),
+                (0.5, 'back', lambda: setattr(arm, 'quiet', False)),
+                (0.7, 'clear', lambda: setattr(arm, 'safety_mode', 1))])
+    cli._wait_until_ready(cfg, arm)
+    assert arm.n_reconnect >= 1 and seen['n_recover'] == 0 and arm.program_running
+    waits = [r.getMessage() for r in caplog.records if r.getMessage().startswith('waiting for the robot')]
+    assert ['Protective stop' in w for w in waits] == [True, False, True] and 'No new data' in waits[1]
+    assert 'robot ready' in caplog.text
 
 
 def test_start_pose_outside_our_limits_is_refused_without_moving(capsys):
@@ -206,6 +268,7 @@ class FakeRobot:
     """What the controller would report and do, shared by the fake receive and control interfaces."""
     def __init__(self):
         self.safety_mode, self.robot_mode, self.script = 3, 7, False
+        self.c_connected = True
         self.calls = []
 
 
@@ -228,11 +291,15 @@ def _fake_rtde(monkeypatch, robot):
         def __init__(self, ip, hz):
             if robot.safety_mode not in (1, 2):
                 raise RuntimeError('RTDE control program is not running on controller')
+            robot.calls.append('c.open')
             robot.script = True
         getRobotStatus = Receive.getRobotStatus
-        isConnected = lambda self: True                                     # noqa: E731
+        isConnected = lambda self: robot.c_connected                        # noqa: E731
         isProgramRunning = lambda self: robot.script                        # noqa: E731
         servoJ = lambda self, *a: robot.script                              # noqa: E731
+
+        def reconnect(self):                # ur_rtde's: uploads the script, even to a stopped robot
+            robot.calls.append('c.reconnect')
 
         def reuploadScript(self):
             robot.calls.append('reupload')
@@ -269,3 +336,23 @@ def test_rtde_arm_waits_for_a_stopped_robot_and_reuploads_after_a_stop(monkeypat
     robot.script = False
     arm.close()                                                      # nothing to stop: no stopScript
     assert 'stopScript' not in robot.calls and 'c.disconnect' in robot.calls
+
+
+def test_rtde_arm_uploads_nothing_to_a_stopped_robot(monkeypatch):
+    robot = FakeRobot()
+    robot.safety_mode = 1
+    _fake_rtde(monkeypatch, robot)
+    arm = RTDEArm(config_mod.RobotConfig())
+    arm.connect()
+    robot.safety_mode, robot.script = 3, False                      # a protective stop ends the script
+    assert arm.recover() is False and 'reupload' not in robot.calls
+    robot.c_connected = False                                       # and the control link drops
+    arm.reconnect()
+    assert 'c.reconnect' not in robot.calls and 'c.disconnect' in robot.calls   # closed instead
+    assert not arm.read_state().program_running
+    t0 = time.monotonic()
+    arm.wait_period(arm.init_period())                              # ticks keep time without it
+    assert time.monotonic() - t0 >= 0.9 * arm.cfg.period_s
+    robot.safety_mode = 1                                           # cleared on the pendant
+    assert arm.recover() and robot.calls.count('c.open') == 2       # a new one, with its script
+    assert 'reupload' not in robot.calls

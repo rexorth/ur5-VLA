@@ -15,10 +15,25 @@ from __future__ import annotations
 import threading
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import numpy as np
 
 from ..config import GripperConfig
+
+
+@dataclass(frozen=True)
+class GripperReading:
+    """What a gripper reports, for display. None: this gripper doesn't report it."""
+    position: float                         # 0 open .. 1 closed, measured
+    requested: float | None = None          # the target it is going to, 0 .. 1
+    motion: str | None = None               # moving | contact while opening | contact while closing
+                                            # | at target | idle
+    object_detected: bool | None = None     # the fingers stopped on something before the target
+    current_ma: int | None = None           # motor current: rises with grip force, not a force reading
+    force_limit_n: float | None = None      # the grip force setting: the most it squeezes
+    activated: bool | None = None
+    fault: str | None = None
 
 
 class Gripper(ABC):
@@ -42,8 +57,16 @@ class Gripper(ABC):
         The control loop and teleop end the episode on it."""
         return None
 
+    def activate(self) -> None:
+        """Activate it if it isn't, or after a major fault (`ur5vla prepare`, before each demo).
+        Nothing for a gripper that needs no activation, or one connected read-only."""
+
     def status_text(self) -> str:
         return f'gripper {self.position():.2f}'
+
+    def reading(self) -> GripperReading | None:
+        """Everything it reports, for display; None if there is no gripper. Never blocks."""
+        return GripperReading(self.position(), fault=self.fault())
 
 
 class NoGripper(Gripper):
@@ -60,6 +83,9 @@ class NoGripper(Gripper):
 
     def command(self, g: float) -> None:
         pass
+
+    def reading(self) -> GripperReading | None:
+        return None
 
 
 class SimGripper(Gripper):
@@ -99,6 +125,14 @@ class SimGripper(Gripper):
 
     def status_text(self) -> str:
         return f'gripper {self.position():.2f} (simulated)'
+
+    def reading(self) -> GripperReading:
+        pos = self.position()
+        with self._lock:
+            target = self._target
+        return GripperReading(pos, requested=target,
+                              motion='moving' if abs(target - pos) > 1e-3 else 'at target',
+                              object_detected=False, activated=True)
 
 
 def make_gripper(cfg: GripperConfig, dry_run: bool) -> Gripper:

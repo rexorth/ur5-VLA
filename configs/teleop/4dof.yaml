@@ -1,0 +1,32 @@
+# Top-down gamepad teleop for pick-and-place demos: x y z and roll (turning the gripper about its
+# own axis), with pitch and yaw locked unless X is held. Fewer free axes give smoother, more
+# consistent demos; the model still outputs all six joints. Replaces the cell file's whole teleop:
+# block (keys left out take the defaults in config.py, not the cell file's values):
+#
+#   ur5vla demo -c configs/cell.yaml -t configs/teleop/4dof.yaml --prompt "..."
+#
+# Same layout and signs as configs/cell.yaml: the right stick and triggers translate, the left
+# stick rotates, and X (held) changes only the left stick, since it shares the right thumb with the
+# right stick.
+device: null
+frame: tool                   # tool z points out of the flange: roll turns the gripper about it
+max_linear_m_s: 0.15          # raise to ~0.2 once driving is smooth; RB slows the final approach
+max_angular_deg_s: 15
+linear_accel_m_s2: 0.5
+angular_accel_deg_s2: 90
+max_joint_speed_deg_s: 45
+slow_scale: 0.25
+deadzone: 0.12
+curve: 1.5
+axes:
+  x:  [{axis: 3, sign: 1}]                                         # right stick left/right
+  y:  [{axis: 4, sign: 1}]                                         # right stick up/down
+  z:  [{axis: 5, trigger: true}, {axis: 2, trigger: true, sign: -1}]  # RT forward, LT back
+  rz: [{axis: 0, sign: 1}]                                         # left stick left/right: roll
+alt_axes:                                                          # while X is held:
+  rx: [{axis: 1, sign: 1}]                                         # left stick up/down: pitch
+  ry: [{axis: 0, sign: 1}]                                         # left stick left/right: yaw
+  rz: []
+gripper: [{button: 0}, {button: 1, sign: -1}]                       # A close, B open
+gripper_mode: snap                                                 # A closes fully, B opens fully
+buttons: {deadman: 4, slow: 5, toggle_frame: 6, done: 7, alt: 2}    # LB (hold), RB (hold), View, Menu, X (hold)

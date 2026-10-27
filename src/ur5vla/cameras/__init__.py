@@ -7,6 +7,9 @@ Every camera also takes `rotate: 0 | 90 | 180 | 270` (degrees clockwise), for a 
 on its side or upside down. It turns each frame before anything sees it: the control loop, the
 recorder, the policy and the viewer. The driver's width/height stay the sensor's, so 90 and 270
 give frames `width` tall and `height` wide.
+
+The real cameras take image settings too: a fixed focus (autofocus never runs), automatic exposure
+and white balance within limits, or fixed ones. See oak.py, realsense.py and uvc.py.
 """
 
 from __future__ import annotations
@@ -19,7 +22,8 @@ from .base import CameraSource, ThreadedCamera
 DRIVERS: dict[str, str] = {
     'realsense': 'ur5vla.cameras.realsense:RealSenseCamera',
     'oak': 'ur5vla.cameras.oak:OakCamera',
-    'mcu_uvc': 'ur5vla.cameras.uvc:UVCCamera',
+    'uvc': 'ur5vla.cameras.uvc:UVCCamera',          # any USB webcam
+    'mcu_uvc': 'ur5vla.cameras.uvc:UVCCamera',      # the same driver, named for MCU camera boards
     'replay': 'ur5vla.cameras.replay:ReplayCamera',
     'synthetic': 'ur5vla.cameras.synthetic:SyntheticCamera',
 }

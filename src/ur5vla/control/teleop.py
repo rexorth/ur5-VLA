@@ -1,5 +1,8 @@
-"""Gamepad teleoperation: Cartesian jogging in the base or tool frame, executed exactly like a
-policy: joint targets streamed with servoJ at the robot rate, each one through SafetyLayer.
+"""Teleoperation, executed exactly like a policy: joint targets streamed with servoJ at the robot
+rate, each one through SafetyLayer. The operator's input decides each tick's target: a gamepad
+(GamepadInput, below) or a leader arm (control/leader.py).
+
+The gamepad jogs the TCP in the base or tool frame.
 
 Each tick the gamepad's twist (scaled, ramped by the accel limits) becomes a joint step by damped
 least squares on the UR5 Jacobian of the TCP point:
@@ -12,11 +15,14 @@ Limits:
     far ahead of the arm) is simply not taken: the arm stops at the wall, `status` says why, and
     it can be driven back out.
   * A stop on the robot's side (protective stop, e-stop, ..., or a servoJ it refuses), the force
-    limit or a gripper fault: with pause_on_stop the session pauses. It waits for the stop to be
-    cleared on the pendant, then resumes on a fresh deadman press (or resume_request): the control
-    script is uploaded again if it stopped, the command restarts from where the arm is and the
-    force estimate is tared again. Without pause_on_stop (recording demos) the episode ends.
-  * The software e-stop, the done button and a lost gamepad always end the session.
+    or torque limit, or a gripper or F/T sensor fault: with pause_on_stop the session pauses. It
+    waits for the stop to be cleared on the pendant, logging each change of what it waits for,
+    then resumes on a fresh deadman press (or resume_request): the control script is uploaded
+    again if it stopped and the command restarts from where the arm is; force readings carry on
+    as they are (an F/T sensor keeps its zero from the calibration pose). While the robot is still stopped nothing is sent to it; if its data go silent,
+    the link is reconnected, nothing more. Without pause_on_stop (recording demos) the episode
+    ends.
+  * The software e-stop, the done button and a lost gamepad (or leader) always end the session.
 
 The deadman stops motion the instant it is released; the ramp only shapes motion while held.
 """
@@ -34,12 +40,13 @@ import numpy as np
 
 from ..config import RunConfig, TeleopConfig
 from ..robot.arm import Arm, ArmError
+from ..robot.ft_sensor import FTSensor, NoFTSensor
 from ..robot.gripper import Gripper
 from ..robot.kinematics import fk, jacobian
 from ..types import RobotState
 from ..teleop.gamepad import EdgeDetector, GamepadState
 from .loop import Mode
-from .safety import SafetyLayer, Violation, describe
+from .safety import SafetyLayer, Violation, cause, describe
 
 log = logging.getLogger(__name__)
 
@@ -90,8 +97,105 @@ class NullRecorder:
 
 
 @dataclass
+class Controls:
+    """What the operator's input says this tick."""
+    connected: bool = True
+    lost: str = 'gamepad_lost'      # the end reason when not connected
+    held: bool = True               # the deadman (True when there is none)
+    pressed: bool = False           # the deadman just pressed: resumes a pause
+    done: bool = False
+
+
+class TeleopInput(Protocol):
+    """Turns the operator's input into joint targets. The session calls, each tick, poll(), then
+    step() and gripper() while the deadman is held, else hold()."""
+    notice: str | None              # shown when nothing else is (e.g. how to take over)
+
+    def begin(self) -> None: ...                    # a new episode
+    def poll(self, rec) -> Controls: ...            # every tick, paused or not
+    def step(self, q_cmd: np.ndarray, state: RobotState, dt: float, rec) -> np.ndarray | None: ...
+    def gripper(self, g_cmd: float, dt: float) -> float: ...
+    def hold(self, q_cmd: np.ndarray) -> None: ...  # not moving: released, paused or stopped
+    def restart(self, q_cmd: np.ndarray) -> None: ...   # moving again from q_cmd, after a pause
+    def refused(self) -> None: ...                  # SafetyLayer refused step()'s target
+    def resume_hint(self) -> str: ...
+    def legend(self) -> str: ...
+
+
+def pad_gripper(mapping, pad: GamepadState, tcfg: TeleopConfig, g_cmd: float, dt: float) -> float:
+    """The gripper target from the gamepad's gripper buttons: snap fully, or ramp."""
+    rate = mapping.gripper_rate(pad)
+    if tcfg.gripper_mode == 'snap':
+        return 1.0 if rate > 0 else 0.0 if rate < 0 else g_cmd
+    return float(np.clip(g_cmd + rate * tcfg.gripper_speed * dt, 0.0, 1.0))
+
+
+class GamepadInput:
+    """The gamepad jogs the TCP: its twist becomes a joint step (CartesianJogger)."""
+
+    def __init__(self, cfg: RunConfig, pad: Pad):
+        self.tcfg = cfg.teleop
+        self.pad = pad
+        self.mapping = cfg.teleop.mapping()
+        self.jog = CartesianJogger(cfg.teleop, np.asarray(cfg.safety.tcp_offset_m))
+        self.frame = cfg.teleop.frame
+        self.notice = None
+        self._pad: GamepadState | None = None
+        self._edges = EdgeDetector(self.mapping)
+        self._alt = False                       # the alt button, as last seen
+        if self.mapping.buttons.get('deadman') is None:
+            log.warning('teleop: no deadman button mapped; sticks move the arm whenever deflected')
+
+    def begin(self) -> None:
+        self._edges = EdgeDetector(self.mapping)
+        self.jog.reset()
+        self._alt = False
+
+    def poll(self, rec) -> Controls:
+        pad = self._pad = self.pad.snapshot()
+        # Read every tick so edges stay current; the deadman's only resumes while paused.
+        pressed = self._edges.pressed('deadman', pad)
+        done = self._edges.pressed('done', pad)
+        if self._edges.pressed('toggle_frame', pad):
+            self.frame = 'tool' if self.frame == 'base' else 'base'
+            self.jog.reset()
+            rec.log_event('frame', frame=self.frame)
+            log.info('teleop: %s frame', self.frame)
+        if self.mapping.alt_axes and self.mapping.held('alt', pad) != self._alt:
+            self._alt = not self._alt
+            self.jog.reset()                    # the sticks now mean other axes: start from rest
+            rec.log_event('alt', held=self._alt)
+        held = self.mapping.buttons.get('deadman') is None or self.mapping.held('deadman', pad)
+        return Controls(pad.connected, 'gamepad_lost', held, pressed, done)
+
+    def step(self, q_cmd, state, dt, rec):
+        scale = self.tcfg.slow_scale if self.mapping.held('slow', self._pad) else 1.0
+        self.jog.update(self.mapping.twist(self._pad), scale, dt)
+        dq = self.jog.joint_step(q_cmd, self.frame, dt)
+        return q_cmd + dq if np.any(dq) else None
+
+    def gripper(self, g_cmd, dt):
+        return pad_gripper(self.mapping, self._pad, self.tcfg, g_cmd, dt)
+
+    def hold(self, q_cmd) -> None:
+        self.jog.reset()                        # stop now, not after a ramp
+
+    def restart(self, q_cmd) -> None:
+        self.jog.reset()
+
+    def refused(self) -> None:
+        self.jog.reset()
+
+    def resume_hint(self) -> str:
+        return f'press {self.mapping.button_name("deadman")} (or r) to resume'
+
+    def legend(self) -> str:
+        return self.mapping.legend(self.frame)
+
+
+@dataclass
 class TeleopResult:
-    end_reason: str                 # operator | timeout | estop | safety | gamepad_lost | error
+    end_reason: str                 # operator | timeout | estop | safety | gamepad_lost | leader_lost | error
     detail: dict[str, Any] = field(default_factory=dict)
     duration_s: float = 0.0
     blocked: int = 0                # times a step was refused at a limit
@@ -100,25 +204,36 @@ class TeleopResult:
 
 
 class TeleopSession:
-    def __init__(self, cfg: RunConfig, arm: Arm, gripper: Gripper, pad: Pad):
+    """input: what moves the arm; the gamepad `pad` (GamepadInput) unless given, e.g. a
+    control.leader.LeaderInput."""
+
+    def __init__(self, cfg: RunConfig, arm: Arm, gripper: Gripper, pad: Pad | None,
+                 ft_sensor: FTSensor | None = None, input: TeleopInput | None = None):
         self.cfg = cfg
         self.arm = arm
         self.gripper = gripper
+        self.ft = ft_sensor or NoFTSensor()
         self.pad = pad
-        self.mapping = cfg.teleop.mapping()
+        self.input = input if input is not None else GamepadInput(cfg, pad)
         self.safety = SafetyLayer(cfg.safety, cfg.robot.period_s)
-        self.jog = CartesianJogger(cfg.teleop, np.asarray(cfg.safety.tcp_offset_m))
-        self.frame = cfg.teleop.frame
         # For display, written by the execution thread:
         self.state: RobotState | None = None     # the latest robot state
+        self.target: np.ndarray | None = None    # the joint target sent last; None while paused
         self.status: str | None = None           # what the operator needs to know: paused, blocked
         self.paused = False
         self.estop = threading.Event()
         self.end_request = threading.Event()
         self.resume_request = threading.Event()  # resume a pause, like a fresh deadman press
-        if self.mapping.buttons.get('deadman') is None:
-            log.warning('teleop: no deadman button mapped; sticks move the arm whenever deflected')
         sys.setswitchinterval(0.0005)
+
+    @property
+    def mapping(self):
+        """The gamepad mapping (the gamepad's, or the leader's gamepad's), or None."""
+        return getattr(self.input, 'mapping', None)
+
+    @property
+    def frame(self) -> str:
+        return getattr(self.input, 'frame', 'joint')
 
     def run_episode(self, recorder=None, max_episode_s: float | None = None,
                     pause_on_stop: bool = False) -> TeleopResult:
@@ -158,20 +273,35 @@ class TeleopSession:
         log.info('teleop end: %s %s', reason, detail or '')
         rec.log_event('end', reason=reason, **(detail or {}))
 
+    def _read_state(self) -> RobotState:
+        """The arm's state with the gripper and F/T sensor merged in."""
+        state = self.arm.read_state()
+        state.gripper = self.gripper.position()
+        state.ft = self.ft.wrench()
+        return state
+
+    def _device_fault(self) -> Violation | None:
+        if (fault := self.gripper.fault()) is not None:
+            return Violation('gripper', {'fault': fault})
+        if (fault := self.ft.fault()) is not None:
+            return Violation('ft_sensor', {'fault': fault})
+        return None
+
     def _blocker(self, state: RobotState) -> Violation | None:
-        """What still prevents a resume: the robot's own state, or a gripper fault."""
-        v = self.safety.robot_condition(state)
-        if v is None and (fault := self.gripper.fault()) is not None:
-            v = Violation('gripper', {'fault': fault})
-        return v
+        """What still prevents a resume: the robot's own state, or a gripper or F/T sensor fault."""
+        return self.safety.robot_condition(state) or self._device_fault()
 
     def _resume(self) -> RobotState | None:
         """Restart the control script if a stop ended it; the state to restart from, or None."""
-        if not self.arm.recover():
+        try:
+            if not self.arm.recover():
+                return None
+        except RuntimeError as exc:         # stopped again meanwhile, or ur_rtde's script didn't start
+            log.warning('teleop: restarting the control script failed: %s', exc)
             return None
         deadline = time.monotonic() + 1.0
         while time.monotonic() < deadline:
-            state = self.arm.read_state()
+            state = self._read_state()
             if state.program_running:
                 return state
             time.sleep(0.01)
@@ -179,29 +309,28 @@ class TeleopSession:
 
     def _exec_loop(self, rec, running: threading.Event, pause_on_stop: bool) -> None:
         period = self.cfg.robot.period_s
-        tcfg = self.cfg.teleop
-        edges = EdgeDetector(self.mapping)
-        resume_hint = f'press {self.mapping.button_name("deadman")} (or r) to resume'
-        state = self.arm.read_state()
-        self.safety.tare(state.wrench)
+        inp = self.input
+        resume_hint = inp.resume_hint()
+        state = self._read_state()
         q_cmd = state.q.copy()
         g_cmd = self.gripper.position()
-        self.jog.reset()
+        inp.begin()
         self.status, self.paused = None, False
         enabled = False
         blocked: Violation | None = None
         pause: Violation | None = None              # why the session is paused; None while running
+        waiting_for = None                          # cause() of what the pause waits for, as logged
         servoing = False
         t_prev = None
         relinked = 0.0                              # last reconnect attempt while the link is down
 
         def stop(v: Violation) -> bool:
             """A stop. True if it ends the session; otherwise the session is now paused."""
-            nonlocal servoing, pause, enabled
+            nonlocal servoing, pause, enabled, waiting_for
             if servoing:
                 self.arm.servo_stop()               # False if the robot already stopped itself
                 servoing = False
-            self.jog.reset()
+            inp.hold(q_cmd)
             ends = not pause_on_stop or v.reason == 'estop'
             rec.log_event('safety' if ends else 'pause', reason=v.reason, **v.detail)
             if ends:
@@ -209,7 +338,7 @@ class TeleopSession:
                 self._end(rec, 'estop' if v.reason == 'estop' else 'safety', {'violation': v.reason, **v.detail})
                 return True
             log.warning('teleop paused: %s', describe(v))
-            pause, enabled = v, False
+            pause, enabled, self.target, waiting_for = v, False, None, cause(v)
             self.paused, self._result.pauses = True, self._result.pauses + 1
             self.status = f'PAUSED: {describe(v)} Then {resume_hint}.'
             return False
@@ -218,16 +347,14 @@ class TeleopSession:
             while running.is_set():
                 token = self.arm.init_period()
                 now = time.monotonic()
-                state = self.arm.read_state()
-                state.gripper = self.gripper.position()
+                state = self._read_state()
                 self.state = state
                 loop_dt = np.nan if t_prev is None else now - t_prev
                 t_prev = now
                 if loop_dt > 1.5 * period:
                     self._result.overruns += 1
-                pad = self.pad.snapshot()
-                # Read every tick so edges stay current; only acted on while paused.
-                resume = edges.pressed('deadman', pad)
+                controls = inp.poll(rec)
+                resume = controls.pressed           # only acted on while paused
                 if self.resume_request.is_set():
                     self.resume_request.clear()
                     resume = True
@@ -236,80 +363,76 @@ class TeleopSession:
                     stop(Violation('estop'))
                     return
                 if pause is None:
-                    v = self.safety.check_state(state)
-                    if v is None and (fault := self.gripper.fault()) is not None:
-                        v = Violation('gripper', {'fault': fault})
+                    v = self.safety.check_state(state) or self._device_fault()
                     if v is not None:
                         if stop(v):
                             return
                         resume = False              # a press in the same tick doesn't count
-                if not pad.connected:
-                    self._end(rec, 'gamepad_lost')
+                if not controls.connected:
+                    self._end(rec, controls.lost)
                     return
-                if edges.pressed('done', pad):
+                if controls.done:
                     self._end(rec, 'operator')
                     return
-                if edges.pressed('toggle_frame', pad):
-                    self.frame = 'tool' if self.frame == 'base' else 'base'
-                    self.jog.reset()
-                    rec.log_event('frame', frame=self.frame)
-                    log.info('teleop: %s frame', self.frame)
 
                 if pause is not None:
                     blocker = self._blocker(state)
+                    changed = cause(blocker) != waiting_for
+                    if changed:                     # the log keeps each change: what the robot said
+                        waiting_for = cause(blocker)
+                        if blocker is None:
+                            log.info('teleop: the stop is cleared: %s', resume_hint)
+                        else:
+                            log.warning('teleop: still paused: %s', describe(blocker))
                     if blocker is not None:
                         self.status = f'PAUSED: {describe(blocker)} Then {resume_hint}.'
                         if blocker.reason == 'robot_link' and now - relinked > 1.0:
-                            relinked = now          # fresh data is what clears it: reconnect
+                            relinked = now          # fresh data is what clears it: reconnect, no upload
                             try:
-                                self.arm.recover()
+                                self.arm.reconnect()
                             except Exception as exc:
                                 log.warning('teleop: reconnecting to the robot failed: %s', exc)
                     else:
-                        if not self.status.startswith('PAUSED ('):
-                            log.info('teleop: the stop is cleared: %s', resume_hint)
-                        self.status = f'PAUSED ({describe(pause)}) Cleared: {resume_hint}.'
+                        if changed:
+                            self.status = f'PAUSED ({describe(pause)}) Cleared: {resume_hint}.'
                         if resume:
                             fresh = self._resume()
                             if fresh is None:
+                                log.warning("teleop: the robot's control script didn't start again")
                                 self.status = ("PAUSED: the robot's control script didn't start again. "
                                                f'Check the pendant, then {resume_hint}.')
                             else:
                                 q_cmd = fresh.q.copy()
-                                self.safety.tare(fresh.wrench)
-                                self.jog.reset()
+                                inp.restart(q_cmd)
                                 pause, blocked, self.status, self.paused = None, None, None, False
+                                self.target = q_cmd
                                 rec.log_event('resume')
                                 log.info('teleop: resumed')
                     rec.log_tick(now, state.q, state.qd, state.tcp_pose, state.wrench, state.gripper,
-                                 None, None, int(Mode.HOLD), loop_dt)
+                                 None, None, int(Mode.HOLD), loop_dt, state.ft)
                     self.arm.wait_period(token)
                     continue
 
-                held = self.mapping.buttons.get('deadman') is None or self.mapping.held('deadman', pad)
-                if held != enabled:
-                    enabled = held
+                if controls.held != enabled:
+                    enabled = controls.held
                     rec.log_event('enable' if enabled else 'disable')
-                dq = np.zeros(6)
+                q_next = None
                 if enabled:
-                    scale = tcfg.slow_scale if self.mapping.held('slow', pad) else 1.0
-                    self.jog.update(self.mapping.twist(pad), scale, period)
-                    dq = self.jog.joint_step(q_cmd, self.frame, period)
-                    g_cmd = float(np.clip(g_cmd + self.mapping.gripper_rate(pad) * tcfg.gripper_speed * period,
-                                          0.0, 1.0))
+                    q_next = inp.step(q_cmd, state, period, rec)
+                    g_cmd = inp.gripper(g_cmd, period)
                 else:
-                    self.jog.reset()    # released: stop now, not after a ramp
+                    inp.hold(q_cmd)
                     if blocked is not None:
                         blocked, self.status = None, None
 
-                if np.any(dq):
-                    refused = self.safety.check_command(q_cmd + dq, q_cmd, state.q)
+                if q_next is not None:
+                    refused = self.safety.check_command(q_next, q_cmd, state.q)
                     if refused is None:
-                        q_cmd = q_cmd + dq
+                        q_cmd = q_next
                         if blocked is not None:
                             blocked, self.status = None, None
                     else:
-                        self.jog.reset()
+                        inp.refused()
                         if blocked is None or blocked.reason != refused.reason:
                             self._result.blocked += 1
                             rec.log_event('blocked', reason=refused.reason, **refused.detail)
@@ -325,9 +448,10 @@ class TeleopSession:
                     self.arm.wait_period(token)
                     continue
                 servoing = True
+                self.target = q_cmd
                 self.gripper.command(g_cmd)
                 rec.log_tick(now, state.q, state.qd, state.tcp_pose, state.wrench, state.gripper,
-                             q_cmd.copy(), g_cmd, int(Mode.SERVO), loop_dt)
+                             q_cmd.copy(), g_cmd, int(Mode.SERVO), loop_dt, state.ft)
                 self.arm.wait_period(token)
         except Exception as exc:
             log.exception('teleop loop failed')
