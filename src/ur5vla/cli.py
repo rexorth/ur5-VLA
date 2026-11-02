@@ -75,15 +75,19 @@ def _start_cameras(cfg: config_mod.RunConfig, names: list[str] | None = None,
     one's first frame, then for automatic exposure to settle. `automatic`: they choose focus,
     exposure and white balance themselves."""
     cameras = build_cameras({name: cfg.cameras[name] for name in names} if names else cfg.cameras)
-    for cam in cameras.values():
-        cam.automatic = automatic
-        cam.start()
-    deadline = time.monotonic() + timeout_s
-    while any(c.latest() is None for c in cameras.values()):
-        if time.monotonic() > deadline:
-            silent = [n for n, c in cameras.items() if c.latest() is None]
-            raise TimeoutError(f'no frames from camera(s) {silent} within {timeout_s} s')
-        time.sleep(0.05)
+    try:
+        for cam in cameras.values():
+            cam.automatic = automatic
+            cam.start()
+        deadline = time.monotonic() + timeout_s
+        while any(c.latest() is None for c in cameras.values()):
+            if time.monotonic() > deadline:
+                silent = [n for n, c in cameras.items() if c.latest() is None]
+                raise TimeoutError(f'no frames from camera(s) {silent} within {timeout_s} s')
+            time.sleep(0.05)
+    except BaseException:
+        _stop_cameras(cameras)      # one camera failed: stop the ones that started, or their
+        raise                       # background threads abort the process on the way out
     time.sleep(max((getattr(c, 'settle_s', 0.0) for c in cameras.values()), default=0.0))
     return cameras
 
@@ -374,6 +378,8 @@ def _episode_keys(estop: threading.Event, end: threading.Event, resume: threadin
 
 
 def _keys_text(devices) -> str:
+    if devices.pedal is not None:
+        return 'keys: hold the foot pedal to move, [space]/[e] e-stop, [d] done, Ctrl-C e-stop'
     if devices.keyboard is None:
         return TELEOP_KEYS
     key = devices.keyboard.name
@@ -450,17 +456,22 @@ def _teleop_display(session, tcp_offset_m, viewer, terminal: bool):
             print('\x1b[K', end='', flush=True)    # clear it: the caller prints the final pose
 
 
+_JOINT_SHORT = ('base', 'shld', 'elb', 'wr1', 'wr2', 'wr3')
+
+
 def _leader_flag(inp) -> str:
-    """Following, or what's in the way, for the pose line."""
+    """Following, or every joint's offset so they can be lined up together, for the pose line."""
     if inp.engaged:
         return 'FOLLOWING the leader' + (' (catching up)' if inp.catching_up else '')
     if inp.error is None:
         r = inp.reading
         return f'leader: {r.fault}' if r is not None and r.fault else 'leader: hold the deadman'
-    from .control.safety import JOINT_NAMES
-    j = int(np.argmax(np.abs(inp.error)))
-    return (f'not following: leader {JOINT_NAMES[j]} {np.rad2deg(inp.error[j]):+.0f} deg off '
-            f'(within {inp.lcfg.engage_deg:.0f} to take over)')
+    deg = np.rad2deg(inp.error)                      # leader minus arm, per joint
+    engage = inp.lcfg.engage_deg
+    cells = ' '.join(f'{n} {d:+5.0f}' for n, d in zip(_JOINT_SHORT, deg))
+    worst = float(np.max(np.abs(deg)))
+    head = 'ALIGNED - hold the deadman' if worst <= engage else f'align all within {engage:.0f} deg'
+    return f'{head}:  {cells}'
 
 
 def _robot_flags(session, state) -> str:
@@ -747,10 +758,10 @@ class _Devices:
     plugged in."""
 
     def __init__(self):
-        self.pad = self.leader = self.keyboard = None
+        self.pad = self.leader = self.keyboard = self.pedal = self.nudge_key = None
 
     def close(self) -> None:
-        for device in (self.keyboard, self.leader, self.pad):
+        for device in (self.keyboard, self.pedal, self.nudge_key, self.leader, self.pad):
             if device is not None:
                 device.close()
 
@@ -767,6 +778,8 @@ def _open_devices(args, cfg: config_mod.RunConfig, why_pad: str) -> _Devices:
                          '(docs/procedures.md#45-leader-arm)')
     try:
         devices.keyboard = _open_keyboard(cfg)
+        devices.pedal = _open_pedal(cfg)
+        devices.nudge_key = _open_nudge_key(cfg)
         devices.pad = _open_pad(cfg, required=(
             "With the leader, the gamepad's deadman is held to move (leader.deadman: gamepad); "
             "--deadman keyboard, button or none does without" if lc.deadman == 'gamepad' else None))
@@ -794,12 +807,37 @@ def _open_keyboard(cfg: config_mod.RunConfig):
         raise SystemExit(f'leader.deadman keyboard: {exc}') from None
 
 
+def _open_pedal(cfg: config_mod.RunConfig):
+    """The foot-pedal deadman, read from /dev/input, if leader.deadman is pedal; else None."""
+    if cfg.leader.deadman != 'pedal':
+        return None
+    from .keys import PedalDeadman
+    try:
+        return PedalDeadman(cfg.leader.pedal_name, cfg.leader.pedal_key, cfg.leader.pedal_grab).start()
+    except RuntimeError as exc:
+        raise SystemExit(f'leader.deadman pedal: {exc}') from None
+
+
+def _open_nudge_key(cfg: config_mod.RunConfig):
+    """The recovery-nudge key (held to creep the arm toward the leader), from the desktop session.
+    None if unset, or if there is no X11 session (a warning, not fatal: it is only a recovery aid)."""
+    if not cfg.leader.nudge_key:
+        return None
+    from .keys import HeldKey
+    try:
+        return HeldKey(cfg.leader.nudge_key).start()
+    except RuntimeError as exc:
+        log.warning('leader.nudge_key %r unavailable, recovery nudge off: %s', cfg.leader.nudge_key, exc)
+        return None
+
+
 def _session_input(cfg: config_mod.RunConfig, devices: _Devices):
     """The leader's input for the session, or None for the gamepad's."""
     if devices.leader is None:
         return None
     from .control.leader import GelloSource, LeaderInput
-    return LeaderInput(cfg, GelloSource(devices.leader), devices.pad, keyboard=devices.keyboard)
+    return LeaderInput(cfg, GelloSource(devices.leader), devices.pad, keyboard=devices.keyboard,
+                       pedal=devices.pedal)
 
 
 def _offer_move_to_leader(cfg: config_mod.RunConfig, arm, leader) -> None:
@@ -843,7 +881,8 @@ def _teleop(args, cfg: config_mod.RunConfig) -> int:
         _warn_if_not_zeroed(ft)
         if devices.leader is not None:
             _offer_move_to_leader(cfg, arm, devices.leader)
-        session = TeleopSession(cfg, arm, gripper, devices.pad, ft, input=_session_input(cfg, devices))
+        session = TeleopSession(cfg, arm, gripper, devices.pad, ft, input=_session_input(cfg, devices),
+                                nudge_key=devices.nudge_key)
         tcp_offset = cfg.safety.tcp_offset_m
         print(f'{session.input.legend()}\n{_keys_text(devices)}, [r] resume\n'
               f'If the robot stops itself the arm pauses: clear the stop on the pendant, then '
@@ -1020,7 +1059,8 @@ def _flange_demo(args, cfg: config_mod.RunConfig) -> int:
         source = SingleJointSource(driver, joint=5, ratio=args.ratio, sign=args.sign)
         title = f'FLANGE DEMO (encoder ch{channel})'
         session = TeleopSession(cfg, arm, NoGripper(), pad, ft,
-                                input=LeaderInput(cfg, source, pad, title, keyboard=devices.keyboard))
+                                input=LeaderInput(cfg, source, pad, title, keyboard=devices.keyboard),
+                                nudge_key=devices.nudge_key)
         print(f'{session.input.legend()}\n{_keys_text(devices)}, [r] resume', flush=True)
         keys = _episode_keys(session.estop, session.end_request, session.resume_request,
                              devices.keyboard.name if devices.keyboard else None)
@@ -1087,7 +1127,8 @@ def _demos(args, cfg: config_mod.RunConfig, prompt: str, run_name: str, run_dir:
         _connect_arm(cfg, arm)
         gripper.connect()
         ft.connect()
-        session = TeleopSession(cfg, arm, gripper, devices.pad, ft, input=_session_input(cfg, devices))
+        session = TeleopSession(cfg, arm, gripper, devices.pad, ft, input=_session_input(cfg, devices),
+                                nudge_key=devices.nudge_key)
         print(session.input.legend(), flush=True)
         for ep in range(args.episodes):
             prepared = _prepare(cfg, arm, gripper, ft, args.yes, args.reuse_tare)
@@ -1308,7 +1349,7 @@ def main(argv: list[str] | None = None) -> int:
     def add_deadman(p):
         p.add_argument('--deadman', choices=config_mod.LEADER_DEADMAN,
                        help='with the leader: what must be held to move (keyboard: leader.deadman_key, '
-                            'space by default); overrides leader.deadman')
+                            'space by default; pedal: a USB foot pedal); overrides leader.deadman')
 
     p = add('teleop', cmd_teleop, dry=True, view=True, teleop=True)
     add_leader(p)

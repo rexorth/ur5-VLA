@@ -43,13 +43,13 @@ cameras:
   # printer: the printer's front, at table height. Reports itself as "NexiGo N60 FHD Webcam" with
   # serial 2021030103. Fixed focus; exposure and white balance automatic. Under 50 Hz anti-flicker
   # it runs at 25 fps (and at 60 Hz it sends no frames at all).
-  printer: {type: uvc, device: /dev/v4l/by-id/usb-2M_UVC_CAMERA_NexiGo_N60_FHD_Webcam_2021030103-video-index0,
-            width: 640, height: 480, fps: 25, mains_hz: 50}
+  #printer: {type: uvc, device: /dev/v4l/by-id/usb-2M_UVC_CAMERA_NexiGo_N60_FHD_Webcam_2021030103-video-index0,
+  #          width: 640, height: 480, fps: 25, mains_hz: 50}
   # base2: high, looking down over the arm at the table and the printer. Its firmware reports the
   # generic Linux "USB Webcam gadget" (no serial number, so a second such camera would share this
   # path: use by-path then). Automatic exposure only, with no focus or white-balance control.
-  base2: {type: uvc, device: /dev/v4l/by-id/usb-Linux_Foundation_USB_Webcam_gadget-video-index0,
-          width: 640, height: 480, fps: 30, mains_hz: 50}
+  #base2: {type: uvc, device: /dev/v4l/by-id/usb-Linux_Foundation_USB_Webcam_gadget-video-index0,
+  #        width: 640, height: 480, fps: 30, mains_hz: 50}
 
 
 control:
@@ -146,20 +146,38 @@ leader:
   type: gello_as5600
   port: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_B0:A6:04:00:EC:C8-if00
   channels: [0, 1, 2, 3, 4, 5]          # multiplexer channel of each joint, base to wrist 3
-  joint_signs: [1, 1, -1, 1, 1, 1]      # GELLO's for a UR; check each with `ur5vla leader --arm`
-  joint_offsets_deg: null               # from --calibrate, with the leader in calibration_q_deg
-  calibration_q_deg: [0, -90, 90, -90, -90, 0]   # GELLO's UR calibration pose
+  joint_signs: [-1, -1, 1, -1, -1, -1]      # GELLO's for a UR; check each with `ur5vla leader --arm`
+  joint_offsets_deg: [-115.22, -14.25, -2.90, 126.47, -19.69, 151.08]               # from --calibrate, with the leader in calibration_q_deg
+  calibration_q_deg: [0, -90, -90, -90, 90, 0]   # the leader's reference pose = robot pointing down the table (toward the printer)
   gripper_channel: 6                    # the trigger's encoder (null: the gamepad's A/B)
-  gripper_open_deg: null                # from --calibrate
-  gripper_closed_deg: null
-  # Held to move: keyboard (deadman_key, read from the desktop wherever the focus is; a USB foot
-  # switch that types it works too) | gamepad (teleop.buttons.deadman, LB) | button (ESP32 D1) | none
-  deadman: keyboard
-  deadman_key: space
+  gripper_open_deg: 86.6                # from --calibrate
+  gripper_closed_deg: 124.8
+  # Held to move: keyboard (deadman_key, read from the desktop wherever the focus is) | pedal (a USB
+  # foot pedal read straight from /dev/input, grabbed so its key stays off the desktop; program it to
+  # an inert key like F13 first - docs/procedures.md) | gamepad (teleop.buttons.deadman, LB) |
+  # button (ESP32 D1) | none
+  deadman: pedal
+  deadman_key: space          # the keyboard deadman, if deadman: keyboard
+  pedal_name: FootSwitch      # substring of the pedal's /dev/input name (ls /dev/input/by-id)
+  pedal_key: KEY_F13          # the evdev key it sends after `footswitch -2 -k f13`
+  pedal_grab: true            # grab the pedal so F13 never reaches other windows while teleop runs
   engage_deg: 10                        # the arm takes over once every joint is within this of it
   disengage_deg: 30                     # and lets go if the leader gets this far ahead
   max_joint_speed_deg_s: 90
   catch_up_deg_s: 20
+  # Recovery: hold this key (an X keysym) to creep the arm toward the leader while it is paused
+  # or not following - to back off a stop or re-line-up a lost arm. '' turns it off.
+  nudge_key: n
+  nudge_deg_s: 15
+
+sim:
+  # MuJoCo dry-run of the leader arm (scripts/leader_mujoco.py, docs/procedures.md#45-leader-arm).
+  # The arm starts at robot.start_q_deg and mirrors the leader; nothing here touches the real robot.
+  scene: ../ur5-workspace/scene_c5.xml   # UR5 + 2F-85 scene (null = the script's default); path is from the repo root
+  base:                                  # the robot base's pose in the sim, matching the real mounting
+    xyz_mm:  [0.0, 0.0, 0.0]             # nudge the base in the scene (x y z, mm)
+    rpy_deg: [0.0, 0.0, 90.0]            # roll, pitch, yaw about scene x y z (deg); yaw 90 points it down the table to the printer (try -90)
+  fps: 60                                 # viewer update rate
 
 logging:
   root: runs

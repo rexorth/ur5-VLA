@@ -126,22 +126,27 @@ class SingleJointSource:
 
 class LeaderInput:
     """The arm follows `source` (GelloSource, SingleJointSource). `keyboard`: the held key, a
-    keys.HeldKey (leader.deadman: keyboard). `pad`, optional: the gamepad, for its deadman
-    (leader.deadman: gamepad), its done button and, without a trigger, its gripper buttons."""
+    keys.HeldKey (leader.deadman: keyboard). `pedal`: a USB foot pedal, keys.PedalDeadman
+    (leader.deadman: pedal). `pad`, optional: the gamepad, for its deadman (leader.deadman: gamepad),
+    its done button and, without a trigger, its gripper buttons."""
 
     def __init__(self, cfg: RunConfig, source, pad: Pad | None = None, title: str = 'LEADER ARM',
-                 keyboard=None):
+                 keyboard=None, pedal=None):
         self.cfg, self.lcfg, self.source, self.pad, self.title = cfg, cfg.leader, source, pad, title
         self.keyboard = keyboard
+        self.pedal = pedal
         self.mapping = cfg.teleop.mapping() if pad is not None else None
         if self.lcfg.deadman == 'gamepad' and pad is None:
             raise ValueError('leader.deadman is gamepad, but there is no gamepad')
         if self.lcfg.deadman == 'keyboard' and keyboard is None:
             raise ValueError('leader.deadman is keyboard, but no key is being read')
+        if self.lcfg.deadman == 'pedal' and pedal is None:
+            raise ValueError('leader.deadman is pedal, but no pedal is being read')
         period = cfg.robot.period_s
         self.max_speed = min(np.deg2rad(self.lcfg.max_joint_speed_deg_s),
                              STEP_MARGIN * cfg.safety.max_step_rad / period)
         self.catch_up = min(np.deg2rad(self.lcfg.catch_up_deg_s), self.max_speed)
+        self.nudge_speed = min(np.deg2rad(self.lcfg.nudge_deg_s), self.max_speed)  # recovery creep
         v = cfg.safety.max_tcp_speed_m_s
         self.max_tcp = None if v is None else TCP_MARGIN * v
         self.tcp_offset = np.asarray(cfg.safety.tcp_offset_m, dtype=float)
@@ -174,6 +179,8 @@ class LeaderInput:
         pad = self._pad = self.pad.snapshot() if self.pad is not None else None
         if self.lcfg.deadman == 'keyboard':
             held = self.keyboard.held()
+        elif self.lcfg.deadman == 'pedal':
+            held = self.pedal.held()
         elif self.lcfg.deadman == 'gamepad':
             held = self.mapping.buttons.get('deadman') is None or self.mapping.held('deadman', pad)
         elif self.lcfg.deadman == 'button':
@@ -241,6 +248,27 @@ class LeaderInput:
             return pad_gripper(self.mapping, self._pad, self.cfg.teleop, g_cmd, dt)
         return g_cmd
 
+    def nudge(self, q_cmd: np.ndarray, dt: float) -> np.ndarray | None:
+        """Recovery (the nudge key held, arm paused or not following): a slow step of q_cmd toward
+        the leader's pose, each joint on the turn nearest the arm's. None if the leader isn't
+        reading. The caller still runs it through check_command, but past the force/torque pause."""
+        r = self.reading
+        if r is None or r.q is None:
+            return None
+        target = r.q + TURN * np.round((q_cmd - r.q) / TURN)
+        step = np.clip(target - q_cmd, -self.nudge_speed * dt, self.nudge_speed * dt)
+        return q_cmd + step if np.any(step) else None
+
+    def nudge_gripper(self, g_cmd: float, dt: float) -> float:
+        """The gripper toward the leader's trigger while nudging, so a part clamped under force can
+        be released to clear the stop. The trigger if calibrated, else the gamepad buttons."""
+        g = self.source.gripper()
+        if g is not None:
+            return float(np.clip(g, 0.0, 1.0))
+        if self.mapping is not None:
+            return pad_gripper(self.mapping, self._pad, self.cfg.teleop, g_cmd, dt)
+        return g_cmd
+
     def hold(self, q_cmd: np.ndarray) -> None:
         """Released (or paused): stop following, but keep the gap and how to take over current,
         so the leader can be lined up before the deadman is pressed."""
@@ -280,11 +308,14 @@ class LeaderInput:
         if c.done_button is not None:
             done.append(f'leader button {c.done_button}')
         first, *rest = self.source.legend(c, hold)
+        recover = ([f'  recover: hold {c.nudge_key} to creep the arm to the leader (back off a stop, '
+                    f'relocate a lost arm); the gripper follows the trigger'] if c.nudge_key else [])
         return '\n'.join([
             f'{self.title}: {first}', *rest,
             f'  up to {np.rad2deg(self.max_speed):.0f} deg/s per joint'
             + (f', TCP {self.max_tcp:.2f} m/s' if self.max_tcp is not None else ''),
             f'  gripper: {gripper}',
+            *recover,
             f'  done: {", ".join(done + ["[d]"])}',
         ])
 
@@ -292,6 +323,7 @@ class LeaderInput:
 
     def _deadman_text(self, verb: str) -> str:
         what = {'keyboard': lambda: self.lcfg.deadman_key,
+                'pedal': lambda: 'the foot pedal',
                 'gamepad': lambda: self.mapping.button_name('deadman'),
                 'button': lambda: f'leader button {self.lcfg.deadman_button}'}[self.lcfg.deadman]()
         return f'{verb} {what}'.strip()

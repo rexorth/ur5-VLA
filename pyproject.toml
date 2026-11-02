@@ -32,6 +32,14 @@ lerobot = ["lerobot[async,dataset]>=0.6,<0.7", "torch", "torchvision"]
 # A GELLO leader arm (`teleop --leader`): GELLO's own hardware layer, from its as5600-encoders
 # branch in third_party/gello_software. It needs only numpy, so both venvs take it.
 leader = ["gello"]
+# Watch the leader drive the arm in MuJoCo (scripts/leader_mujoco.py, a dry run with no robot).
+# It loads the UR5 scene from ../ur5-workspace and reads the leader, so install it into whichever
+# venv already has the `leader` extra: uv pip install --python <that venv> mujoco
+sim = ["mujoco>=3.0,<4"]
+# A USB foot-pedal deadman (`--deadman pedal`): reads the pedal straight off /dev/input via evdev,
+# so the held signal doesn't depend on keyboard focus. Needs the user in the `input` group. Install
+# into the venv that runs teleop: uv pip install --python <that venv> evdev
+pedal = ["evdev>=1.6"]
 
 [project.scripts]
 ur5vla = "ur5vla.cli:main"

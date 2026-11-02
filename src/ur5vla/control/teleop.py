@@ -208,13 +208,17 @@ class TeleopSession:
     control.leader.LeaderInput."""
 
     def __init__(self, cfg: RunConfig, arm: Arm, gripper: Gripper, pad: Pad | None,
-                 ft_sensor: FTSensor | None = None, input: TeleopInput | None = None):
+                 ft_sensor: FTSensor | None = None, input: TeleopInput | None = None,
+                 nudge_key=None):
         self.cfg = cfg
         self.arm = arm
         self.gripper = gripper
         self.ft = ft_sensor or NoFTSensor()
         self.pad = pad
         self.input = input if input is not None else GamepadInput(cfg, pad)
+        # A held key (keys.HeldKey) that creeps the arm toward the leader to recover from a stop or
+        # a lost arm; only for a leader input (it has nudge()/nudge_gripper()).
+        self.nudge_key = nudge_key if hasattr(self.input, 'nudge') else None
         self.safety = SafetyLayer(cfg.safety, cfg.robot.period_s)
         # For display, written by the execution thread:
         self.state: RobotState | None = None     # the latest robot state
@@ -287,6 +291,29 @@ class TeleopSession:
             return Violation('ft_sensor', {'fault': fault})
         return None
 
+    def _nudge_paused(self, q_cmd, g_cmd, state, period):
+        """Recovery while paused: creep the arm toward the leader and drive the gripper toward its
+        trigger — past the force/torque pause (not re-checked here), but still through
+        check_command. A hardware stop (protective/e-stop) still refuses servoJ, so it can't move
+        then. Returns (q_cmd, g_cmd, status, servoed)."""
+        status, servoed = 'NUDGING toward the leader (recovery)', False
+        qn = self.input.nudge(q_cmd, period)
+        if qn is None:
+            status = 'NUDGE: no reading from the leader'
+        else:
+            refused = self.safety.check_command(qn, q_cmd, state.q)
+            if refused is not None:
+                status = f'NUDGE blocked: {describe(refused)}'
+            else:
+                try:
+                    self.arm.servo_j(qn)
+                    q_cmd, self.target, servoed = qn, qn, True
+                except ArmError:
+                    status = 'NUDGE: clear the robot stop on the pendant first, then nudge'
+        g_cmd = self.input.nudge_gripper(g_cmd, period)
+        self.gripper.command(g_cmd)
+        return q_cmd, g_cmd, status, servoed
+
     def _blocker(self, state: RobotState) -> Violation | None:
         """What still prevents a resume: the robot's own state, or a gripper or F/T sensor fault."""
         return self.safety.robot_condition(state) or self._device_fault()
@@ -358,6 +385,7 @@ class TeleopSession:
                 if self.resume_request.is_set():
                     self.resume_request.clear()
                     resume = True
+                nudging = self.nudge_key is not None and self.nudge_key.held()
 
                 if self.estop.is_set():
                     stop(Violation('estop'))
@@ -376,6 +404,7 @@ class TeleopSession:
                     return
 
                 if pause is not None:
+                    inp.hold(q_cmd)                 # keep the leader gap live for the display
                     blocker = self._blocker(state)
                     changed = cause(blocker) != waiting_for
                     if changed:                     # the log keeps each change: what the robot said
@@ -384,7 +413,11 @@ class TeleopSession:
                             log.info('teleop: the stop is cleared: %s', resume_hint)
                         else:
                             log.warning('teleop: still paused: %s', describe(blocker))
-                    if blocker is not None:
+                    servoed = False
+                    if nudging:                     # recovery: creep toward the leader, past the pause
+                        q_cmd, g_cmd, self.status, servoed = self._nudge_paused(q_cmd, g_cmd, state, period)
+                        servoing = servoing or servoed
+                    elif blocker is not None:
                         self.status = f'PAUSED: {describe(blocker)} Then {resume_hint}.'
                         if blocker.reason == 'robot_link' and now - relinked > 1.0:
                             relinked = now          # fresh data is what clears it: reconnect, no upload
@@ -409,7 +442,8 @@ class TeleopSession:
                                 rec.log_event('resume')
                                 log.info('teleop: resumed')
                     rec.log_tick(now, state.q, state.qd, state.tcp_pose, state.wrench, state.gripper,
-                                 None, None, int(Mode.HOLD), loop_dt, state.ft)
+                                 q_cmd.copy() if servoed else None, g_cmd if servoed else None,
+                                 int(Mode.SERVO if servoed else Mode.HOLD), loop_dt, state.ft)
                     self.arm.wait_period(token)
                     continue
 
@@ -422,7 +456,11 @@ class TeleopSession:
                     g_cmd = inp.gripper(g_cmd, period)
                 else:
                     inp.hold(q_cmd)
-                    if blocked is not None:
+                    if nudging:                     # recovery: creep a not-following arm to the leader
+                        q_next = inp.nudge(q_cmd, period)
+                        g_cmd = inp.nudge_gripper(g_cmd, period)
+                        self.status = 'NUDGING toward the leader (recovery)'
+                    elif blocked is not None:
                         blocked, self.status = None, None
 
                 if q_next is not None:

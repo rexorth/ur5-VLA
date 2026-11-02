@@ -236,6 +236,64 @@ def test_held_key_reads_the_x_server():
         key.close()
 
 
+class FakePedal:
+    def __init__(self):
+        self.down = False
+
+    def held(self):
+        return self.down
+
+    def close(self):
+        pass
+
+
+def test_pedal_deadman_needs_a_pedal():
+    with pytest.raises(ValueError, match='no pedal'):
+        LeaderInput(_cfg({'deadman': 'pedal'}), GelloSource(SimLeaderArm(HOME)))
+
+
+def test_pedal_deadman_drives_the_arm_like_a_held_key():
+    from ur5vla import cli
+    cfg = _cfg({'deadman': 'pedal'})
+    pedal = FakePedal()
+    leader = SimLeaderArm(HOME)
+    inp = LeaderInput(cfg, GelloSource(leader), None, pedal=pedal)
+    inp.begin()
+    rec = Rec()
+    assert not inp.poll(rec).held
+    pedal.down = True
+    c = inp.poll(rec)
+    assert c.held and c.pressed
+    assert 'hold the foot pedal' in inp.legend()
+    assert inp.resume_hint() == 'press the foot pedal (or r) to resume'
+    _follow(inp, HOME.copy(), 3)
+    assert inp.engaged
+    pedal.down = False
+    inp.poll(rec)
+    inp.hold(HOME)
+    assert not inp.engaged and 'Hold the foot pedal to follow' in inp.notice
+    devices = _devices_with_pedal(pedal)
+    assert cli._keys_text(devices) == ('keys: hold the foot pedal to move, [space]/[e] e-stop, '
+                                       '[d] done, Ctrl-C e-stop')
+
+
+def _devices_with_pedal(pedal):
+    from ur5vla import cli
+    devices = cli._Devices()
+    devices.pedal = pedal
+    return devices
+
+
+def test_pedal_held_is_fail_safe_when_the_reader_stalls():
+    from ur5vla.keys import PedalDeadman
+    pedal = PedalDeadman()                                   # not started: no evdev, no device
+    assert pedal.held() is False                             # up by default
+    pedal._held, pedal._t = True, time.monotonic()
+    assert pedal.held() is True                              # held, heartbeat fresh
+    pedal._t = time.monotonic() - 1.0                        # reader stalled / pedal gone
+    assert pedal.held() is False                             # counts as released
+
+
 def test_the_trigger_drives_the_gripper_only_while_following():
     cfg = _cfg({'gripper_channel': 6, 'gripper_open_deg': 10, 'gripper_closed_deg': 60, 'engage_deg': 5})
     leader = SimLeaderArm(HOME + np.deg2rad([20, 0, 0, 0, 0, 0]), gripper=0.7)
@@ -442,7 +500,77 @@ def test_display_lines():
     _follow(inp, HOME.copy(), 2)
     text = panels.leader_lines(inp)
     assert 'not following' in text and 'leader +25.0' in text and 'elbow' in text
-    assert 'elbow +25 deg off' in cli._leader_flag(inp)
+    flag = cli._leader_flag(inp)                     # the one-line matrix: every joint's offset
+    assert 'align all within 10 deg' in flag and 'elb   +25' in flag and 'base    +0' in flag
     leader.set(HOME)
     _follow(inp, HOME.copy(), 2)
     assert 'following' in panels.leader_lines(inp) and cli._leader_flag(inp).startswith('FOLLOWING')
+
+
+def test_nudge_steps_toward_the_leader_and_follows_the_trigger():
+    cfg = _cfg({'gripper_channel': 6, 'gripper_open_deg': 0, 'gripper_closed_deg': 40})
+    leader = SimLeaderArm(HOME + np.deg2rad([0, 0, 0, 0, 0, 30]), gripper=0.7)
+    inp = LeaderInput(cfg, GelloSource(leader))
+    inp.begin()
+    inp.poll(Rec())
+    dt = 0.008
+    step = inp.nudge(HOME.copy(), dt) - HOME
+    assert step[5] == pytest.approx(inp.nudge_speed * dt)                 # toward the leader, clamped
+    assert np.allclose(step[:5], 0.0)                                     # the matched joints don't move
+    assert inp.nudge_gripper(0.0, dt) == pytest.approx(0.7)               # gripper follows the trigger
+    leader.set(HOME)                                                      # already there: no step
+    inp.poll(Rec())
+    assert inp.nudge(HOME.copy(), dt) is None
+
+
+class _Held:
+    def __init__(self, held=True):
+        self._held = held
+
+    def held(self):
+        return self._held
+
+    def close(self):
+        pass
+
+
+def test_nudge_creeps_a_not_following_arm_to_the_leader(tmp_path):
+    cfg = _cfg({'deadman': 'button'})                                     # button unpressed: not following
+    leader = SimLeaderArm(HOME + np.deg2rad([0, 0, 0, 0, 0, 20]))
+    s = TeleopSession(cfg, SimArm(cfg.robot), NoGripper(), None,
+                      input=LeaderInput(cfg, GelloSource(leader)), nudge_key=_Held(True))
+    rec = EpisodeRecorder(tmp_path / 'ep', {}, cfg.logging)
+    rec.start({'kind': 'demo', 'prompt': 'p'})
+    s.run_episode(rec, 0.5, pause_on_stop=True)
+    rec.finish({})
+    wr3 = np.rad2deg(np.load(rec.dir / TICKS)['q_cmd'][:, 5])
+    assert wr3[-1] > wr3[0] and 2 < wr3[-1] < 20                          # crept toward +20, not overshoot
+
+
+def test_nudge_off_leaves_a_not_following_arm_put(tmp_path):
+    cfg = _cfg({'deadman': 'button'})
+    leader = SimLeaderArm(HOME + np.deg2rad([0, 0, 0, 0, 0, 20]))
+    s = TeleopSession(cfg, SimArm(cfg.robot), NoGripper(), None,
+                      input=LeaderInput(cfg, GelloSource(leader)), nudge_key=_Held(False))
+    rec = EpisodeRecorder(tmp_path / 'ep', {}, cfg.logging)
+    rec.start({'kind': 'demo', 'prompt': 'p'})
+    s.run_episode(rec, 0.3, pause_on_stop=True)
+    rec.finish({})
+    wr3 = np.rad2deg(np.load(rec.dir / TICKS)['q_cmd'][:, 5])
+    assert np.allclose(wr3, 0.0, atol=0.01)                              # not held -> arm stays home
+
+
+def test_nudge_cannot_move_a_hardware_stopped_arm(tmp_path):
+    cfg = _cfg({'deadman': 'button'})
+    leader = SimLeaderArm(HOME + np.deg2rad([0, 0, 0, 0, 0, 20]))
+    arm = SimArm(cfg.robot)
+    arm.simulate_stop()                                                  # protective stop: servoJ refused
+    s = TeleopSession(cfg, arm, NoGripper(), None,
+                      input=LeaderInput(cfg, GelloSource(leader)), nudge_key=_Held(True))
+    rec = EpisodeRecorder(tmp_path / 'ep', {}, cfg.logging)
+    rec.start({'kind': 'demo', 'prompt': 'p'})
+    result = s.run_episode(rec, 0.3, pause_on_stop=True)
+    rec.finish({})
+    assert result.pauses >= 1
+    assert np.allclose(arm.read_state().q, HOME, atol=1e-9)              # refused until cleared on the pendant
+    assert 'pendant' in (s.status or '')                                 # tells the operator why
