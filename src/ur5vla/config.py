@@ -253,7 +253,7 @@ class FTSensorConfig:
 
 
 LEADER_TYPES = ('none', 'gello_as5600')
-LEADER_DEADMAN = ('keyboard', 'gamepad', 'button', 'none')
+LEADER_DEADMAN = ('keyboard', 'pedal', 'gamepad', 'button', 'none')
 OPERATOR_KEYS = ('e', 'd', 'r')     # keys.py commands: a keyboard deadman can't be one of them
 GELLO_UR_SIGNS = [1, 1, -1, 1, 1, 1]
 GELLO_UR_CALIBRATION_DEG = [0.0, -90.0, 90.0, -90.0, -90.0, 0.0]
@@ -278,26 +278,50 @@ class LeaderConfig:
     gripper_open_deg: float | None = None
     gripper_closed_deg: float | None = None
     # What must be held for the arm to follow: a key (deadman_key, an X keysym name; read from
-    # the desktop session wherever the focus is), the gamepad's deadman button (teleop.buttons),
-    # a button wired to the ESP32 (deadman_button: its bit, 1 = D1), or nothing.
+    # the desktop session wherever the focus is), a USB foot pedal (pedal_*, read straight off
+    # /dev/input), the gamepad's deadman button (teleop.buttons), a button wired to the ESP32
+    # (deadman_button: its bit, 1 = D1), or nothing.
     deadman: str = 'keyboard'
     deadman_key: str = 'space'
     deadman_button: int = 1
+    # deadman: pedal. The pedal is an HID device held down while pressed; we read it directly via
+    # evdev (needs the `input` group and the `pedal` extra), so the signal is focus-independent, and
+    # grab it so its key never reaches other windows while teleop runs. Program the pedal to an inert
+    # key like F13 (it types nothing) with the `footswitch` tool -- see docs/procedures.md. pedal_name
+    # is a substring of the device name (ls /dev/input/by-id); pedal_key is the evdev key it sends.
+    pedal_name: str = 'FootSwitch'
+    pedal_key: str = 'KEY_F13'
+    pedal_grab: bool = True
     done_button: int | None = None  # an ESP32 button that ends the episode, like the gamepad's done
     engage_deg: float = 10.0        # the arm takes over once every joint is within this of it
     disengage_deg: float = 30.0     # and lets go if the leader gets this far ahead
     max_joint_speed_deg_s: float = 90.0
     catch_up_deg_s: float = 20.0    # the speed it closes the gap at after taking over
     stale_s: float = 0.1            # an encoder without a good reading this long: let go
+    # Recovery: a key held (an X keysym, like deadman_key) that creeps the arm toward the leader's
+    # pose while the arm is paused or not following, to back off a stop or re-line-up a lost arm.
+    # It goes through the usual joint/step/workspace checks but past the force/torque pause, and
+    # can't move the arm while a hardware stop is uncleared. '' = off. Needs the desktop (X11).
+    nudge_key: str = 'n'
+    nudge_deg_s: float = 15.0       # how fast the recovery nudge moves
 
     def __post_init__(self):
         if self.type not in LEADER_TYPES:
             raise ConfigError(f'leader.type must be one of {LEADER_TYPES}, got {self.type!r}')
         if self.deadman not in LEADER_DEADMAN:
             raise ConfigError(f'leader.deadman must be one of {LEADER_DEADMAN}, got {self.deadman!r}')
+        if self.deadman == 'pedal' and not (self.pedal_name and self.pedal_key):
+            raise ConfigError('leader.deadman is pedal: set leader.pedal_name and leader.pedal_key')
         if self.deadman_key.lower() in OPERATOR_KEYS:
             raise ConfigError(f'leader.deadman_key {self.deadman_key!r} is an operator key '
                               f'({", ".join(OPERATOR_KEYS)}: e-stop, done, resume); pick another')
+        if self.nudge_key and self.nudge_key.lower() in OPERATOR_KEYS:
+            raise ConfigError(f'leader.nudge_key {self.nudge_key!r} is an operator key '
+                              f'({", ".join(OPERATOR_KEYS)}); pick another')
+        if self.nudge_key and self.nudge_key == self.deadman_key:
+            raise ConfigError('leader.nudge_key must differ from deadman_key')
+        if self.nudge_deg_s <= 0:
+            raise ConfigError('leader.nudge_deg_s must be > 0')
         for key in ('channels', 'joint_signs', 'calibration_q_deg'):
             if len(getattr(self, key)) != 6:
                 raise ConfigError(f'leader.{key} needs 6 values')
@@ -332,6 +356,34 @@ class LoggingConfig:
 
 
 @dataclass
+class BaseFrame:
+    """Where the robot base sits in the sim scene, matching the real mounting: a translation and a
+    roll-pitch-yaw applied on top of the scene's own base placement (rotated in place about the
+    mount, then shifted). rpy is about the scene's x, y, z axes, applied roll then pitch then yaw."""
+    xyz_mm: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])    # nudge, scene x y z
+    rpy_deg: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])   # roll, pitch, yaw
+
+    def __post_init__(self):
+        for key in ('xyz_mm', 'rpy_deg'):
+            if not isinstance(getattr(self, key), (list, tuple)) or len(getattr(self, key)) != 3:
+                raise ConfigError(f'sim.base.{key} needs 3 values')
+
+
+@dataclass
+class SimConfig:
+    """The MuJoCo dry-run of the leader arm (scripts/leader_mujoco.py): where its scene is and how
+    the robot sits in it, so the sim matches the real cell. The arm still starts at
+    robot.start_q_deg and mirrors the leader; nothing here touches the real robot."""
+    scene: str | None = None        # path to the UR5 MuJoCo scene XML; null = the script's default
+    base: BaseFrame = field(default_factory=BaseFrame)   # the robot base's pose in the scene
+    fps: float = 60.0               # viewer update rate
+
+    def __post_init__(self):
+        if isinstance(self.base, dict):
+            self.base = from_dict(BaseFrame, self.base, 'sim.base')
+
+
+@dataclass
 class RunConfig:
     robot: RobotConfig
     cameras: dict[str, dict[str, Any]]  # logical name -> {type: ..., driver params}
@@ -343,13 +395,14 @@ class RunConfig:
     gripper: GripperConfig = field(default_factory=GripperConfig)
     ft_sensor: FTSensorConfig = field(default_factory=FTSensorConfig)
     leader: LeaderConfig = field(default_factory=LeaderConfig)
+    sim: SimConfig = field(default_factory=SimConfig)
     prompt: str = ''
     source: str | None = None           # path the config was loaded from
     raw: dict[str, Any] = field(default_factory=dict)  # as loaded, saved with every episode
 
 
 SECTIONS = ('robot', 'cameras', 'policy', 'control', 'safety', 'logging', 'teleop', 'gripper', 'ft_sensor',
-            'leader', 'prompt')
+            'leader', 'sim', 'prompt')
 ROTATIONS = (0, 90, 180, 270)       # cameras.<name>.rotate, degrees clockwise
 
 
@@ -378,6 +431,7 @@ def parse(raw: dict[str, Any], source: str | None = None) -> RunConfig:
         gripper=from_dict(GripperConfig, raw.get('gripper'), 'gripper'),
         ft_sensor=from_dict(FTSensorConfig, raw.get('ft_sensor'), 'ft_sensor'),
         leader=from_dict(LeaderConfig, raw.get('leader'), 'leader'),
+        sim=from_dict(SimConfig, raw.get('sim'), 'sim'),
         prompt=str(raw.get('prompt') or ''),
         source=source,
         raw=raw,

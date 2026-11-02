@@ -1,5 +1,5 @@
 """Single-key operator commands while an episode runs: the software e-stop and "episode done";
-and a key held down as a deadman (HeldKey).
+and a deadman held down to move the arm -- a keyboard key (HeldKey) or a USB foot pedal (PedalDeadman).
 
 The terminal goes into cbreak mode for the episode only, so keys act without Enter while Ctrl-C
 still raises SIGINT. This is a convenience stop, not a safety-rated one: the pendant e-stop is.
@@ -131,3 +131,102 @@ class HeldKey:
     def _run(self) -> None:
         while not self._stop.wait(self.POLL_S):
             self._poll()
+
+
+class PedalDeadman:
+    """A USB foot-pedal deadman, read straight from /dev/input via evdev: the pedal is an HID device
+    that holds a key down while pressed (program it to an inert key like F13 so it types nothing in
+    apps -- see docs/procedures.md). We read the device directly, so the held signal doesn't depend
+    on which window has focus, and grab it so the key never reaches other apps while teleop runs.
+
+    held() is False if the pedal is up, if the reader thread has stalled, or if the pedal is gone
+    (fail safe). The reader heartbeats `_t` every loop, so a stall or a thread death goes stale
+    within STALE_S whether or not the key is auto-repeating. Needs the user in the `input` group and
+    the `evdev` package (the `pedal` extra). start()/held()/close() match HeldKey."""
+
+    STALE_S = 0.1
+
+    def __init__(self, name_contains: str = 'FootSwitch', key: str = 'KEY_F13', grab: bool = True):
+        self.name_contains = name_contains
+        self.key_name = key
+        self.grab = grab
+        self._code = 0
+        self._devs: list = []
+        self._held = False
+        self._t = 0.0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> PedalDeadman:
+        try:
+            from evdev import InputDevice, ecodes, list_devices
+        except ImportError as exc:
+            raise RuntimeError('no evdev: the foot-pedal deadman reads the pedal from /dev/input. '
+                               'Install the pedal extra: uv pip install --python <venv> evdev') from exc
+        code = ecodes.ecodes.get(self.key_name)
+        if code is None:
+            raise RuntimeError(f'unknown pedal key {self.key_name!r} (an evdev key name, e.g. KEY_F13)')
+        self._code = code
+        seen = []
+        for path in list_devices():
+            try:
+                dev = InputDevice(path)
+            except OSError:
+                continue            # a node we can't open (not ours): skip it
+            keys = dev.capabilities().get(ecodes.EV_KEY, [])
+            if self.name_contains.lower() in dev.name.lower() and code in keys:
+                self._devs.append(dev)
+            else:
+                seen.append(dev.name)
+                dev.close()
+        if not self._devs:
+            raise RuntimeError(
+                f'no foot pedal found: no readable /dev/input device is named like {self.name_contains!r} '
+                f'and sends {self.key_name}. Plugged in, and programmed to {self.key_name} (footswitch '
+                f'-k f13)? In the `input` group (id | grep input)? Saw: {", ".join(sorted(set(seen))) or "nothing"}')
+        if self.grab:
+            for dev in self._devs:
+                try:
+                    dev.grab()
+                except OSError as exc:
+                    log.warning('pedal: could not grab %s (%s); its key may reach other windows',
+                                dev.path, exc)
+        self._t = time.monotonic()
+        self._thread = threading.Thread(target=self._run, name='pedal', daemon=True)
+        self._thread.start()
+        return self
+
+    def held(self) -> bool:
+        return self._held and time.monotonic() - self._t < self.STALE_S
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        for dev in self._devs:
+            try:
+                if self.grab:
+                    dev.ungrab()
+            except OSError:
+                pass
+            try:
+                dev.close()
+            except OSError:
+                pass
+        self._devs = []
+
+    def _run(self) -> None:
+        from evdev import ecodes
+        fds = {dev.fd: dev for dev in self._devs}
+        while not self._stop.is_set():
+            self._t = time.monotonic()      # heartbeat: a stall or dead thread goes stale, fail safe
+            ready, _, _ = select.select(list(fds), [], [], self.STALE_S / 2)
+            for fd in ready:
+                try:
+                    for ev in fds[fd].read():
+                        if ev.type == ecodes.EV_KEY and ev.code == self._code:
+                            self._held = ev.value != 0      # 1 down, 2 repeat, 0 up
+                except OSError:
+                    self._held = False      # the pedal went away: fail safe, and stop reading it
+                    self._t = 0.0
+                    return

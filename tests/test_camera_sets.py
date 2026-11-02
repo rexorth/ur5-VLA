@@ -21,6 +21,35 @@ def test_uvc_is_the_webcam_driver_name():
     assert isinstance(build_camera('board', {'type': 'mcu_uvc'}), UVCCamera)
 
 
+def test_start_cameras_stops_the_started_ones_when_a_later_one_fails(monkeypatch):
+    """A missing camera must not leave an already-started one running: its background threads abort
+    the whole process on the way out (depthai core-dumps)."""
+    from ur5vla import cli
+
+    class FakeCam:
+        def __init__(self, name, fail=False):
+            self.name, self.fail = name, fail
+            self.started = self.stopped = self.automatic = False
+
+        def start(self):
+            if self.fail:
+                raise RuntimeError('No device connected')
+            self.started = True
+
+        def stop(self):
+            self.stopped = True
+
+        def latest(self):
+            return object()
+
+    good, bad = FakeCam('base'), FakeCam('wrist', fail=True)
+    monkeypatch.setattr(cli, 'build_cameras', lambda specs: {'base': good, 'wrist': bad})
+    cfg = config_mod.parse({'cameras': {'base': {'type': 'synthetic'}, 'wrist': {'type': 'synthetic'}}})
+    with pytest.raises(RuntimeError, match='No device connected'):
+        cli._start_cameras(cfg)
+    assert good.started and good.stopped            # the started camera was torn down, not left live
+
+
 def test_the_recorder_gets_a_writer_per_camera_and_reports_drops(tmp_path):
     cams = {n: SyntheticCamera(n, width=8, height=6, fps=30) for n in ('a', 'b', 'c', 'd', 'e')}
     rec = EpisodeRecorder(tmp_path / 'ep', cams, config_mod.LoggingConfig())

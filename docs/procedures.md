@@ -801,6 +801,18 @@ ESP32's buttons, and what is wrong with any encoder: `no encoder answering` (wir
 the magnet `not detected`, `too weak` or `too strong`. Turn each joint and watch its channel move.
 `leader.channels` lists the channel of each joint, base first.
 
+**Gauge each encoder.** For numbers (each encoder's noise and the magnet's strength, with a
+verdict per channel), quit everything else that reads the ESP32 and, from
+`third_party/gello_software`:
+
+```bash
+python third_party/gello_software/scripts/encoder_quality.py          # --duration 20 > encoders.txt: one table, to keep
+```
+
+Let go of the arm to read the noise, then turn each joint slowly through its travel (about 10 s a
+turn). The magnet is best with its AGC mid-range (0..128 on 3.3 V) and steady all the way round;
+one that swings means the magnet is off the axis or tilted. To test for wiring/signal issues, lower the I2C bus clock (`--i2c 100000`, or type `i2c 100000` while it runs): if failed reads (`errs`) or noise clear at a slower clock, that channel's wiring is marginal rather than a bad encoder. The script's docstring explains every column.
+
 **Calibrate.** Put the leader in GELLO's UR calibration pose (`leader.calibration_q_deg`,
 0 −90 90 −90 −90 0: its pictures are in the gello_software README) and hold it still:
 
@@ -826,15 +838,16 @@ in `leader.joint_signs` and calibrate again.
 **Drive the arm.**
 
 ```bash
-ur5vla teleop -c configs/cell.yaml --leader [--view] [--dry-run] [--deadman keyboard|gamepad|button|none]
+ur5vla teleop -c configs/cell.yaml --leader [--view] [--dry-run] [--deadman keyboard|pedal|gamepad|button|none]
 ur5vla demo   -c configs/cell.yaml --leader --prompt "..." [--episodes 20] ...
 ```
 
 - **Taking over.** The arm holds until the deadman is held and every leader joint is within
-  `leader.engage_deg` (10°) of the arm's. Until then the status says which joint is how far off,
-  and with `--view` the LEADER block shows each joint's gap. `teleop` first offers to move the arm
-  to the leader (a checked, confirmed `moveJ`); `demo` moves it to the start pose instead, so
-  bring the leader to that pose. Then the arm starts slowly (`catch_up_deg_s`) and speeds up to
+  `leader.engage_deg` (10°) of the arm's. Until then the pose line shows **every joint's** offset
+  (base shld elb wr1 wr2 wr3, degrees), updated continuously, so you can line them all up at once;
+  `--view`'s LEADER block shows the same gaps as bars. `teleop` first offers to move the arm to
+  the leader (a checked, confirmed `moveJ`); `demo` moves it to the start pose instead, so bring
+  the leader to that pose. Then the arm starts slowly (`catch_up_deg_s`) and speeds up to
   `max_joint_speed_deg_s` within half a second.
 - **Following.** Up to `max_joint_speed_deg_s` per joint, slower if the TCP would pass
   `safety.max_tcp_speed_m_s`. Every target passes the same safety checks as gamepad teleop: at a
@@ -842,13 +855,29 @@ ur5vla demo   -c configs/cell.yaml --leader --prompt "..." [--episodes 20] ...
 - **Letting go.** Releasing the deadman, a pause, the leader getting `disengage_deg` (30°) ahead
   (it moved faster than the arm may, or on past a limit), or an encoder not reading. The arm
   stops; bring the leader back to it to take over again.
+- **Recovering** (`leader.nudge_key`, default `n`), held to creep the arm toward the leader's
+  current pose at `leader.nudge_deg_s` while it is **paused or not following** — to back off after
+  a stop or re-line-up a lost arm. The gripper follows the trigger meanwhile, so a part clamped
+  under force can be released to clear a force/torque pause. It still obeys the joint, step,
+  workspace and TCP-speed checks, but moves past the force/torque pause; it **cannot** move the arm
+  while a hardware stop (protective/e-stop) is uncleared — clear that on the pendant first. Needs
+  the desktop (X11), like the keyboard deadman.
 - **Deadman** (`leader.deadman`), held while you move the leader. No gamepad is needed:
-  - `keyboard` (the default): the space bar (`deadman_key`). It is read from the desktop session
+  - `keyboard`: the space bar (`deadman_key`). It is read from the desktop session
     (X11), which reports true press and release; a terminal can't, as it sees only auto-repeat. So
     it counts wherever the keyboard focus is, the terminal, the camera window or another
-    program, and a USB foot switch that types the key works too. Space is then no longer an
-    e-stop key: `e` and Ctrl-C are. Run from the machine's desktop: over SSH there is no
-    session to read.
+    program. Space is then no longer an e-stop key: `e` and Ctrl-C are. Run from the machine's
+    desktop: over SSH there is no session to read.
+  - `pedal` (the default here): a USB foot pedal, read straight from `/dev/input` (`evdev`) so the
+    held signal doesn't depend on keyboard focus, and **grabbed** so its key never reaches other
+    windows while teleop runs. Needs the user in the `input` group (`sudo usermod -aG input $USER`,
+    then log out/in) and the `pedal` extra (`uv pip install --python <venv> evdev`). `pedal_name` is
+    a substring of the device name (`ls /dev/input/by-id`); `pedal_key` is the evdev key it sends.
+    **Program the pedal to an inert key first** so it types nothing: build `rgerganov/footswitch`
+    (`sudo apt install libhidapi-dev && git clone … && cd footswitch && mkdir -p obj && make
+    footswitch`), read it with `sudo ./footswitch -r`, then `sudo ./footswitch -2 -k f13` (the single
+    pedal is switch 2). F13 shows up as `KEY_F13`, which is `pedal_key`'s default. Unplug it and
+    teleop refuses to start ("no foot pedal found").
   - `gamepad`: its deadman button (LB).
   - `button`: a push button from the ESP32's D1 to GND (`deadman_button: 1`), e.g. on the
     handle.
@@ -863,11 +892,29 @@ ur5vla demo   -c configs/cell.yaml --leader --prompt "..." [--episodes 20] ...
 - Demos record the commanded targets as actions, as with the gamepad; `meta.json` says
   `teleop_input: leader`.
 
+**See it in MuJoCo (dry run).** To watch the arm follow the leader with no robot connected — a
+visual check of the calibration, the joint signs and the ranges, and the trigger — run the arm
+in MuJoCo and mirror the leader into it:
+
+```bash
+.venv-lerobot/bin/python scripts/leader_mujoco.py -c configs/cell.yaml
+```
+
+The cell file's `sim:` block holds the settings: the MuJoCo `scene` (the UR5 + 2F-85 from the
+sibling `ur5-workspace` repo, the same CB3 UR5 as [kinematics](architecture.md)), `base` (an `xyz_mm` + `rpy_deg` frame that places the robot to match how it is actually mounted on the desk), and the viewer `fps`;
+`--scene` / `--base-yaw` / `--fps` override them for one run. The arm starts at the cell's home
+(`robot.start_q_deg`) and is driven straight from the leader — no deadman, no engage, no safety
+layer; it is position-servoed to the leader and the gripper is stepped under physics, so the
+fingers move. Needs the `sim` extra's `mujoco` in the leader venv (`uv pip install --python
+.venv-lerobot/bin/python mujoco`) and a desktop (the viewer opens a window). For the full
+follower path (deadman, engage, safety) without a window,
+`ur5vla teleop --leader --dry-run` runs the real control loop against the numeric SimArm.
+
 **Flange demo.** One encoder turns the flange (wrist 3), geared down, through the same follower,
 checks and deadman:
 
 ```bash
-ur5vla flange-demo -c configs/cell.yaml --channel 2 [--ratio 4] [--sign -1] [--dry-run] [--deadman ...]
+ur5vla flange-demo -c configs/cell.yaml --channel 0 [--ratio 4] [--sign -1] [--dry-run] [--deadman ...]
 ```
 
 `--ratio 4`: four turns of the encoder turn the flange once. Hold space (the deadman, as above)
@@ -886,8 +933,11 @@ wherever the encoder is, so it never jumps, and nothing else moves. Try it with 
 | `calibration_q_deg` | `[0, -90, 90, -90, -90, 0]` | The pose `--calibrate` expects |
 | `gripper_channel` | `null` | The trigger's channel; `null`: gamepad buttons |
 | `gripper_open_deg` / `gripper_closed_deg` | `null` | From `--calibrate` |
-| `deadman` | `keyboard` | `keyboard` / `gamepad` / `button` / `none` |
+| `deadman` | `keyboard` | `keyboard` / `pedal` / `gamepad` / `button` / `none` |
 | `deadman_key` | `space` | The key held with `deadman: keyboard`: an X keysym name (`space`, `Control_R`, `F12`, a letter; not `e`, `d` or `r`) |
+| `pedal_name` | `FootSwitch` | With `deadman: pedal`: a substring of the pedal's `/dev/input` name |
+| `pedal_key` | `KEY_F13` | With `deadman: pedal`: the evdev key it sends (program it with `footswitch`) |
+| `pedal_grab` | `true` | Grab the pedal so its key stays off the desktop while teleop runs |
 | `deadman_button` / `done_button` | `1` / `null` | ESP32 button bits: 0 the BOOT button, 1 D1, 2 D2 |
 | `engage_deg` | 10 | Take over once every joint is this close |
 | `disengage_deg` | 30 | Let go when the leader gets this far ahead |
