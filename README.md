@@ -30,9 +30,6 @@ To get started, follow [setup](docs/procedures.md#2-one-time-setup) and then
 
 ## Not done yet
 
-- Nothing has run against the real arm yet. Checked on the hardware on their own: the cameras
-  (OAK-D, D415), the gripper (activate, open and close with `ur5vla gripper`) and the LeRobot
-  server (a pi05_base plumbing check). Tests cover the logic and the wire formats.
 - `mcu_stream` camera driver (milestone 7, only if needed).
 - The v2.1 (openpi) dataset path is untested: it needs openpi's environment. v3.0 is tested.
 - An A/B trial scheduler; merging LoRA adapters for serving.

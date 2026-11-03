@@ -1,0 +1,32 @@
+# Gamepad teleoperation (`ur5vla teleop`, `ur5vla demo`). Numbers below are an Xbox One pad over
+# USB (xpad driver); run `ur5vla gamepad` to see yours live. Each robot axis
+# is a sum of terms, clipped to [-1, 1]: {axis: i}, {axis: i, trigger: true} (0..1), {button: i},
+# each with an optional sign: -1. Listing a robot axis replaces its default; leave one out = unused.
+# While buttons.alt is held, alt_axes replaces the robot axes it names ([] = off).
+# This block is 6-DoF: the right stick and triggers translate, the left stick rotates, and holding
+# X turns the left stick's left/right from yaw into roll. (X shares the right thumb with the right
+# stick, so it only changes the left stick.) For top-down demos, -t configs/teleop/4dof.yaml
+# locks pitch and yaw unless X is held.
+teleop:
+  device: null                # /dev/input/jsN; null = the first joystick found
+  frame: tool                 # starting frame (base | tool); the toggle_frame button flips it
+  max_linear_m_s: 0.1        # at full deflection; deliberately slow for bring-up
+  max_angular_deg_s: 15
+  linear_accel_m_s2: 0.5
+  angular_accel_deg_s2: 90
+  max_joint_speed_deg_s: 45
+  slow_scale: 0.25            # while the slow button is held
+  deadzone: 0.12
+  curve: 1.5                  # stick response |x|^curve: finer near the center
+  axes:
+    x:  [{axis: 3, sign: 1}]                                         # right stick left/right
+    y:  [{axis: 4, sign: 1}]                                         # right stick up/down
+    z:  [{axis: 5, trigger: true}, {axis: 2, trigger: true, sign: -1}]  # RT forward, LT back
+    rx: [{axis: 1, sign: 1}]                                         # left stick up/down: pitch
+    ry: [{axis: 0, sign: 1}]                                         # left stick left/right: yaw
+  alt_axes:                                                          # while X is held:
+    ry: []
+    rz: [{axis: 0, sign: 1}]                                         # left stick left/right: roll
+  gripper: [{button: 0}, {button: 1, sign: -1}]                       # A close, B open
+  gripper_mode: snap                                                 # A closes fully, B opens fully
+  buttons: {deadman: 4, slow: 5, toggle_frame: 6, done: 7, alt: 2}    # LB (hold), RB, View, Menu, X (hold)

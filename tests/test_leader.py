@@ -361,6 +361,68 @@ def test_session_with_the_trigger_commands_the_gripper(tmp_path):
     assert grip.position() > 0.3                                         # on its way to 0.6
 
 
+class FakeFT:
+    """A stand-in F/T sensor reporting a fixed wrench (flange frame), for the compliance test."""
+
+    def __init__(self, wrench):
+        self._w = np.asarray(wrench, dtype=float)
+
+    def connect(self):
+        pass
+
+    def close(self):
+        pass
+
+    def wrench(self):
+        return self._w.copy()
+
+    def fault(self):
+        return None
+
+    def rated_range(self):
+        return None
+
+
+def test_compliance_makes_the_arm_yield_to_force_within_bounds(tmp_path):
+    """With robot.compliance on, a steady external force pushes the executed command off the leader's
+    pose (the arm gives like a spring) by a bounded amount, without tripping a block."""
+    from ur5vla.control.compliance import AdmittanceController
+    cfg = _cfg(safety={'ft_limit_n': 1000, 'ft_limit_nm': 1000, 'max_tracking_error_deg': None})
+    cfg.robot.compliance = config_mod.ComplianceConfig(enabled=True, stiffness_n_m=500, deadband_n=1,
+                                                       max_offset_m=0.05)
+    leader = ScriptedLeader(lambda t: HOME)                 # engaged and stationary at HOME
+    ft = FakeFT([15.0, 0, 0, 0, 0, 0])                      # steady push along flange x
+    ctrl = AdmittanceController(cfg.robot.compliance, cfg.safety.tcp_offset_m)
+    s = TeleopSession(cfg, SimArm(cfg.robot), NoGripper(), None,
+                      input=LeaderInput(cfg, GelloSource(leader)), ft_sensor=ft, compliance=ctrl)
+    rec = EpisodeRecorder(tmp_path / 'ep', {}, cfg.logging)
+    rec.start({'kind': 'demo', 'prompt': 'p'})
+    result = s.run_episode(rec, 1.0, pause_on_stop=True)
+    rec.finish({})
+    ticks = np.load(rec.dir / TICKS)
+    sent = ~np.isnan(ticks['q_cmd'][:, 0])
+    assert result.blocked == 0                                           # the spring stays inside the limits
+    assert np.rad2deg(np.abs(ticks['q_cmd'][sent] - HOME)).max() > 0.5   # the command yielded off the leader pose
+    tcp = np.array([tool_point(q, np.asarray(cfg.safety.tcp_offset_m)) for q in ticks['q_cmd'][sent]])
+    give = np.linalg.norm(tcp - tcp[0], axis=1).max()
+    assert 0.01 < give < 0.05                                            # ~F/stiffness = 0.028 m, bounded
+
+
+def test_compliance_off_by_default_leaves_teleop_rigid(tmp_path):
+    cfg = _cfg()
+    ft = FakeFT([15.0, 0, 0, 0, 0, 0])
+    s = TeleopSession(cfg, SimArm(cfg.robot), NoGripper(), None,
+                      input=LeaderInput(cfg, GelloSource(ScriptedLeader(lambda t: HOME))), ft_sensor=ft)
+    assert s.compliance is None
+    rec = EpisodeRecorder(tmp_path / 'ep', {}, cfg.logging)
+    rec.start({'kind': 'demo', 'prompt': 'p'})
+    s.run_episode(rec, 0.5, pause_on_stop=True)
+    rec.finish({})
+    ticks = np.load(rec.dir / TICKS)
+    sent = ~np.isnan(ticks['q_cmd'][:, 0])
+    assert np.rad2deg(np.abs(ticks['q_cmd'][sent] - HOME)).max() < 0.05   # rigid: holds the leader pose
+
+
 # ---- the flange demo ----
 
 class FakeDriver:

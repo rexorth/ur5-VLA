@@ -24,6 +24,7 @@ import logging
 import math
 import multiprocessing as mp
 import os
+import queue
 import signal
 import threading
 import time
@@ -43,6 +44,11 @@ POLL_S = 0.005              # how often the sender looks for new frames
 WARN, ALERT, GOOD = '\x01', '\x02', '\x03'
 COLOURS = {WARN: '#ffcc00', ALERT: '#ff4040', GOOD: '#40e040'}
 
+# ask() state. Per-process identities (spawn re-imports this module), never sent across the pipe —
+# only a str or None ever crosses it, so comparing these across processes never happens.
+_UNSET = object()       # drain: no prompt message in this batch; __init__: no prompt set yet
+_CLOSED = object()      # the window closed while ask() was waiting for an answer
+
 
 class CameraViewer:
     def __init__(self, cameras: dict[str, CameraSource], title: str = 'ur5vla', fps: float = 30.0,
@@ -58,6 +64,10 @@ class CameraViewer:
         self._bindings: dict[str, Callable[[], None]] | None = None
         self._info: tuple[str, ...] | None = None
         self._info_sent: tuple[str, ...] | None = None
+        # The modal prompt (ask): a str to show, None to clear it, _UNSET for "nothing to send".
+        self._prompt: object = _UNSET
+        self._prompt_sent: object = _UNSET
+        self._answer: queue.Queue | None = None     # set while ask() waits for a key
         self._stop = threading.Event()
         self._proc = None
         self._frames = None         # our end: frames to the window
@@ -139,6 +149,9 @@ class CameraViewer:
         if self._info != self._info_sent:
             self._info_sent = self._info
             self._frames.send(('info', self._info_sent))
+        if self._prompt is not self._prompt_sent:   # a str or None (never _UNSET) crosses the pipe
+            self._prompt_sent = self._prompt
+            self._frames.send(('prompt', self._prompt_sent))
         now = time.monotonic()
         for name, cam in self.cameras.items():
             frame = cam.latest()
@@ -156,11 +169,40 @@ class CameraViewer:
             while not self._stop.is_set():
                 if not self._keys.poll(0.1):
                     continue
-                action = (self._bindings or {}).get(self._keys.recv())
+                key = self._keys.recv()
+                answer = self._answer
+                if answer is not None:      # a modal (ask) is waiting: this key answers it
+                    with contextlib.suppress(queue.Full):
+                        answer.put_nowait(key)
+                    continue
+                action = (self._bindings or {}).get(key)
                 if action is not None:
                     action()
         except (EOFError, OSError):         # the window is gone
-            pass
+            answer = self._answer
+            if answer is not None:          # unblock a waiting ask()
+                with contextlib.suppress(queue.Full):
+                    answer.put_nowait(_CLOSED)
+
+    def ask(self, text: str) -> bool | None:
+        """Show `text` as a modal in the window and block until a key answers it: True for Enter or
+        Space, False for any other key (Esc), None if there is no window or it closed first. One
+        ask at a time; the window's key bindings are suspended while it waits."""
+        if not self.is_open():
+            return None
+        self._answer = queue.Queue(1)
+        self._prompt = text
+        try:
+            while self.is_open():
+                try:
+                    key = self._answer.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                return None if key is _CLOSED else key in ('\r', '\n', ' ')
+            return None
+        finally:
+            self._answer = None
+            self._prompt = None             # _send_new then tells the window to clear the modal
 
 
 def grid_layout(n: int, width: int) -> tuple[int, int, int | None]:
@@ -180,21 +222,24 @@ def fit(width: int, height: int, box_w: float, box_h: float, upscale: bool = Tru
     return max(1, round(width * scale)), max(1, round(height * scale))
 
 
-def drain(conn, limit: int) -> tuple[dict[str, tuple[tuple[int, ...], float, bytes]], tuple[str, ...] | None]:
+def drain(conn, limit: int) -> tuple[dict[str, tuple[tuple[int, ...], float, bytes]], tuple[str, ...] | None, object]:
     """Read up to `limit` messages waiting in the pipe. Returns each camera's newest frame as
-    {name: (shape, t_capture, rgb bytes)}, and the newest info columns (None if none came).
+    {name: (shape, t_capture, rgb bytes)}, the newest info columns (None if none came), and the
+    newest modal prompt (a str to show, None to clear it, _UNSET if no prompt message came).
     Raises EOFError once the sender has closed."""
-    fresh, info = {}, None
+    fresh, info, prompt = {}, None, _UNSET
     for _ in range(limit):
         if not conn.poll():
             break
         msg = conn.recv()
         if msg[0] == 'info':
             info = msg[1]
+        elif msg[0] == 'prompt':
+            prompt = msg[1]
         else:
             _, name, shape, t = msg
             fresh[name] = (shape, t, conn.recv_bytes())
-    return fresh, info
+    return fresh, info, prompt
 
 
 def _window(frames, keys, names: list[str], title: str, width: int) -> None:
@@ -255,6 +300,26 @@ def _window(frames, keys, names: list[str], title: str, width: int) -> None:
             text.configure(state='disabled', height=max(len(lines), int(text.cget('height'))),
                            width=max(max(len(line) for line in lines), int(text.cget('width')), 1))
 
+    modal: dict[str, object] = {'frame': None}
+
+    def show_prompt(text) -> None:
+        """Replace any open modal; text None clears it. Centred, with a warning border, and a line
+        saying which keys answer. Enter/Space/Esc all carry a char, so on_key sends them back."""
+        existing = modal['frame']
+        if existing is not None:
+            existing.destroy()
+            modal['frame'] = None
+        if text is None:
+            return
+        frame = tk.Frame(root, bg='black', highlightbackground=COLOURS[WARN], highlightthickness=2)
+        tk.Label(frame, text=text, fg='white', bg='black', font='TkFixedFont', justify='center',
+                 padx=20, pady=(14, 4)).pack()
+        tk.Label(frame, text='[Enter]/[Space] = yes    [Esc] = no', fg=COLOURS[WARN], bg='black',
+                 font='TkFixedFont', padx=20, pady=(0, 14)).pack()
+        frame.place(relx=0.5, rely=0.5, anchor='center')
+        frame.lift()
+        modal['frame'] = frame
+
     def on_key(event) -> None:
         if event.char:
             with contextlib.suppress(OSError):
@@ -288,12 +353,14 @@ def _window(frames, keys, names: list[str], title: str, width: int) -> None:
     def pump() -> None:
         nonlocal last_caption
         try:
-            fresh, info = drain(frames, 4 * len(names) + 1)
+            fresh, info, prompt = drain(frames, 4 * len(names) + 1)
         except (EOFError, OSError):
             root.destroy()
             return
         if info is not None:
             show_info(info)
+        if prompt is not _UNSET:
+            show_prompt(prompt)
         now = time.monotonic()
         for name, (shape, t, data) in fresh.items():
             img = Image.frombuffer('RGB', (shape[1], shape[0]), data, 'raw', 'RGB', 0, 1)

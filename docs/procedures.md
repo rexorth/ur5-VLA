@@ -27,14 +27,29 @@ name the environment only where it matters.
 
 ### Config files
 
-- **Cell file** (`-c configs/cell.yaml`): robot, cameras, control, safety, teleop, gripper, F/T
-  sensor and logging.
+- **Cell config** (`-c`): robot, cameras, control, safety, teleop, gripper, F/T sensor and logging.
+  It is **split one file per section** under `configs/sections/`, pulled together by a **master**
+  that lists them under `include:`. `configs/default.yaml` is the master used **when no `-c` is
+  given**, so most commands need none:
+
+  ```
+  ur5vla teleop --leader
+  ur5vla run -p configs/policy/openpi.yaml --prompt "..."
+  ```
+
+  To swap a section, edit the master's `include` list (or a section file in place); to swap the
+  whole config for one run, pass `-c <other master>.yaml`. `include` takes a path or a list, relative
+  to the file that names it; includes merge in order (nested keys deep-merged, later wins), and a
+  master's own inline keys override its includes. A flat single-file config (no `include:`) still
+  works. `configs/cell.yaml` is now a thin alias for `configs/default.yaml` (kept so older commands
+  that pass `-c configs/cell.yaml` keep working). `ur5vla workspace --write` and
+  `ur5vla leader --calibrate --write` edit the section file the block actually lives in.
 - **Policy file** (`-p configs/policy/<name>.yaml`): used by the policy commands. It replaces the
-  cell file's `policy:` block, so an openpi run and a LeRobot run can't differ in anything else.
+  config's `policy:` block, so an openpi run and a LeRobot run can't differ in anything else.
 - **Teleop file** (`-t configs/teleop/<name>.yaml`): used by `gamepad`, `teleop` and `demo`. It
-  replaces the cell file's `teleop:` block the same way. `configs/teleop/4dof.yaml` is the
+  replaces the config's `teleop:` block the same way. `configs/teleop/4dof.yaml` is the
   top-down mapping for pick-and-place demos ([4.2](#42-ur5vla-teleop)).
-- **`configs/dry_run.yaml`** is a cell file with a simulated arm and synthetic cameras.
+- **`configs/dry_run.yaml`** is a flat config with a simulated arm and synthetic cameras.
 
 ### Global option
 
@@ -194,6 +209,7 @@ by that tolerance plus a margin.
 | `max_tcp_speed_m_s` | General limits → TCP speed | Pendant above ours |
 | `ft_limit_n` | General limits → force | Pendant above ours. With the sensor ([3.9](#39-ft-sensor)), checked from its zero at the calibration pose: 30–40 N plus the share of the gripper's weight the wrist can turn onto it. Without it, a joint-current estimate, untared and offset by the pose: keep a wide margin (the cell uses 90 N) |
 | `ft_limit_nm` | none | Torque at the sensor, from its zero at the calibration pose; only meaningful with the F/T sensor. `null` = off |
+| `ft_limit_nm_estimate` | none | Torque fallback. When the Axia's torque axes saturate (reads at their rated range, ~5 N·m on the SI-150-8 — e.g. pulling a stuck part), its torque is unreliable, so the torque limit switches to the CB3 joint-current *estimate* checked against this higher cap, letting the move continue past the sensor's range while still guarded (the UR protective stop stays the hard backstop). Force is unaffected (it doesn't saturate), though a severe torque overload can degrade the force reading, so keep `ft_limit_n` and the pendant limits sensible. `null` = off (saturation just trips `ft_limit_nm` on the clipped reading) |
 | `tcp_offset_m` | TCP Configuration | **Equal**, not nested: both layers must check the same point. Metres, in the flange frame: a fingertip 142.3 mm out along the flange's z is `[0, 0, 0.1423]` |
 | `max_tracking_error_deg` | none | 15°. Lower catches a slowing robot sooner, but servoJ lags by up to a few degrees at speed |
 
@@ -688,9 +704,12 @@ ur5vla demo -c configs/cell.yaml --prompt "pick up the black block and place it 
 
 | Option | Meaning |
 |---|---|
-| `--prompt` | Task text stored with every demo; it becomes the dataset task and the training prompt. Required unless `prompt:` is set in the cell file. |
+| `--prompt` | Task text stored with every demo; it becomes the dataset task and the training prompt. Required unless `prompt:` is set in the cell file, or `--scenario`/`--demos` is given. |
+| `--scenario PROMPT` | A demo scenario (its prompt); repeat for a sequence (e.g. a task and its reset) recorded in order and cycled `--rounds` times. See the scheduler below. |
+| `--demos FILE` | A demos YAML (e.g. `configs/demos/cube.yaml`) listing the scenarios; see the scheduler below. |
+| `--rounds N` | Times to cycle the `--scenario`/`--demos` sequence (default: the file's `rounds`, else 1). For a single `--prompt`, `--episodes` still sets the count. |
 | `-t` | A teleop file, as in [4.2](#42-ur5vla-teleop) |
-| `--episodes` | Number of demos (default 1) |
+| `--episodes` | Number of demos for a single `--prompt` (default 1) |
 | `--max-seconds` | Time limit per demo (default `control.max_episode_s`, 120) |
 | `--tag` | Appended to the run directory name |
 | `--start NAME` | Start each demo at `robot.start_poses[NAME]` instead of `robot.start_q_deg` ([3.7](#37-teleop-on-the-arm)) |
@@ -722,6 +741,29 @@ A robot stop, the force limit or a gripper fault ends the demo, which is saved w
 prompt; `demo` then waits until the robot is ready (the terminal says what to clear on the
 pendant) and goes on to the next demo. The e-stop, an error or a lost
 controller end the session.
+
+**Scheduling a task and its reset (no manual reset).** Give several scenarios and `demo` records
+each as its own demo, in order, cycling the sequence `--rounds` times. Record the **reset as a demo
+too** — e.g. a "put the cube in the box" task and a "take the cube out and put it on the table"
+reset — and the recorded reset returns the scene for the next task, so you never reset by hand:
+
+```bash
+ur5vla demo --leader --demos configs/demos/cube.yaml --rounds 20 --view base wrist
+# or inline, without a file:
+ur5vla demo --leader --rounds 20 \
+    --scenario "put the cube in the box" \
+    --scenario "take the cube out of the box and put it on the table"
+```
+
+A demos file lives under `configs/demos/`: a `scenarios:` list whose items are a prompt string, or
+`{prompt, start, name}` (`start` is a `robot.start_poses` name to move to first; `name` a short
+label), plus an optional top-level `rounds:`. In this scheduled mode the arm **continues from the
+current state between demos** (no re-home, no re-tare — it tares once at the start), which is what
+lets the reset demo hand the scene to the next task; add `start:` to a scenario only if it needs the
+arm re-homed first. Each demo keeps its own `prompt` in `meta.json` (plus its `round` and
+`scenario`), so `to-lerobot` ([5.1](#51-ur5vla-to-lerobot)) builds a multi-task dataset — task and
+reset both become trainable instructions. (A single `--prompt` with `--episodes` works exactly as
+before: it re-homes and re-tares each episode.)
 
 **Tips.**
 - Use the same start pose, scene reset and prompt wording for every demo of a task.
@@ -838,7 +880,7 @@ in `leader.joint_signs` and calibrate again.
 **Drive the arm.**
 
 ```bash
-ur5vla teleop -c configs/cell.yaml --leader [--view] [--dry-run] [--deadman keyboard|pedal|gamepad|button|none]
+ur5vla teleop --leader [--view] [--dry-run] [--deadman keyboard|pedal|gamepad|button|none]
 ur5vla demo   -c configs/cell.yaml --leader --prompt "..." [--episodes 20] ...
 ```
 
@@ -891,6 +933,33 @@ ur5vla demo   -c configs/cell.yaml --leader --prompt "..." [--episodes 20] ...
   unplugged leader ends the session (`leader_lost`).
 - Demos record the commanded targets as actions, as with the gamepad; `meta.json` says
   `teleop_input: leader`.
+
+**Compliance (spring).** With `robot.compliance.enabled: true` the arm no longer tracks the leader
+rigidly: it behaves like a spring, yielding along the measured F/T force so it **gives on contact**
+instead of tripping the force pause. Off by default (teleop is then exactly as above). It needs the
+F/T sensor (`ft_sensor: axia80`): the yield is driven by the Axia's measured wrench, which streams to
+this PC — UR's own `forceMode` can't see it, so the spring is done in software on the servoJ stream.
+
+- **How it works.** A steady external force `F` settles the command `F / stiffness_n_m` metres off
+  the leader's pose (a first-order admittance with `damping_n_s_m` for a settled, non-oscillating
+  response). Forces under `deadband_n` / `deadband_nm` are ignored (sensor noise, residual gravity),
+  the yield is capped at `max_offset_m` / `max_offset_rad`, and `axes` picks which Cartesian DoF are
+  compliant (`[1,1,1,0,0,0]` = translation only, the default). The yield is mapped to joints through
+  the Jacobian and still passes every usual check (joint, step, TCP speed, workspace, tracking).
+- **Safety.** `safety.ft_limit_n` / `ft_limit_nm` stay the **hard backstop** (the spring keeps normal
+  contact below them, and `max_offset` bounds how far it drives into a wall); set them above the
+  compliant working force. The pendant's protective stop and the sensor's own range fault remain.
+- **Tune it on the hardware.** The defaults are conservative starting points. First check
+  `force_sign`: push the arm and confirm it yields **along** the push, not into it (flip to `-1` if
+  not). Then set `stiffness_n_m` (lower = softer), `damping_n_s_m` (raise if it oscillates),
+  `deadband_n` (above the gravity drift you see as the wrist turns from the tare pose — a
+  gravity-compensation term is a worthwhile future addition), and `max_offset_m`. `--dry-run` shows
+  no yield (the SimArm's F/T reads zero); tune on the real arm. The teleop banner prints
+  `COMPLIANCE on` when it is active.
+- **Training on force.** Record demos with compliance on, convert with `to-lerobot --ft` so the
+  measured wrench joins `observation.state` ([5.1](#51-ur5vla-to-lerobot)), and set
+  `include_ft_state: true` in the policy file ([6.3](#63-policy-files)). The action is still the
+  commanded position, as always.
 
 **See it in MuJoCo (dry run).** To watch the arm follow the leader with no robot connected — a
 visual check of the calibration, the joint signs and the ranges, and the trigger — run the arm

@@ -1,0 +1,22 @@
+# The UR5 cell, split into one file per section under configs/sections/. This master pulls them all
+# in; it is the config used when no -c/--config is given, so most commands need no -c at all:
+#
+#   ur5vla teleop --leader
+#   ur5vla run -p configs/policy/openpi.yaml --prompt "..."
+#
+# To swap a section (e.g. a different safety box or leader), edit the include list below to point at
+# another file, or pass -c <other master>.yaml for one run. Sections listed later win, and anything
+# written here directly (below the include) overrides the included files.
+include:
+  - sections/robot.yaml
+  - sections/cameras.yaml
+  - sections/control.yaml
+  - sections/safety.yaml
+  - sections/teleop.yaml
+  - sections/gripper.yaml
+  - sections/ft_sensor.yaml
+  - sections/leader.yaml
+  - sections/sim.yaml
+  - sections/logging.yaml
+
+prompt: ""

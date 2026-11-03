@@ -1,0 +1,12 @@
+# Demo scenarios for the cube-in-box task and its reset. Run with:
+#   ur5vla demo --demos configs/demos/cube.yaml --rounds 20 --view base wrist
+# Each scenario is recorded as its own demo, in order; the sequence repeats `rounds` times, so you
+# alternate task / reset and never reset the scene by hand -- the recorded reset undoes the task.
+# The arm continues from the current state between demos (no re-home, no re-tare; it tares once at
+# the start). Add `start:` (a robot.start_poses name) to a scenario to move there first, `name:` for
+# a short label. `to-lerobot` trains a multi-task policy on the per-demo prompts.
+rounds: 20
+scenarios:
+  - "put the cube in the box"
+  - prompt: "take the cube out of the box and put it on the table"
+    name: reset

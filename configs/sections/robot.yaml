@@ -1,0 +1,31 @@
+robot:
+  ip: 192.168.10.125          # CB3 UR5. No External Control URCap program may be running.
+  rate_hz: 125                # CB3 RTDE maximum
+  servoj: {lookahead: 0.1, gain: 300}
+  start_q_deg: null         # teach and set before A/B runs: every trial starts here
+  # Named start poses, say one per task: `ur5vla demo ... --start printer` (and run) starts each
+  # episode there instead of start_q_deg. Teleop prints the joints to paste when it ends, e.g.
+  #   printer: [0.0, -90.0, 90.0, -90.0, -90.0, 0.0]
+  start_poses: {}
+  move_speed_deg_s: 20
+  move_accel_deg_s2: 40
+
+  # Compliance (admittance) during leader teleop: with enabled true the arm behaves like a spring,
+  # yielding along the measured F/T force instead of tracking the leader rigidly, so it gives on
+  # contact rather than tripping the force pause. Needs ft_sensor: axia80 and a tare (ur5vla
+  # prepare). The existing safety.ft_limit_n / ft_limit_nm stay as the hard backstop; raise them for
+  # compliant work. Tune stiffness/damping/deadband/max_offset on the hardware -- see
+  # docs/procedures.md. Off by default (behaviour is identical to rigid teleop).
+  compliance:
+    enabled: true
+    stiffness_n_m: 2000       # virtual spring: a steady F newtons gives F / stiffness metres
+    damping_n_s_m: 400        # velocity damping for a settled, non-oscillating response
+    deadband_n: 5             # ignore forces this small (sensor noise, residual gravity bias)
+    max_offset_m: 0.05        # cap on how far the arm yields from the leader command
+    axes: [1, 1, 1, 1, 1, 1]  # which Cartesian DoF are compliant: x y z (roll pitch yaw); default translation only
+    # CHECK ON HARDWARE: push the arm and confirm it yields ALONG the push, not into it. If it drives
+    # into the force (runs away / trips the limit), set this to -1.
+    force_sign: 1
+    # Rotational compliance only (unused while axes rx/ry/rz are 0): rot_stiffness_nm_rad,
+    # rot_damping_nm_s_rad, deadband_nm, max_offset_rad. damping_ls: Jacobian J^+ damping near
+    # singularities. All optional; see ComplianceConfig in src/ur5vla/config.py for defaults.

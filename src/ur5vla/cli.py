@@ -32,6 +32,7 @@ import queue
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -128,10 +129,12 @@ def _start_meta(cfg: config_mod.RunConfig, args) -> dict:
     return {'name': args.start, 'q_deg': cfg.robot.start_q_deg}
 
 
-def _move_to(cfg: config_mod.RunConfig, arm, q_deg: list[float], what: str, assume_yes: bool) -> bool:
+def _move_to(cfg: config_mod.RunConfig, arm, q_deg: list[float], what: str, assume_yes: bool,
+             confirm: Callable[[str], bool] | None = None) -> bool:
     """moveJ to q_deg after confirmation. False if the operator declines, the pose is outside our
     limits or the robot's, the TCP would leave the workspace box on the way (check_path), or the
-    move doesn't complete."""
+    move doesn't complete. `confirm`: ask the question some other way (the --view modal) instead of
+    the terminal [y/N] prompt."""
     q = np.deg2rad(q_deg)
     check = SafetyLayer(cfg.safety, cfg.robot.period_s)
     refused = check.check_command(q, q)
@@ -153,7 +156,9 @@ def _move_to(cfg: config_mod.RunConfig, arm, q_deg: list[float], what: str, assu
         print(f'{what} refused: {describe(refused)}')
         return False
     print(f'{what} {list(q_deg)} deg (now {np.round(np.rad2deg(q_now), 1).tolist()})')
-    if _ask(f'move there at {cfg.robot.move_speed_deg_s} deg/s? [y/N] ', assume_yes, 'y') != 'y':
+    question = f'move there at {cfg.robot.move_speed_deg_s:.0f} deg/s?'
+    ok = confirm(question) if confirm is not None else _ask(f'{question} [y/N] ', assume_yes, 'y') == 'y'
+    if not ok:
         return False
     try:
         arm.move_j(q, np.deg2rad(cfg.robot.move_speed_deg_s), np.deg2rad(cfg.robot.move_accel_deg_s2))
@@ -362,6 +367,44 @@ def _report_saved(recorder: EpisodeRecorder) -> None:
 def _close_viewer(viewer) -> None:
     if viewer is not None:
         viewer.close()
+
+
+def _start_leader_sim(cfg: config_mod.RunConfig, get_q):
+    """A second --view window showing the leader's pose on a UR5 in MuJoCo (leadersim.py), from a
+    base-like viewpoint, as an alignment reference. Optional and non-fatal, like _start_viewer: a
+    warning (not a crash) if mujoco, the scene or a display is missing. Returns a close() callable,
+    or None."""
+    if not cfg.sim.scene:
+        return None
+    scene = Path(cfg.sim.scene)
+    if not scene.is_absolute():
+        scene = (Path(__file__).resolve().parents[2] / scene).resolve()   # sim.scene is from the repo root
+    if not scene.exists():
+        log.warning('leader sim window off: scene %s not found (sim.scene)', scene)
+        return None
+    try:
+        from .leadersim import LeaderSimView
+    except ImportError as exc:
+        log.warning('leader sim window off: mujoco not available (%s)', exc)
+        return None
+    from .viewer import CameraViewer
+    view = viewer = None
+    try:
+        view = LeaderSimView(scene, cfg.sim.base, cfg.robot.start_q_deg, get_q,
+                             fps=min(cfg.sim.fps, 30.0)).start()
+        viewer = CameraViewer({view.name: view}, title='ur5vla leader (sim)').start()
+    except Exception as exc:
+        log.warning('leader sim window off: %s', exc)
+        if viewer is not None:
+            viewer.close()
+        if view is not None:
+            view.stop()
+        return None
+
+    def close() -> None:
+        viewer.close()
+        view.stop()
+    return close
 
 
 def _episode_keys(estop: threading.Event, end: threading.Event, resume: threading.Event | None = None,
@@ -831,6 +874,19 @@ def _open_nudge_key(cfg: config_mod.RunConfig):
         return None
 
 
+def _open_compliance(cfg: config_mod.RunConfig):
+    """The admittance (spring) controller if robot.compliance.enabled, else None. Needs an F/T
+    sensor: the spring is driven by the measured wrench."""
+    if not cfg.robot.compliance.enabled:
+        return None
+    if cfg.ft_sensor.type == 'none':
+        raise SystemExit('robot.compliance.enabled needs an F/T sensor (set ft_sensor.type), so the '
+                         'spring has a force to yield to')
+    from .control.compliance import AdmittanceController
+    return AdmittanceController(cfg.robot.compliance, cfg.safety.tcp_offset_m,
+                               torque_fallback=cfg.safety.ft_limit_nm_estimate is not None)
+
+
 def _session_input(cfg: config_mod.RunConfig, devices: _Devices):
     """The leader's input for the session, or None for the gamepad's."""
     if devices.leader is None:
@@ -840,9 +896,10 @@ def _session_input(cfg: config_mod.RunConfig, devices: _Devices):
                        pedal=devices.pedal)
 
 
-def _offer_move_to_leader(cfg: config_mod.RunConfig, arm, leader) -> None:
+def _offer_move_to_leader(cfg: config_mod.RunConfig, arm, leader, viewer=None) -> None:
     """If the leader is far from the arm, offer to moveJ the arm to it: quicker than matching the
-    leader to the arm by hand."""
+    leader to the arm by hand. With a --view window, ask in it (answer there); fall back to the
+    terminal if there is no window or it closed."""
     r = leader.read()
     if r.q is None:
         return
@@ -855,7 +912,14 @@ def _offer_move_to_leader(cfg: config_mod.RunConfig, arm, leader) -> None:
     j = int(np.argmax(gap))
     print(f'The leader is {gap[j]:.0f} deg from the arm ({JOINT_NAMES[j]}). To take over, bring it '
           f'to the arm, or move the arm to it:')
-    _move_to(cfg, arm, np.round(np.rad2deg(q), 2).tolist(), "the leader's pose", assume_yes=False)
+    confirm = None
+    if viewer is not None:
+        def confirm(question: str) -> bool:
+            print('answer in the camera window ([Enter]/[Space] = yes, [Esc] = no)', flush=True)
+            answer = viewer.ask(f'Move the arm to the leader?\n{question}')
+            return _ask(f'{question} [y/N] ', False, 'y') == 'y' if answer is None else answer
+    _move_to(cfg, arm, np.round(np.rad2deg(q), 2).tolist(), "the leader's pose", assume_yes=False,
+             confirm=confirm)
 
 
 def cmd_teleop(args) -> int:
@@ -873,6 +937,7 @@ def _teleop(args, cfg: config_mod.RunConfig) -> int:
     arm, gripper = make_arm(cfg.robot), make_gripper(cfg.gripper, cfg.robot.dry_run)
     ft = make_ft_sensor(cfg.ft_sensor, cfg.robot.dry_run)
     viewer = None
+    leader_sim = None
     try:
         viewer = _start_viewer(args, cameras, 'ur5vla teleop')
         _connect_arm(cfg, arm)
@@ -880,10 +945,18 @@ def _teleop(args, cfg: config_mod.RunConfig) -> int:
         ft.connect()
         _warn_if_not_zeroed(ft)
         if devices.leader is not None:
-            _offer_move_to_leader(cfg, arm, devices.leader)
+            _offer_move_to_leader(cfg, arm, devices.leader, viewer)
         session = TeleopSession(cfg, arm, gripper, devices.pad, ft, input=_session_input(cfg, devices),
-                                nudge_key=devices.nudge_key)
+                                nudge_key=devices.nudge_key, compliance=_open_compliance(cfg))
+        if args.view is not None and devices.leader is not None:
+            # A second window mirroring the leader in sim, reusing the session's own leader reading
+            # (never a second serial open). Opened after the session exists so get_q can read it.
+            leader_sim = _start_leader_sim(cfg, lambda: getattr(getattr(session.input, 'reading', None), 'q', None))
         tcp_offset = cfg.safety.tcp_offset_m
+        if session.compliance is not None:
+            print(f'COMPLIANCE on: the arm yields to force like a spring (stiffness '
+                  f'{cfg.robot.compliance.stiffness_n_m:.0f} N/m). safety.ft_limit_n '
+                  f'{cfg.safety.ft_limit_n} N stays the hard limit.', flush=True)
         print(f'{session.input.legend()}\n{_keys_text(devices)}, [r] resume\n'
               f'If the robot stops itself the arm pauses: clear the stop on the pendant, then '
               f'{session.input.resume_hint().replace(" to resume", "")}.', flush=True)
@@ -908,6 +981,8 @@ def _teleop(args, cfg: config_mod.RunConfig) -> int:
         arm.close()
         devices.close()
         _close_viewer(viewer)
+        if leader_sim is not None:
+            leader_sim()
         _stop_cameras(cameras)
     return 0
 
@@ -1007,11 +1082,12 @@ def _calibrate_leader(args, cfg: config_mod.RunConfig) -> int:
             print(f'the trigger moved only {abs(g_closed - g_open):.1f} deg: is ch{lc.gripper_channel} its encoder?')
             return 1
         print(f'gripper_open_deg: {g_open:.1f}\ngripper_closed_deg: {g_closed:.1f}')
+    target = cfg.sources.get('leader', args.config)      # the file the leader: block lives in
     if args.write:
-        write_calibration(args.config, offsets, g_open, g_closed)
-        print(f'written to the leader: block of {args.config}')
+        write_calibration(target, offsets, g_open, g_closed)
+        print(f'written to the leader: block of {target}')
     else:
-        print(f'paste these under leader: in {args.config}, or run again with --write')
+        print(f'paste these under leader: in {target}, or run again with --write')
     print('Then check each joint turns the way the arm\'s does: `ur5vla leader -c ... --arm` shows the '
           'leader minus the arm; with the leader matched to the arm every value is near 0. A joint '
           'that moves the wrong way needs its sign flipped (leader.joint_signs), then calibrate again.')
@@ -1103,17 +1179,45 @@ def cmd_prepare(args) -> int:
 
 def cmd_demo(args) -> int:
     cfg = _load(args)
-    prompt = args.prompt or cfg.prompt
-    if not prompt:
-        print('a prompt is required (--prompt or `prompt:` in the config)', file=sys.stderr)
-        return 2
+    scenarios, rounds, scheduled = _demo_schedule(args, cfg)
     run_name = f'{time.strftime("%Y%m%d-%H%M%S")}_demo' + (f'_{args.tag}' if args.tag else '')
     run_dir = Path(cfg.logging.root) / run_name
     with sessionlog.session_log(run_dir / sessionlog.NAME):
-        return _demos(args, cfg, prompt, run_name, run_dir)
+        return _demos(args, cfg, scenarios, rounds, scheduled, run_name, run_dir)
 
 
-def _demos(args, cfg: config_mod.RunConfig, prompt: str, run_name: str, run_dir: Path) -> int:
+def _demo_schedule(args, cfg: config_mod.RunConfig):
+    """Resolve the demo scenarios and how many times to cycle them: (scenarios, rounds, scheduled).
+    scheduled is the multi-scenario mode (continue between demos, tare once); legacy single --prompt
+    mode moves to the start pose and tares each episode, as before."""
+    from .demos import DemoError, Scenario, load_demos
+    file_rounds = None
+    try:
+        if args.demos:
+            scenarios, file_rounds = load_demos(args.demos)
+            scheduled = True
+        elif args.scenario:
+            scenarios, scheduled = [Scenario(s.strip()) for s in args.scenario], True
+        else:
+            prompt = args.prompt or cfg.prompt
+            if not prompt:
+                raise DemoError('a prompt is required: --prompt, --scenario, --demos, or `prompt:` '
+                                'in the config')
+            scenarios, scheduled = [Scenario(prompt, start=args.start)], False
+    except DemoError as exc:
+        raise SystemExit(f'demos: {exc}') from None
+    for sc in scenarios:
+        if sc.start is not None and sc.start not in cfg.robot.start_poses:
+            raise SystemExit(f"demos: start pose '{sc.start}' is not in robot.start_poses "
+                             f"({', '.join(cfg.robot.start_poses) or 'none'})")
+    rounds = args.rounds or file_rounds or (1 if scheduled else args.episodes)
+    if rounds < 1:
+        raise SystemExit('demos: --rounds must be >= 1')
+    return scenarios, rounds, scheduled
+
+
+def _demos(args, cfg: config_mod.RunConfig, scenarios, rounds: int, scheduled: bool,
+           run_name: str, run_dir: Path) -> int:
     from .control.teleop import TeleopSession
     _apply_deadman(args, cfg)
     devices = _open_devices(args, cfg, 'Demos drive with it.')
@@ -1128,21 +1232,42 @@ def _demos(args, cfg: config_mod.RunConfig, prompt: str, run_name: str, run_dir:
         gripper.connect()
         ft.connect()
         session = TeleopSession(cfg, arm, gripper, devices.pad, ft, input=_session_input(cfg, devices),
-                                nudge_key=devices.nudge_key)
+                                nudge_key=devices.nudge_key, compliance=_open_compliance(cfg))
+        if session.compliance is not None:
+            print(f'COMPLIANCE on: the arm yields to force like a spring (stiffness '
+                  f'{cfg.robot.compliance.stiffness_n_m:.0f} N/m). safety.ft_limit_n '
+                  f'{cfg.safety.ft_limit_n} N stays the hard limit.', flush=True)
         print(session.input.legend(), flush=True)
-        for ep in range(args.episodes):
-            prepared = _prepare(cfg, arm, gripper, ft, args.yes, args.reuse_tare)
-            if prepared is None or not _move_to_start(cfg, arm, args.yes, args.start):
+        plan = [(r, sc) for r in range(rounds) for sc in scenarios]
+        if scheduled:
+            seq = ', '.join(dict.fromkeys(sc.label for sc in scenarios))
+            print(f'scheduled {len(plan)} demos: {rounds} x [{seq}], continuing from the current '
+                  f'state between demos', flush=True)
+        for ep, (rnd, sc) in enumerate(plan):
+            reuse = args.reuse_tare or (scheduled and ep > 0)       # tare once for a chained run
+            prepared = _prepare(cfg, arm, gripper, ft, args.yes, reuse)
+            if prepared is None:
                 break
-            if _ask(f'demo {ep}: Enter to start recording, q to quit ', args.yes) == 'q':
+            if scheduled:
+                if sc.start is not None and not _move_to(cfg, arm, list(cfg.robot.start_poses[sc.start]),
+                                                         f"start pose '{sc.start}'", args.yes):
+                    break
+                start_meta = {'name': sc.start,
+                              'q_deg': list(cfg.robot.start_poses[sc.start]) if sc.start else None}
+            else:
+                if not _move_to_start(cfg, arm, args.yes, args.start):
+                    break
+                start_meta = _start_meta(cfg, args)
+            where = f' [{sc.label}]' if scheduled else ''
+            if _ask(f'demo {ep + 1}/{len(plan)}{where}: Enter to start recording, q to quit ', args.yes) == 'q':
                 break
             recorder = EpisodeRecorder(run_dir / f'ep_{ep:03d}', cameras, cfg.logging)
-            recorder.start({'run': run_name, 'episode': ep, 'kind': 'demo', 'prompt': prompt,
-                            'config_path': cfg.source, 'config': cfg.raw, 'dry_run': cfg.robot.dry_run,
-                            'start': _start_meta(cfg, args), 'teleop_input': 'leader' if leader else 'gamepad',
-                            **prepared})
+            recorder.start({'run': run_name, 'episode': ep, 'round': rnd, 'scenario': sc.label,
+                            'kind': 'demo', 'prompt': sc.prompt, 'config_path': cfg.source,
+                            'config': cfg.raw, 'dry_run': cfg.robot.dry_run, 'start': start_meta,
+                            'teleop_input': 'leader' if leader else 'gamepad', **prepared})
             mode = 'leader arm' if leader is not None else f'{session.frame} frame'
-            print(f'recording, {mode} | {_keys_text(devices)}', flush=True)
+            print(f'recording{where}, {mode} | {_keys_text(devices)}', flush=True)
             keys = _episode_keys(session.estop, session.end_request,
                                  deadman_key=devices.keyboard.name if devices.keyboard else None)
             with _operator_keys(keys, viewer), \
@@ -1229,11 +1354,12 @@ def _show_box(args, cfg: config_mod.RunConfig, qs) -> int:
     print(f'workspace box around {len(qs)} point(s) of the TCP point (flange + safety.tcp_offset_m '
           f'{list(offset)} m), UR base frame, margin {args.margin * 1000:.0f} mm:\n'
           f'{workspace.extent_text(lo, hi)}')
+    target = cfg.sources.get('safety', args.config)      # the file the safety: block lives in
     if args.write:
-        workspace.write_box(Path(args.config), lo, hi)
-        print(f'written to {args.config} (safety.workspace_min_m / workspace_max_m)')
+        workspace.write_box(Path(target), lo, hi)
+        print(f'written to {target} (safety.workspace_min_m / workspace_max_m)')
     else:
-        print(f'to use it, put these under safety: in {args.config}, or run again with --write:\n'
+        print(f'to use it, put these under safety: in {target}, or run again with --write:\n'
               f'{workspace.box_yaml(lo, hi)}')
     return 0
 
@@ -1289,7 +1415,9 @@ def main(argv: list[str] | None = None) -> int:
 
     def add(name, fn, policy=False, dry=False, view=False, teleop=False):
         p = sub.add_parser(name)
-        p.add_argument('-c', '--config', required=True, help='cell config YAML')
+        p.add_argument('-c', '--config', default=config_mod.DEFAULT_CONFIG,
+                       help=f'config YAML (default: {config_mod.DEFAULT_CONFIG}); a flat cell file or a '
+                            f'master that includes per-section files')
         if teleop:
             add_teleop_file(p)
         if policy:
@@ -1337,7 +1465,9 @@ def main(argv: list[str] | None = None) -> int:
                    help='no prompts: confirm moves, start episodes at once, leave outcomes unlabelled')
 
     p = sub.add_parser('gamepad', help='show live controller axes/buttons (and the mapped twist)')
-    p.add_argument('-c', '--config', help='cell config: also show what its teleop mapping makes of it')
+    p.add_argument('-c', '--config', nargs='?', const=config_mod.DEFAULT_CONFIG,
+                   help='cell config: also show what its teleop mapping makes of it (bare -c uses '
+                        f'{config_mod.DEFAULT_CONFIG}); omit to show raw numbers only')
     p.add_argument('--device', help='/dev/input/jsN (default: teleop.device, else the first found)')
     add_teleop_file(p)
     p.set_defaults(fn=cmd_gamepad)
@@ -1356,6 +1486,16 @@ def main(argv: list[str] | None = None) -> int:
     p = add('demo', cmd_demo, dry=True, view=True, teleop=True)
     add_leader(p)
     p.add_argument('--prompt', help='task prompt; overrides `prompt:` in the config')
+    p.add_argument('--scenario', action='append', metavar='PROMPT',
+                   help='a demo scenario (its prompt); repeat for a task/reset sequence recorded in '
+                        'order and cycled --rounds times, continuing from the current state between '
+                        'demos (so the recorded reset undoes the task, no manual reset)')
+    p.add_argument('--demos', metavar='FILE',
+                   help='a demos YAML (e.g. configs/demos/cube.yaml): a `scenarios:` list (prompt '
+                        'strings, or {prompt, start, name}) and an optional `rounds:`')
+    p.add_argument('--rounds', type=int,
+                   help='times to cycle the --scenario/--demos sequence (default: the file\'s rounds, '
+                        'else 1). For a single --prompt, --episodes still sets the count')
     p.add_argument('--episodes', type=int, default=1)
     p.add_argument('--max-seconds', type=float, help='overrides control.max_episode_s')
     p.add_argument('--tag', help='appended to the run directory name')
@@ -1396,6 +1536,9 @@ def main(argv: list[str] | None = None) -> int:
         return args.fn(args)
     except config_mod.ConfigError as exc:
         print(f'config: {exc}', file=sys.stderr)
+        return 2
+    except ArmError as exc:             # e.g. the robot is unreachable: a clear line, not a traceback
+        print(f'robot: {exc}', file=sys.stderr)
         return 2
     except KeyboardInterrupt:           # Ctrl-C at a prompt or while waiting for the robot
         print()

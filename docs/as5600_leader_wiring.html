@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AS5600 GELLO leader — wiring reference</title>
+<style>
+  :root{ --3v3:#d64545; --gnd:#333; --sda:#2b7bd6; --scl:#2a9d4a; --ink:#1a1a1a; --mut:#666; }
+  body{ font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:var(--ink);
+        margin:0; padding:24px; background:#fafafa; }
+  h1{ font-size:20px; margin:0 0 4px; }
+  .sub{ color:var(--mut); margin:0 0 18px; font-size:13px; }
+  .card{ background:#fff; border:1px solid #e3e3e3; border-radius:10px; padding:16px 18px; margin:0 auto 18px;
+         max-width:1220px; box-shadow:0 1px 3px rgba(0,0,0,.05); }
+  svg{ width:100%; height:auto; display:block; }
+  .notes{ max-width:1220px; margin:0 auto; }
+  .notes h2{ font-size:15px; margin:4px 0 8px; }
+  .notes ol{ margin:0; padding-left:20px; line-height:1.55; font-size:13.5px; }
+  .notes li{ margin-bottom:6px; }
+  .pill{ display:inline-block; font:600 11px/1.6 monospace; padding:0 6px; border-radius:4px; background:#f0f0f0; }
+  .legend-row{ display:flex; gap:18px; flex-wrap:wrap; font-size:12.5px; color:var(--mut); margin-top:6px; }
+  .legend-row span{ display:inline-flex; align-items:center; gap:6px; }
+  .sw{ width:16px; height:4px; border-radius:2px; display:inline-block; }
+</style>
+</head>
+<body>
+  <h1>AS5600 GELLO leader — recommended wiring</h1>
+  <p class="sub">Single 3V3 rail from the USB-powered XIAO ESP32-C3 · TCA9548A mux · one AS5600 per channel · I²C @ 100 kHz</p>
+
+  <div class="card">
+  <svg viewBox="0 0 1220 740" role="img" aria-label="Wiring schematic">
+    <defs>
+      <marker id="arrow" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto">
+        <path d="M0,0 L6,3 L0,6 Z" fill="#555"/>
+      </marker>
+    </defs>
+    <style>
+      .w3{ stroke:#d64545; stroke-width:2.6; fill:none; }
+      .wg{ stroke:#333; stroke-width:2.6; fill:none; }
+      .wa{ stroke:#2b7bd6; stroke-width:2; fill:none; }
+      .wc{ stroke:#2a9d4a; stroke-width:2; fill:none; }
+      .box{ fill:#fff; stroke:#333; stroke-width:1.6; }
+      .mod{ fill:#f6fbff; stroke:#2b7bd6; stroke-width:1.4; }
+      .ic{ fill:#f4f1fb; stroke:#5a4a9f; stroke-width:1.6; }
+      .lbl{ font:12px sans-serif; fill:#1a1a1a; }
+      .lbls{ font:10.5px sans-serif; fill:#444; }
+      .lblb{ font:600 12.5px sans-serif; fill:#1a1a1a; }
+      .rail{ font:600 12px sans-serif; }
+      .dash{ stroke-dasharray:5 4; }
+    </style>
+
+    <!-- ===== RAILS ===== -->
+    <line class="w3" x1="150" y1="60"  x2="1180" y2="60"/>
+    <text class="rail" x="150" y="52" fill="#d64545">+3V3 rail  (from XIAO 3V3 — USB powered)</text>
+    <line class="wg" x1="150" y1="700" x2="1180" y2="700"/>
+    <text class="rail" x="150" y="722" fill="#333">GND rail  (common)</text>
+
+    <!-- ===== PC + USB ===== -->
+    <rect class="box" x="20" y="150" width="96" height="54" rx="6"/>
+    <text class="lblb" x="68" y="174" text-anchor="middle">PC</text>
+    <text class="lbls" x="68" y="190" text-anchor="middle">USB host</text>
+    <line x1="116" y1="177" x2="170" y2="177" stroke="#555" stroke-width="2.4" marker-end="url(#arrow)"/>
+    <text class="lbls" x="143" y="170" text-anchor="middle">USB-C</text>
+
+    <!-- ===== XIAO ===== -->
+    <rect class="ic" x="170" y="140" width="180" height="150" rx="8"/>
+    <text class="lblb" x="260" y="162" text-anchor="middle">XIAO ESP32-C3</text>
+    <text class="lbls" x="260" y="178" text-anchor="middle">USB 5V → LDO → 3V3</text>
+    <!-- pins (right edge x=350) -->
+    <text class="lbls" x="344" y="203" text-anchor="end">3V3</text>
+    <text class="lbls" x="344" y="228" text-anchor="end">GND</text>
+    <text class="lbls" x="344" y="253" text-anchor="end">D4/GPIO6 · SDA</text>
+    <text class="lbls" x="344" y="278" text-anchor="end">D5/GPIO7 · SCL</text>
+
+    <!-- XIAO 3V3 -> rail -->
+    <polyline class="w3" points="350,200 390,200 390,60"/>
+    <!-- XIAO GND -> rail -->
+    <polyline class="wg" points="350,225 410,225 410,700"/>
+    <!-- SDA / SCL bus to mux -->
+    <polyline class="wa" points="350,250 600,250"/>
+    <polyline class="wc" points="350,275 600,275"/>
+
+    <!-- ===== MAIN-BUS PULLUPS ===== -->
+    <!-- SDA pullup at x=455 -->
+    <rect class="box" x="448" y="120" width="14" height="40"/>
+    <line class="wa" x1="455" y1="250" x2="455" y2="160"/>
+    <line class="w3" x1="455" y1="120" x2="455" y2="60"/>
+    <!-- SCL pullup at x=500 -->
+    <rect class="box" x="493" y="120" width="14" height="40"/>
+    <line class="wc" x1="500" y1="275" x2="500" y2="160"/>
+    <line class="w3" x1="500" y1="120" x2="500" y2="60"/>
+    <text class="lbls" x="478" y="110" text-anchor="middle">2.2–3.3 kΩ</text>
+    <text class="lbls" x="478" y="98" text-anchor="middle">main-bus pull-ups</text>
+
+    <!-- ===== BULK CAP near mux (x=545) ===== -->
+    <line class="w3" x1="545" y1="60" x2="545" y2="150"/>
+    <line x1="528" y1="150" x2="562" y2="150" stroke="#333" stroke-width="2.4"/>
+    <line x1="532" y1="160" x2="558" y2="160" stroke="#333" stroke-width="2.4"/>
+    <line class="wg" x1="545" y1="160" x2="545" y2="700"/>
+    <text class="lbls" x="545" y="140" text-anchor="middle">bulk</text>
+    <text class="lbls" x="545" y="178" text-anchor="middle">100–470 µF</text>
+    <text class="lbls" x="545" y="190" text-anchor="middle">∥ 1 µF</text>
+
+    <!-- ===== TCA9548A ===== -->
+    <rect class="ic" x="600" y="140" width="170" height="340" rx="8"/>
+    <text class="lblb" x="685" y="162" text-anchor="middle">TCA9548A mux</text>
+    <text class="lbls" x="685" y="177" text-anchor="middle">addr 0x70</text>
+    <!-- left pins -->
+    <text class="lbls" x="606" y="204">VIN</text>
+    <text class="lbls" x="606" y="228">GND</text>
+    <text class="lbls" x="606" y="252">SDA</text>
+    <text class="lbls" x="606" y="276">SCL</text>
+    <text class="lbls" x="606" y="312">RST</text>
+    <text class="lbls" x="606" y="336">A0/A1/A2</text>
+    <!-- VIN -> 3V3 -->
+    <polyline class="w3" points="600,200 580,200 580,60"/>
+    <!-- GND -> gnd -->
+    <polyline class="wg" points="600,224 566,224 566,700"/>
+    <!-- SDA/SCL in -->
+    <line class="wa" x1="600" y1="248" x2="600" y2="250"/>
+    <line class="wc" x1="600" y1="272" x2="600" y2="275"/>
+    <!-- RST -> 3V3 -->
+    <polyline class="w3" points="600,308 574,308 574,60"/>
+    <!-- A0-2 -> GND -->
+    <polyline class="wg" points="600,332 560,332 560,700"/>
+
+    <!-- channel pins right edge x=770 -->
+    <text class="lbls" x="764" y="204" text-anchor="end">SD0/SC0</text>
+    <text class="lbls" x="764" y="320" text-anchor="end">SD1/SC1</text>
+    <text class="lbls" x="764" y="430" text-anchor="end">SD2..SD6 / SC2..SC6</text>
+
+    <!-- ===== AS5600 ch0 ===== -->
+    <rect class="mod" x="880" y="160" width="230" height="96" rx="8"/>
+    <text class="lblb" x="995" y="182" text-anchor="middle">AS5600 — ch0 (0x36)</text>
+    <text class="lbls" x="995" y="199" text-anchor="middle">diametric magnet, 0.5–3 mm, centered</text>
+    <!-- 100nF across VCC/GND at module -->
+    <line x1="862" y1="214" x2="878" y2="214" stroke="#333" stroke-width="2"/>
+    <line x1="862" y1="224" x2="878" y2="224" stroke="#333" stroke-width="2"/>
+    <text class="lbls" x="852" y="242" text-anchor="end">100 nF</text>
+    <line class="w3" x1="870" y1="214" x2="870" y2="60"/>
+    <line class="wg" x1="870" y1="224" x2="870" y2="700"/>
+    <!-- module pins: SDA/SCL/VCC/GND/DIR -->
+    <polyline class="wa" points="770,200 820,200 820,230 880,230"/>
+    <polyline class="wc" points="760,205 810,205 810,244 880,244"/>
+    <line class="w3" x1="880" y1="185" x2="870" y2="185"/>
+    <text class="lbls" x="1116" y="205" >VCC→3V3 · GND→GND · DIR→GND</text>
+
+    <!-- ===== AS5600 ch1 ===== -->
+    <rect class="mod" x="880" y="290" width="230" height="96" rx="8"/>
+    <text class="lblb" x="995" y="312" text-anchor="middle">AS5600 — ch1 (0x36)</text>
+    <text class="lbls" x="995" y="329" text-anchor="middle">identical: VCC 3V3 · GND · DIR→GND</text>
+    <line x1="862" y1="344" x2="878" y2="344" stroke="#333" stroke-width="2"/>
+    <line x1="862" y1="354" x2="878" y2="354" stroke="#333" stroke-width="2"/>
+    <text class="lbls" x="852" y="372" text-anchor="end">100 nF</text>
+    <line class="w3" x1="870" y1="344" x2="870" y2="60"/>
+    <line class="wg" x1="870" y1="354" x2="870" y2="700"/>
+    <polyline class="wa" points="770,316 835,316 835,330 880,330"/>
+    <polyline class="wc" points="760,322 828,322 828,346 880,346"/>
+
+    <!-- ===== AS5600 ch2..ch6 (repeat) ===== -->
+    <rect class="mod dash" x="880" y="420" width="230" height="150" rx="8"/>
+    <text class="lblb" x="995" y="452" text-anchor="middle">AS5600 — ch2 … ch6</text>
+    <text class="lbls" x="995" y="472" text-anchor="middle">identical wiring, one per mux channel</text>
+    <text class="lbls" x="995" y="490" text-anchor="middle">each: VCC→3V3, GND→GND, DIR→GND,</text>
+    <text class="lbls" x="995" y="505" text-anchor="middle">SDn/SCn→its channel, 100 nF at the chip</text>
+    <text class="lbls" x="995" y="534" text-anchor="middle">ch7 free (optional trigger / handle button)</text>
+    <polyline class="wa" points="770,430 850,430 850,470 880,470"/>
+    <polyline class="wc" points="760,436 843,436 843,486 880,486"/>
+    <line class="w3" x1="870" y1="430" x2="870" y2="60"/>
+    <line class="wg" x1="870" y1="500" x2="870" y2="700"/>
+
+    <!-- ===== LEGEND ===== -->
+    <g transform="translate(20,560)">
+      <rect x="0" y="0" width="300" height="120" rx="8" fill="#fff" stroke="#e0e0e0"/>
+      <text class="lblb" x="12" y="22">Legend</text>
+      <line class="w3" x1="14" y1="42" x2="44" y2="42"/><text class="lbls" x="52" y="46">3V3 power</text>
+      <line class="wg" x1="14" y1="62" x2="44" y2="62"/><text class="lbls" x="52" y="66">GND</text>
+      <line class="wa" x1="14" y1="82" x2="44" y2="82"/><text class="lbls" x="52" y="86">SDA (I²C data)</text>
+      <line class="wc" x1="14" y1="102" x2="44" y2="102"/><text class="lbls" x="52" y="106">SCL (I²C clock)</text>
+      <rect class="box" x="160" y="36" width="12" height="20"/><text class="lbls" x="180" y="51">resistor</text>
+      <line x1="162" y1="78" x2="184" y2="78" stroke="#333" stroke-width="2"/>
+      <line x1="166" y1="86" x2="180" y2="86" stroke="#333" stroke-width="2"/>
+      <text class="lbls" x="196" y="86">capacitor</text>
+    </g>
+  </svg>
+  </div>
+
+  <div class="notes">
+    <h2>Build notes</h2>
+    <ol>
+      <li><b>One 3V3 rail, from the XIAO.</b> USB powers the XIAO; its <span class="pill">3V3</span> pin feeds the mux and every AS5600. <b>Do not</b> also feed an external supply (buck/bench) into <span class="pill">3V3</span> or <span class="pill">5V/VIN</span> while USB is connected — on the XIAO C3 the 5V pin is tied to USB VBUS, so you'd back-feed the PC port. If you ever need an external rail, it's USB <i>or</i> external, never both.</li>
+      <li><b>Run I²C at 100 kHz.</b> 400 kHz was marginal on this harness and caused the register-read timeouts (the "sensors 4–6 missing" symptom). Set it as the firmware default (<span class="pill">i2c_hz = 100000</span>) so it survives a reset, not just the runtime <span class="pill">i2c 100000</span> command.</li>
+      <li><b>Main-bus pull-ups: 2.2–3.3 kΩ to 3V3</b> on SDA and SCL, placed between the XIAO and the mux. This is the segment that was under-pulled at 400 kHz. The AS5600 breakout boards usually carry their own channel-side pull-ups (4.7–10 kΩ, one set per channel); if you're using bare chips, add ~4.7 kΩ per channel to 3V3.</li>
+      <li><b>Decoupling:</b> 100 nF ceramic right at every AS5600 VCC↔GND, plus a bulk 100–470 µF (∥ 1 µF ceramic) across the 3V3 rail near the mux. (Helps noise margin; not what was blocking detection, but good practice once you can add them.)</li>
+      <li><b>Mux config:</b> TCA9548A <span class="pill">A0/A1/A2 → GND</span> (address 0x70), <span class="pill">RST → 3V3</span> (or to a GPIO with <span class="pill">-DPIN_MUX_RST</span> if you want firmware bus-reset). Each AS5600 <span class="pill">DIR → GND</span> sets the count direction.</li>
+      <li><b>Magnets are a separate matter.</b> With clean reads at 100 kHz, several channels still report "too weak / too far" (AGC pegged at 128). That's genuine magnet strength/alignment, not wiring — center a diametric magnet 0.5–3 mm over each chip. It doesn't block teleop (angle still streams), but it's the next hardware follow-up.</li>
+    </ol>
+  </div>
+</body>
+</html>

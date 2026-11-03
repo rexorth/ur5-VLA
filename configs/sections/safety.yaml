@@ -1,0 +1,34 @@
+# Our limits act first and gently (a refused target is never sent); the pendant's safety
+# configuration is the backstop. Keep each of these inside its pendant counterpart:
+# docs/procedures.md#25-safety-limits-the-pendant-and-cellyaml-together
+safety:
+  max_step_rad: 0.02          # per 8 ms tick, any joint: 0.02 rad = 143 deg/s
+  max_tcp_speed_m_s: 0.5      # at tcp_offset_m; null = off
+  max_tracking_error_deg: 15  # target vs. where the arm is: larger = the robot is slowing itself
+  # On |F| and |T|, tared per episode: the F/T sensor when ft_sensor is set, else the CB3's
+  # joint-current ESTIMATE (noisy: hence 90 N). With the sensor, tighten to ~30-40 N. With
+  # robot.compliance on, these stay as the HARD backstop (the spring keeps normal contact below
+  # them); set them above the compliant working force.
+  ft_limit_n: 90
+  ft_limit_nm: 4.8           # N·m; set once the sensor is mounted (the estimate's torque is poor)
+  # Torque fallback: when the Axia's torque saturates (reads at its rated range, ~5 N·m on the
+  # SI-150-8 -- e.g. pulling a stuck part), its torque reading is unreliable. With this set, the
+  # torque limit switches to the CB3 joint-current ESTIMATE against this higher cap, so the move
+  # continues past the sensor's range while still guarded (the UR protective stop stays the hard
+  # backstop). null = off (saturation just trips ft_limit_nm on the clipped reading). Force is
+  # unaffected. The estimate's torque is poor, so leave margin.
+  ft_limit_nm_estimate: 15
+  # Watchdog: hold if the next chunk is overdue. After each chunk the next is expected
+  # ~(1 - refill_fraction) * chunk duration later (or after one latency, if the server is slower
+  # than that); the watchdog allows watchdog_factor times that.
+  watchdog_factor: 1.5
+  # Optional hard cap on the watchdog window, s: the longest the arm may keep moving without a
+  # fresh chunk. null = no cap (then the bound is watchdog_factor x the expected gap).
+  watchdog_max_s: null
+  max_frame_age_s: 0.1
+  # SET PER TASK before running on the arm. These defaults are the UR5's own range and a loose box.
+  joint_min_deg: [-360, -360, -360, -360, -360, -360]
+  joint_max_deg: [360, 360, 360, 360, 360, 360]
+  workspace_min_m: [-0.9, -0.9, -0.05]   # UR base frame, as the pendant shows it
+  workspace_max_m: [1.5, 0.9, 1.0]
+  tcp_offset_m: [0, 0, 0.2147]               # flange -> fingertip: F/T sensor and couplers 72.4 mm + gripper 142.3 mm

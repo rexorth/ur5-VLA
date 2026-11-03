@@ -1,4 +1,12 @@
-"""Run configuration: one YAML file defines robot, cameras, policy, control, safety and logging.
+"""Run configuration: a YAML file defines robot, cameras, policy, control, safety and logging.
+
+A config file may be one flat file (the whole cell in one place, as `dry_run.yaml` is), or a
+**master** that pulls in per-section files with a top-level `include:` list -- a path, or a list of
+paths, relative to the master's own directory. The included files' top-level sections are merged in
+order (nested dicts deep-merged, later wins on a leaf conflict), and the master's own inline
+sections override its includes. `configs/default.yaml` is the master used when no `-c` is given;
+`configs/sections/` holds one file per section. This keeps the sections swappable without retyping
+the command line -- edit the master's include list, or point `-c` at another master.
 
 Switching between openpi and LeRobot changes only the `policy:` block. Unknown keys are errors, not
 warnings: a typo in a safety limit must not silently fall back to a default.
@@ -46,10 +54,49 @@ class ServoJConfig:
 
 
 @dataclass
+class ComplianceConfig:
+    """Admittance (spring) compliance during leader teleop: instead of tracking the leader rigidly,
+    the arm yields along the measured F/T force so a steady external force F settles the command
+    F / stiffness metres off the leader's pose. Needs an F/T sensor (ft_sensor); the measured Axia
+    wrench is used (UR's own forceMode can't see it). safety.ft_limit_n / ft_limit_nm stay the hard
+    backstop. First-order admittance: D*dx/dt + K*dx = F, per compliant Cartesian axis."""
+    enabled: bool = False
+    stiffness_n_m: float = 2000.0       # translational virtual spring K (N/m)
+    damping_n_s_m: float = 400.0        # translational damping D (N·s/m): settled, non-oscillating
+    rot_stiffness_nm_rad: float = 20.0  # rotational K (N·m/rad), for compliant rotation axes
+    rot_damping_nm_s_rad: float = 4.0
+    deadband_n: float = 5.0             # ignore force below this per axis (noise, residual gravity bias)
+    deadband_nm: float = 0.5
+    max_offset_m: float = 0.05          # cap on how far (translational) the arm yields from the command
+    max_offset_rad: float = 0.2         # cap on the rotational yield
+    # Which Cartesian DoF are compliant, base frame: x y z (roll pitch yaw). Default: translation only.
+    axes: list[int] = field(default_factory=lambda: [1, 1, 1, 0, 0, 0])
+    damping_ls: float = 0.05            # damped-least-squares lambda for J^+ near singularities
+    force_sign: float = 1.0             # flip to -1 if the arm yields the wrong way (check on hardware)
+
+    def __post_init__(self):
+        if len(self.axes) != 6 or any(a not in (0, 1) for a in self.axes):
+            raise ConfigError('robot.compliance.axes needs 6 values, each 0 or 1 (x y z rx ry rz)')
+        for key in ('stiffness_n_m', 'damping_n_s_m', 'rot_stiffness_nm_rad', 'rot_damping_nm_s_rad'):
+            if getattr(self, key) <= 0:
+                raise ConfigError(f'robot.compliance.{key} must be > 0')
+        for key in ('deadband_n', 'deadband_nm', 'max_offset_m', 'max_offset_rad', 'damping_ls'):
+            if getattr(self, key) < 0:
+                raise ConfigError(f'robot.compliance.{key} must be >= 0')
+        if self.force_sign not in (1, -1, 1.0, -1.0):
+            raise ConfigError('robot.compliance.force_sign must be 1 or -1')
+        self.force_sign = float(self.force_sign)
+
+
+@dataclass
 class RobotConfig:
     ip: str = '192.168.10.125'
     rate_hz: float = 125.0          # CB3 RTDE maximum
+    # Fail with a clear message if the controller's RTDE port can't be reached within this long,
+    # instead of ur_rtde blocking forever (e.g. the network is down or robot.ip is wrong).
+    connect_timeout_s: float = 2.0
     servoj: ServoJConfig = field(default_factory=ServoJConfig)
+    compliance: ComplianceConfig = field(default_factory=ComplianceConfig)
     # moveJ here (slowly, after confirmation) before every episode. None = start where the arm is.
     start_q_deg: list[float] | None = None
     # Named start poses, say one per task; `--start NAME` on run and demo uses one instead.
@@ -61,6 +108,10 @@ class RobotConfig:
     def __post_init__(self):
         if isinstance(self.servoj, dict):
             self.servoj = from_dict(ServoJConfig, self.servoj, 'robot.servoj')
+        if isinstance(self.compliance, dict):
+            self.compliance = from_dict(ComplianceConfig, self.compliance, 'robot.compliance')
+        if self.connect_timeout_s <= 0:
+            raise ConfigError('robot.connect_timeout_s must be > 0')
         if self.start_q_deg is not None and len(self.start_q_deg) != 6:
             raise ConfigError('robot.start_q_deg needs 6 values')
         if not isinstance(self.start_poses, dict):
@@ -101,6 +152,13 @@ class SafetyConfig:
     # pose if there is one (ft_sensor), else the CB3's joint-current estimate. None disables.
     ft_limit_n: float | None = 30.0
     ft_limit_nm: float | None = None
+    # Torque fallback: when an F/T sensor's torque axis saturates (reads at its rated range, e.g. the
+    # Axia SI-150-8's ~5 N·m pulling a stuck part), its torque reading is no longer trustworthy. With
+    # this set, the torque limit then switches to the CB3 joint-current estimate (|T| of state.wrench)
+    # checked against this higher cap, so the move continues past the sensor's range while still
+    # guarded; the UR's protective stop stays the hard backstop. None = off (saturation just trips
+    # ft_limit_nm on the clipped reading, as before). Force is unaffected (its axes don't saturate).
+    ft_limit_nm_estimate: float | None = None
     # Hold when a chunk is overdue: none arrived within watchdog_factor x the expected gap
     # between chunks, max((1 - control.refill_fraction) x chunk duration, last latency).
     watchdog_factor: float = 1.5
@@ -121,7 +179,8 @@ class SafetyConfig:
             raise ConfigError('safety.watchdog_factor must be > 1 (it is a margin over the expected gap)')
         if self.watchdog_max_s is not None and self.watchdog_max_s <= 0:
             raise ConfigError('safety.watchdog_max_s must be > 0, or null for no cap')
-        for key in ('max_tcp_speed_m_s', 'max_tracking_error_deg', 'ft_limit_n', 'ft_limit_nm'):
+        for key in ('max_tcp_speed_m_s', 'max_tracking_error_deg', 'ft_limit_n', 'ft_limit_nm',
+                    'ft_limit_nm_estimate'):
             if getattr(self, key) is not None and getattr(self, key) <= 0:
                 raise ConfigError(f'safety.{key} must be > 0, or null to disable')
         if self.max_step_rad <= 0:
@@ -398,12 +457,17 @@ class RunConfig:
     sim: SimConfig = field(default_factory=SimConfig)
     prompt: str = ''
     source: str | None = None           # path the config was loaded from
-    raw: dict[str, Any] = field(default_factory=dict)  # as loaded, saved with every episode
+    raw: dict[str, Any] = field(default_factory=dict)  # merged, as parsed; saved with every episode
+    # Top-level section -> the file that last defined it (for in-place write-backs when a config is
+    # split across files; empty for a config built with parse() directly).
+    sources: dict[str, str] = field(default_factory=dict)
 
 
 SECTIONS = ('robot', 'cameras', 'policy', 'control', 'safety', 'logging', 'teleop', 'gripper', 'ft_sensor',
             'leader', 'sim', 'prompt')
 ROTATIONS = (0, 90, 180, 270)       # cameras.<name>.rotate, degrees clockwise
+DEFAULT_CONFIG = 'configs/default.yaml'     # used when no -c/--config is given
+INCLUDE_KEY = 'include'             # a master config's list of per-section files to pull in
 
 
 def parse(raw: dict[str, Any], source: str | None = None) -> RunConfig:
@@ -438,18 +502,72 @@ def parse(raw: dict[str, Any], source: str | None = None) -> RunConfig:
     )
 
 
+def _read_yaml(path: Path) -> dict[str, Any]:
+    try:
+        with path.open() as f:
+            doc = yaml.safe_load(f) or {}
+    except FileNotFoundError as exc:
+        raise ConfigError(f'config file not found: {path}') from exc
+    except yaml.YAMLError as exc:
+        raise ConfigError(f'{path}: {exc}') from exc
+    if not isinstance(doc, dict):
+        raise ConfigError(f'{path}: a config file must be a mapping of sections, got {type(doc).__name__}')
+    return doc
+
+
+def _deep_merge(base: Any, overlay: Any) -> Any:
+    """Merge overlay onto base: nested dicts are merged key by key, anything else overlay replaces."""
+    if isinstance(base, dict) and isinstance(overlay, dict):
+        out = dict(base)
+        for k, v in overlay.items():
+            out[k] = _deep_merge(out.get(k), v)
+        return out
+    return overlay
+
+
+def _resolve(path: Path, seen: frozenset[Path]) -> tuple[dict[str, Any], dict[str, str]]:
+    """Read a config file and merge in whatever its `include:` names, recursively. Returns the
+    merged sections and, for each top-level section, the file that last set it (for write-backs).
+    Includes are relative to the file that names them; later includes and the file's own sections
+    win on conflict. Raises on an include cycle."""
+    rp = path.resolve()
+    if rp in seen:
+        raise ConfigError(f'config include cycle: {path} includes itself')
+    seen = seen | {rp}
+    doc = _read_yaml(path)
+    includes = doc.pop(INCLUDE_KEY, []) or []
+    if isinstance(includes, (str, Path)):
+        includes = [includes]
+    if not isinstance(includes, list):
+        raise ConfigError(f'{path}: `{INCLUDE_KEY}` must be a path or a list of paths')
+    merged: dict[str, Any] = {}
+    sources: dict[str, str] = {}
+    for inc in includes:
+        inc_path = path.parent / str(inc)
+        sub, sub_sources = _resolve(inc_path, seen)
+        for key, value in sub.items():
+            merged[key] = _deep_merge(merged.get(key), value)
+            sources[key] = sub_sources.get(key, str(inc_path))
+    for key, value in doc.items():          # the file's own sections override its includes
+        merged[key] = _deep_merge(merged.get(key), value)
+        sources[key] = str(path)
+    return merged, sources
+
+
 def load(path: str | Path, policy_path: str | Path | None = None,
          teleop_path: str | Path | None = None) -> RunConfig:
-    """Load a cell config. `policy_path` names a file holding just a policy block, which replaces
-    the cell's `policy:`. That way openpi and LeRobot runs share one cell file and can differ in
-    nothing else. `teleop_path` does the same for `teleop:` (e.g. a 4-DoF gamepad mapping)."""
+    """Load a config file, resolving any `include:` of per-section files (see the module docstring).
+    `policy_path` names a file holding just a policy block, which replaces the config's `policy:`;
+    that way openpi and LeRobot runs share one config and differ in nothing else. `teleop_path`
+    does the same for `teleop:` (e.g. a 4-DoF gamepad mapping)."""
     path = Path(path)
-    with path.open() as f:
-        raw = yaml.safe_load(f) or {}
+    raw, sources = _resolve(path, frozenset())
     source = str(path)
     for section, block_path in (('policy', policy_path), ('teleop', teleop_path)):
         if block_path is not None:
-            with Path(block_path).open() as f:
-                raw[section] = yaml.safe_load(f) or {}
+            raw[section] = _read_yaml(Path(block_path))
+            sources[section] = str(block_path)
             source += f' + {block_path}'
-    return parse(raw, source=source)
+    cfg = parse(raw, source=source)
+    cfg.sources = sources
+    return cfg

@@ -38,11 +38,13 @@ from ..robot.kinematics import tool_point
 ROBOT_DATA_TIMEOUT_S = 0.1
 PATH_STEP_RAD = np.deg2rad(1.0)     # check_path: a point every 1 deg of the farthest-moving joint
 JOINT_NAMES = ('base', 'shoulder', 'elbow', 'wrist 1', 'wrist 2', 'wrist 3')
+SAT_FRAC = 0.9                      # an F/T torque axis >= this fraction of its rated range: saturated
 
 
 @dataclass
 class Violation:
-    # estop | gripper | ft_sensor | robot_stopped | robot_link | robot_data | force | torque  (state)
+    # estop | gripper | ft_sensor | robot_stopped | robot_link | robot_data | force | torque |
+    #   torque_estimate                                                                      (state)
     # invalid_target | joint_limit | step | tcp_speed | workspace | tracking           (command)
     # path                                                                             (moveJ)
     reason: str
@@ -104,9 +106,16 @@ class SafetyLayer:
         f = self.force(state)
         if self.cfg.ft_limit_n is not None and f is not None and f > self.cfg.ft_limit_n:
             return Violation('force', {'force_n': f, 'limit_n': self.cfg.ft_limit_n})
-        t = self.torque(state)
-        if self.cfg.ft_limit_nm is not None and t is not None and t > self.cfg.ft_limit_nm:
-            return Violation('torque', {'torque_nm': t, 'limit_nm': self.cfg.ft_limit_nm})
+        if self.torque_saturated(state) and self.cfg.ft_limit_nm_estimate is not None:
+            # The F/T sensor's torque is saturated, so its reading can't be trusted: bound the CB3
+            # joint-current estimate against the higher fallback cap instead, and keep moving.
+            t = None if state.wrench is None else float(np.linalg.norm(state.wrench[3:]))
+            if t is not None and t > self.cfg.ft_limit_nm_estimate:
+                return Violation('torque_estimate', {'torque_nm': t, 'limit_nm': self.cfg.ft_limit_nm_estimate})
+        else:
+            t = self.torque(state)
+            if self.cfg.ft_limit_nm is not None and t is not None and t > self.cfg.ft_limit_nm:
+                return Violation('torque', {'torque_nm': t, 'limit_nm': self.cfg.ft_limit_nm})
         return None
 
     def force(self, state: RobotState) -> float | None:
@@ -118,6 +127,9 @@ class SafetyLayer:
         """|T|, what ft_limit_nm is checked against. None if unknown."""
         w = state.contact_wrench
         return None if w is None else float(np.linalg.norm(w[3:]))
+
+    def torque_saturated(self, state: RobotState) -> bool:
+        return torque_saturated(state)
 
     def check_path(self, q_from: np.ndarray, q_to: np.ndarray) -> Violation | None:
         """Would a moveJ from q_from to q_to take the TCP out of the workspace box on the way?
@@ -175,6 +187,15 @@ class SafetyLayer:
         return None
 
 
+def torque_saturated(state: RobotState) -> bool:
+    """Whether an F/T sensor torque axis is at (within SAT_FRAC of) its rated range, so its torque
+    reading can't be trusted. False without a reading or a known range. Shared by the safety torque
+    check and the admittance controller so both fall back to the CB3 estimate together."""
+    if state.ft is None or state.ft_range is None:
+        return False
+    return bool(np.any(np.abs(np.asarray(state.ft)[3:]) >= SAT_FRAC * np.abs(np.asarray(state.ft_range)[3:])))
+
+
 ROBOT_STOP_HELP = {
     'protective stop': 'Protective stop: the robot stopped itself (a pendant safety limit, a '
                        'collision, or the arm falling behind its target). The pendant says why: fix '
@@ -226,6 +247,9 @@ def describe(v: Violation) -> str:
                           f"(safety.ft_limit_n)."),
         'torque': lambda: (f"Torque {d['torque_nm']:.2f} N·m, over the {d['limit_nm']:.2f} N·m limit "
                            f"(safety.ft_limit_nm)."),
+        'torque_estimate': lambda: (f"Torque {d['torque_nm']:.2f} N·m (the CB3 estimate; the F/T "
+                                    f"sensor's torque is saturated), over the {d['limit_nm']:.2f} N·m "
+                                    f"fallback limit (safety.ft_limit_nm_estimate)."),
         'invalid_target': lambda: 'The target is not a number (NaN or inf): not sent.',
         'joint_limit': lambda: (f"{_joint(d).capitalize()} would pass its limit: {d['q_deg']:.1f} deg, "
                                 f"limit {d['limit_deg']:.1f} (safety.joint_min_deg / joint_max_deg)."),

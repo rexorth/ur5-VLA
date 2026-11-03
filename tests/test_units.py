@@ -117,6 +117,37 @@ def test_safety_checks_the_force_as_it_is_and_robot_stops_are_caught():
     assert s.check_state(_state(protective_stop=True)).reason == 'robot_stopped'
 
 
+# SI-150-8-like range: large force axes, ~5 N·m torque axes.
+FT_RANGE = np.array([200.0, 200.0, 500.0, 5.0, 5.0, 8.0])
+
+
+def test_torque_saturation_detection():
+    s = SafetyLayer(SafetyConfig(), TICK)
+    assert not s.torque_saturated(_state(ft=np.array([0, 0, 0, 4.0, 0, 0]), ft_range=FT_RANGE))  # 4.0 < 0.9*5
+    assert s.torque_saturated(_state(ft=np.array([0, 0, 0, 4.6, 0, 0]), ft_range=FT_RANGE))      # >= 4.5
+    assert not s.torque_saturated(_state(ft=None, ft_range=FT_RANGE))                            # no reading
+    assert not s.torque_saturated(_state(ft=np.array([0, 0, 0, 9, 0, 0]), ft_range=None))        # range unknown
+
+
+def test_torque_falls_back_to_the_estimate_when_the_sensor_saturates():
+    s = SafetyLayer(SafetyConfig(ft_limit_nm=4.8, ft_limit_nm_estimate=9.0), TICK)
+    # Below saturation: the (trusted) Axia torque governs, well under its limit.
+    assert s.check_state(_state(ft=np.array([0, 0, 0, 3.0, 0, 0]), ft_range=FT_RANGE)) is None
+    # Saturated (Tx at range), CB3 estimate within the fallback cap: allowed past the sensor's range.
+    sat_ok = _state(ft=np.array([0, 0, 0, 5.0, 0, 0]), ft_range=FT_RANGE, wrench=np.array([0, 0, 0, 6.0, 0, 0]))
+    assert s.check_state(sat_ok) is None
+    # Saturated, estimate over the cap: tripped, reported as the estimate.
+    sat_over = _state(ft=np.array([0, 0, 0, 5.0, 0, 0]), ft_range=FT_RANGE, wrench=np.array([0, 0, 0, 10.0, 0, 0]))
+    v = s.check_state(sat_over)
+    assert v.reason == 'torque_estimate' and 'estimate' in describe(v)
+
+
+def test_torque_fallback_off_still_trips_on_the_saturated_reading():
+    s = SafetyLayer(SafetyConfig(ft_limit_nm=4.8), TICK)               # no estimate cap -> fallback off
+    sat = _state(ft=np.array([0, 0, 0, 5.0, 0, 0]), ft_range=FT_RANGE, wrench=np.array([0, 0, 0, 1.0, 0, 0]))
+    assert s.check_state(sat).reason == 'torque'                      # clipped 5.0 N·m > 4.8, pauses as before
+
+
 def test_safety_refuses_nan_and_too_fast_tcp_before_sending():
     s = SafetyLayer(SafetyConfig(max_step_rad=0.05, max_tcp_speed_m_s=0.5), TICK)
     q = HOME.copy()
@@ -209,6 +240,171 @@ def test_unknown_keys_are_errors():
         config_mod.parse({'safety': {'max_stp_rad': 0.5}})
     with pytest.raises(ConfigError, match='lookahead'):
         config_mod.parse({'robot': {'servoj': {'lookahead': 0.5}}})
+
+
+def test_the_default_master_matches_the_cell_alias():
+    # configs/default.yaml (the -c default) and configs/cell.yaml (a thin include alias) resolve to
+    # the same merged config, with `include` stripped before parsing.
+    default = config_mod.load(CONFIGS / 'default.yaml')
+    cell = config_mod.load(CONFIGS / 'cell.yaml')
+    assert default.raw == cell.raw
+    assert 'include' not in default.raw and 'include' not in cell.raw
+    assert default.robot.ip == '192.168.10.125' and default.leader.deadman == 'pedal'
+    # Provenance follows the include down to the section file, through the alias too.
+    assert default.sources['leader'].endswith('sections/leader.yaml')
+    assert cell.sources['safety'].endswith('sections/safety.yaml')
+
+
+def test_include_merges_sections_and_own_keys_override(tmp_path):
+    (tmp_path / 'a.yaml').write_text('robot: {ip: 1.1.1.1, rate_hz: 100}\n')
+    (tmp_path / 'b.yaml').write_text('safety: {max_step_rad: 0.03}\n')
+    master = tmp_path / 'master.yaml'
+    master.write_text('include: [a.yaml, b.yaml]\nrobot: {rate_hz: 125}\n')   # own key deep-merges over include
+    cfg = config_mod.load(master)
+    assert cfg.robot.ip == '1.1.1.1'          # from a.yaml
+    assert cfg.robot.rate_hz == 125.0         # master overrides a.yaml's 100, keeping ip
+    assert cfg.safety.max_step_rad == 0.03    # from b.yaml
+    assert cfg.sources['robot'] == str(master)        # master set it last
+    assert cfg.sources['safety'] == str(tmp_path / 'b.yaml')
+
+
+def test_later_include_wins_on_a_conflict(tmp_path):
+    (tmp_path / 'a.yaml').write_text('robot: {ip: 1.1.1.1}\n')
+    (tmp_path / 'b.yaml').write_text('robot: {ip: 2.2.2.2}\n')
+    master = tmp_path / 'm.yaml'
+    master.write_text('include: [a.yaml, b.yaml]\n')
+    cfg = config_mod.load(master)
+    assert cfg.robot.ip == '2.2.2.2' and cfg.sources['robot'] == str(tmp_path / 'b.yaml')
+
+
+def test_nested_includes_resolve(tmp_path):
+    (tmp_path / 'leaf.yaml').write_text('robot: {ip: 9.9.9.9}\n')
+    (tmp_path / 'mid.yaml').write_text('include: [leaf.yaml]\n')
+    master = tmp_path / 'top.yaml'
+    master.write_text('include: [mid.yaml]\n')
+    cfg = config_mod.load(master)
+    assert cfg.robot.ip == '9.9.9.9' and cfg.sources['robot'] == str(tmp_path / 'leaf.yaml')
+
+
+def test_include_cycle_is_an_error(tmp_path):
+    (tmp_path / 'x.yaml').write_text('include: [y.yaml]\n')
+    (tmp_path / 'y.yaml').write_text('include: [x.yaml]\n')
+    with pytest.raises(ConfigError, match='cycle'):
+        config_mod.load(tmp_path / 'x.yaml')
+
+
+def test_compliance_config_validates():
+    cfg = config_mod.parse({'robot': {'compliance': {'enabled': True, 'stiffness_n_m': 1500}}})
+    assert cfg.robot.compliance.enabled and cfg.robot.compliance.stiffness_n_m == 1500
+    assert cfg.robot.compliance.axes == [1, 1, 1, 0, 0, 0]       # translation only by default
+    with pytest.raises(ConfigError, match='axes'):
+        config_mod.parse({'robot': {'compliance': {'axes': [1, 1, 1]}}})
+    with pytest.raises(ConfigError, match='stiffness_n_m'):
+        config_mod.parse({'robot': {'compliance': {'stiffness_n_m': 0}}})
+    with pytest.raises(ConfigError, match='force_sign'):
+        config_mod.parse({'robot': {'compliance': {'force_sign': 2}}})
+
+
+# ---- compliance (admittance) ----
+
+def _comp_state(q, ft):
+    return RobotState(t=0.0, q=q, qd=np.zeros(6), tcp_pose=np.zeros(6), wrench=np.zeros(6),
+                      protective_stop=False, emergency_stop=False, safety_mode=1, robot_mode=7,
+                      program_running=True, speed_scaling=1.0, t_robot=0.0, ft=ft)
+
+
+def test_admittance_is_rigid_without_force_and_under_the_deadband():
+    from ur5vla.control.compliance import AdmittanceController
+    cfg = config_mod.ComplianceConfig(enabled=True, stiffness_n_m=1000, deadband_n=3)
+    ctrl = AdmittanceController(cfg, [0, 0, 0.2])
+    assert np.allclose(ctrl.offset(_comp_state(HOME, np.zeros(6)), 0.008), 0)
+    ctrl.reset()
+    assert np.allclose(ctrl.offset(_comp_state(HOME, np.array([2.0, 0, 0, 0, 0, 0])), 0.008), 0)  # < deadband
+
+
+def test_admittance_settles_to_force_over_stiffness():
+    from ur5vla.control.compliance import AdmittanceController
+    cfg = config_mod.ComplianceConfig(enabled=True, stiffness_n_m=1000, deadband_n=2, max_offset_m=0.5)
+    ctrl = AdmittanceController(cfg, [0, 0, 0.2])
+    st = _comp_state(HOME, np.array([20.0, 0, 0, 0, 0, 0]))
+    for _ in range(6000):
+        ctrl.offset(st, 0.008)
+    expected = fk(HOME)[:3, :3] @ np.array([(20 - 2) / 1000, 0, 0])      # deadband-shifted force, base frame
+    np.testing.assert_allclose(ctrl.dx[:3], expected, atol=1e-4)
+    assert np.allclose(ctrl.dx[3:], 0)                                   # rotation off by default
+
+
+def test_admittance_clamps_the_offset_and_force_sign_flips_it():
+    from ur5vla.control.compliance import AdmittanceController
+    st = _comp_state(HOME, np.array([500.0, 0, 0, 0, 0, 0]))
+    pos = AdmittanceController(config_mod.ComplianceConfig(enabled=True, stiffness_n_m=1000, max_offset_m=0.03),
+                              [0, 0, 0.2])
+    for _ in range(9000):
+        pos.offset(st, 0.008)
+    assert float(np.linalg.norm(pos.dx[:3])) == pytest.approx(0.03, abs=1e-6)
+    neg = AdmittanceController(config_mod.ComplianceConfig(enabled=True, stiffness_n_m=1000, max_offset_m=0.03,
+                                                          force_sign=-1), [0, 0, 0.2])
+    for _ in range(9000):
+        neg.offset(st, 0.008)
+    np.testing.assert_allclose(neg.dx, -pos.dx, atol=1e-6)
+
+
+def test_admittance_torque_falls_back_to_the_estimate_when_the_sensor_saturates():
+    from ur5vla.control.compliance import AdmittanceController
+    cfg = config_mod.ComplianceConfig(enabled=True, axes=[1, 1, 1, 1, 1, 1], deadband_n=0, deadband_nm=0)
+    rng = np.array([200.0, 200.0, 500.0, 5.0, 5.0, 8.0])
+    st = _comp_state(HOME, np.array([0, 0, 0, 5.0, 0, 0]))     # Axia Tx at its 5 N·m range: saturated
+    st.ft_range = rng
+    st.wrench = np.array([0, 0, 0, 0, 0, 7.0])                 # CB3 estimate (base frame): Tz = 7
+    # With the fallback on, the base torque is the estimate (base frame, no rotation).
+    on = AdmittanceController(cfg, [0, 0, 0.2], torque_fallback=True)._wrench_base(st)
+    np.testing.assert_allclose(on[3:], [0, 0, 7.0], atol=1e-9)
+    # Off, it's the (saturated, unreliable) Axia torque rotated into the base frame: different.
+    off = AdmittanceController(cfg, [0, 0, 0.2], torque_fallback=False)._wrench_base(st)
+    assert not np.allclose(off[3:], on[3:])
+    # Below saturation the fallback is inert even when on: torque comes from the Axia.
+    st2 = _comp_state(HOME, np.array([0, 0, 0, 2.0, 0, 0]))
+    st2.ft_range, st2.wrench = rng, np.array([0, 0, 0, 0, 0, 7.0])
+    nn = AdmittanceController(cfg, [0, 0, 0.2], torque_fallback=True)._wrench_base(st2)
+    assert not np.allclose(nn[3:], [0, 0, 7.0])                # not the estimate: the sensor is trusted
+
+
+def test_admittance_relaxes_when_the_force_goes_away():
+    from ur5vla.control.compliance import AdmittanceController
+    ctrl = AdmittanceController(config_mod.ComplianceConfig(enabled=True, stiffness_n_m=1000, deadband_n=0), [0, 0, 0.2])
+    for _ in range(3000):
+        ctrl.offset(_comp_state(HOME, np.array([30.0, 0, 0, 0, 0, 0])), 0.008)
+    assert np.linalg.norm(ctrl.dx[:3]) > 0.01
+    for _ in range(4000):
+        ctrl.offset(_comp_state(HOME, np.zeros(6)), 0.008)
+    assert np.linalg.norm(ctrl.dx[:3]) < 1e-4                            # the spring returns to the command
+
+
+# ---- arm connection ----
+
+def test_unreachable_robot_fails_fast_with_a_clear_message():
+    import socket
+    from ur5vla.robot.arm import ArmError, _check_reachable
+    # A port nothing listens on: the connection is refused at once, with a clear, actionable message
+    # (not an indefinite hang).
+    s = socket.socket()
+    s.bind(('127.0.0.1', 0))
+    port = s.getsockname()[1]
+    s.close()
+    with pytest.raises(ArmError, match='cannot reach the robot'):
+        _check_reachable('127.0.0.1', port, 2.0)
+
+
+def test_reachable_port_passes_the_check():
+    import socket
+    from ur5vla.robot.arm import _check_reachable
+    srv = socket.socket()
+    srv.bind(('127.0.0.1', 0))
+    srv.listen(1)
+    try:
+        _check_reachable('127.0.0.1', srv.getsockname()[1], 2.0)         # a listener: no error
+    finally:
+        srv.close()
 
 
 def test_camera_rotate_turns_frames_clockwise_and_bad_values_are_errors():

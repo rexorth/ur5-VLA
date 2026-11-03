@@ -164,6 +164,7 @@ class ControlLoop:
         state = self.arm.read_state()
         state.gripper = self.gripper.position()
         state.ft = self.ft.wrench()
+        state.ft_range = self.ft.rated_range()
         return state
 
     def _reset_episode_state(self) -> None:

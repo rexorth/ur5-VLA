@@ -205,8 +205,13 @@ def main() -> int:
                 tick = time.monotonic()
                 r = leader.read()
                 if r.q is not None:
-                    q = np.clip(fold_near(r.q, data.qpos[arm_q]), arm_lo, arm_hi)
-                    data.ctrl[arm_act] = q
+                    # Fold into the joint ranges (not clip): clipping the elbow to its +/-180 deg
+                    # limit would show a different, broken pose than the leader's (a leader reading
+                    # of 259 deg must land at -101 deg, the same angle, not be clipped to 180 deg).
+                    q = fold_near(r.q, data.qpos[arm_q])
+                    q = np.where(q < arm_lo, q + TURN * np.ceil((arm_lo - q) / TURN), q)
+                    q = np.where(q > arm_hi, q - TURN * np.ceil((q - arm_hi) / TURN), q)
+                    data.ctrl[arm_act] = np.clip(q, arm_lo, arm_hi)
                     if r.gripper is not None and grip_act >= 0:
                         lo, hi = model.actuator_ctrlrange[grip_act]
                         data.ctrl[grip_act] = lo + np.clip(r.gripper, 0.0, 1.0) * (hi - lo)

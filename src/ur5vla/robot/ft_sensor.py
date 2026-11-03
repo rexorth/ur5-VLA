@@ -49,6 +49,10 @@ class FTSensor(ABC):
         control loop and teleop end the episode on it: the force limits depend on the reading."""
         return None
 
+    def rated_range(self) -> np.ndarray | None:
+        """(6,) the rated range per axis (N / N·m): past it the reading saturates. None if unknown."""
+        return None
+
     def status_text(self) -> str:
         return ''
 

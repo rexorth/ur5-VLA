@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 import time
 from abc import ABC, abstractmethod
 from typing import Any
@@ -16,10 +17,24 @@ log = logging.getLogger(__name__)
 
 # Where the simulated arm starts when robot.start_q_deg is unset.
 SIM_HOME_DEG = [0.0, -90.0, 90.0, -90.0, -90.0, 0.0]
+RTDE_PORT = 30004       # the controller's RTDE port, checked for reachability before ur_rtde connects
 
 
 class ArmError(RuntimeError):
     pass
+
+
+def _check_reachable(host: str, port: int, timeout_s: float) -> None:
+    """Fail fast with a clear message if the controller's RTDE port can't be opened: otherwise
+    ur_rtde's constructor blocks indefinitely when the host is unreachable (network down, wrong IP)."""
+    try:
+        with socket.create_connection((host, port), timeout_s):
+            pass
+    except OSError as exc:
+        reason = exc.strerror or str(exc) or type(exc).__name__
+        raise ArmError(f'cannot reach the robot at {host}:{port} within {timeout_s:g} s ({reason}). Is '
+                       f'the network up (ethernet adapter and cable), the robot powered on, and '
+                       f'robot.ip correct?') from exc
 
 
 class RobotNotReady(ArmError):
@@ -119,6 +134,7 @@ class RTDEArm(Arm):
         if self._r is None:
             log.info('connecting to UR at %s, %.0f Hz%s', self.cfg.ip, self.cfg.rate_hz,
                      ' (receive only)' if receive_only else '')
+            _check_reachable(self.cfg.ip, RTDE_PORT, self.cfg.connect_timeout_s)
             self._r = RTDEReceiveInterface(self.cfg.ip, self.cfg.rate_hz)
         if receive_only or self._c is not None:
             return

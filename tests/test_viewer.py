@@ -33,10 +33,12 @@ def test_drain_keeps_each_cameras_newest_frame():
         w.send(('frame', name, (2, 2, 3), float(value)))
         w.send_bytes(np.full(12, value, np.uint8))
         w.send(('info', (f'text {value}', 'col 2')))
-    fresh, info = drain(r, 10)
+    w.send(('prompt', 'hi'))
+    fresh, info, prompt = drain(r, 10)
     assert {name: t for name, (_, t, _) in fresh.items()} == {'base': 3.0, 'wrist': 2.0}
     assert fresh['base'][2] == bytes([3] * 12)
     assert info == ('text 3', 'col 2')
+    assert prompt == 'hi'
     w.close()
     try:
         drain(r, 10)
@@ -46,13 +48,22 @@ def test_drain_keeps_each_cameras_newest_frame():
         raise AssertionError('drain must raise EOFError once the sender has closed')
 
 
+def test_drain_without_a_prompt_message_reports_unset():
+    from ur5vla.viewer import _UNSET
+    r, w = mp.Pipe(duplex=False)
+    w.send(('info', ('a',)))
+    _, info, prompt = drain(r, 10)
+    assert info == ('a',) and prompt is _UNSET       # None would mean "clear the modal"
+    w.close()
+
+
 def _reporting_window(frames, keys, names, title, width):
     """Waits for a whole frame from every camera and the info text, reports each by its initial
     ('i' for the info), then closes."""
     seen, info = {}, None
     t_end = time.monotonic() + 10
     while (len(seen) < len(names) or info is None) and time.monotonic() < t_end:
-        fresh, new_info = drain(frames, 8)
+        fresh, new_info, _ = drain(frames, 8)
         seen.update(fresh)
         info = new_info or info
         time.sleep(0.01)
@@ -108,6 +119,51 @@ def test_close_ends_the_window_whether_it_reads_or_not():
             assert not viewer.is_open()
             if exitcode is not None:
                 assert viewer._proc.exitcode == exitcode    # closed by EOF, not terminated
+    finally:
+        stop(cams)
+
+
+def _answer_prompt(frames, keys, reply):
+    """Drain until a modal prompt (a str) arrives, send `reply` back as the key answering it, then
+    stay alive a while so the parent's ask() reads the answer before the window (process) exits."""
+    t_end = time.monotonic() + 10
+    while time.monotonic() < t_end:
+        try:
+            _, _, prompt = drain(frames, 8)
+        except EOFError:
+            return
+        if isinstance(prompt, str):
+            keys.send(reply)
+            break
+        time.sleep(0.01)
+    time.sleep(3)
+
+
+def _yes_window(frames, keys, names, title, width):
+    _answer_prompt(frames, keys, '\r')          # Enter = yes
+
+
+def _no_window(frames, keys, names, title, width):
+    _answer_prompt(frames, keys, '\x1b')        # Esc = no
+
+
+def test_ask_shows_a_modal_and_returns_the_answer_key():
+    cams = cameras()
+    try:
+        for window, expected in ((_yes_window, True), (_no_window, False)):
+            viewer = CameraViewer(cams, window=window).start()
+            try:
+                assert viewer.ask('Move the arm to the leader?') is expected
+            finally:
+                viewer.close()
+    finally:
+        stop(cams)
+
+
+def test_ask_without_a_window_returns_none():
+    cams = cameras()
+    try:
+        assert CameraViewer(cams).ask('Move?') is None     # never started
     finally:
         stop(cams)
 

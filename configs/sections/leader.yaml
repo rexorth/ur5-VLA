@@ -1,0 +1,31 @@
+# GELLO leader arm (`ur5vla teleop --leader`, `demo --leader`): the arm follows its joints. The UR5
+# GELLO's dimensions, with AS5600 magnetic encoders on a TCA9548A multiplexer, read by a XIAO
+# ESP32C3 (third_party/gello_software, firmware/as5600_leader). docs/procedures.md#45-leader-arm.
+# `ur5vla leader` shows it live; --calibrate (--write) sets the offsets.
+leader:
+  type: gello_as5600
+  port: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_B0:A6:04:00:DC:80-if00
+  channels: [0, 1, 2, 3, 4, 5]          # multiplexer channel of each joint, base to wrist 3
+  joint_signs: [-1, -1, 1, -1, -1, -1]      # GELLO's for a UR; check each with `ur5vla leader --arm`
+  joint_offsets_deg: [-115.22, -14.25, -2.90, 126.47, -19.69, 151.08]               # from --calibrate, with the leader in calibration_q_deg
+  calibration_q_deg: [0, -90, -90, -90, 90, 0]   # the leader's reference pose = robot pointing down the table (toward the printer)
+  gripper_channel: 6                    # the trigger's encoder (null: the gamepad's A/B)
+  gripper_open_deg: 86.6                # from --calibrate
+  gripper_closed_deg: 124.8
+  # Held to move: keyboard (deadman_key, read from the desktop wherever the focus is) | pedal (a USB
+  # foot pedal read straight from /dev/input, grabbed so its key stays off the desktop; program it to
+  # an inert key like F13 first - docs/procedures.md) | gamepad (teleop.buttons.deadman, LB) |
+  # button (ESP32 D1) | none
+  deadman: pedal
+  deadman_key: space          # the keyboard deadman, if deadman: keyboard
+  pedal_name: FootSwitch      # substring of the pedal's /dev/input name (ls /dev/input/by-id)
+  pedal_key: KEY_F13          # the evdev key it sends after `footswitch -2 -k f13`
+  pedal_grab: true            # grab the pedal so F13 never reaches other windows while teleop runs
+  engage_deg: 10                        # the arm takes over once every joint is within this of it
+  disengage_deg: 30                     # and lets go if the leader gets this far ahead
+  max_joint_speed_deg_s: 90
+  catch_up_deg_s: 20
+  # Recovery: hold this key (an X keysym) to creep the arm toward the leader while it is paused
+  # or not following - to back off a stop or re-line-up a lost arm. '' turns it off.
+  nudge_key: n
+  nudge_deg_s: 15

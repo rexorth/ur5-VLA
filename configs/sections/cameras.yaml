@@ -1,0 +1,35 @@
+# Each camera is picked by its vendor ID, not a /dev/video node: OAKs have no video node, and node
+# numbers change between boots. null = the first one found (fine with one of each type). To list:
+#   realsense: rs-enumerate-devices -s   (the "Serial Number" column, not the /dev/v4l/by-id one)
+#   oak:       python -c "import depthai as dai; print([d.getDeviceId() for d in dai.Device.getAllAvailableDevices()])"
+# Both stream colour: RealSense its RGB sensor (rgb8), OAK the sensor on `socket` (CAM_A on an
+# OAK-D: the IMX378; CAM_B/CAM_C are the mono stereo pair). Close OAK Viewer first: one program
+# at a time can hold an OAK.
+# rotate (0/90/180/270, clockwise) turns a camera mounted on its side upright; with 90 or 270 the
+# frames are `width` tall. Fix it before recording demos: a model expects the view it was
+# trained on.
+cameras:
+  # Image settings (docs/procedures.md#image-settings). Focus is fixed, autofocus never runs: the
+  # OAK's 107 was measured with `ur5vla cameras --measure` on 2026-10-23. Exposure and white balance
+  # follow the light, which the skylight changes through the day; every recorded frame keeps the
+  # values it was taken with. Exposure steps with the 50 Hz mains so the lights don't flicker, and
+  # the OAK's stays under 20 ms to limit motion blur (the D415's can't be capped below 33 ms).
+  base:  {type: oak, device_id: "14442C10F10E3BD400", width: 640, height: 480, fps: 30,       # OAK-D
+          focus: 107, max_exposure_us: 20000, mains_hz: 50}
+  wrist: {type: realsense, serial: "234422064578", width: 640, height: 480, fps: 30,         # D415, fixed focus
+          mains_hz: 50}
+  # More scene cameras, to compare placements (docs/procedures.md#74-comparing-camera-sets). Every
+  # camera here is recorded; a policy uses the ones in its camera_map. USB webcams go by their
+  # stable path (ls /dev/v4l/by-id/), never /dev/videoN.
+  # Two webcams in identical bodies, told apart by what they report over USB. Always use the
+  # video-index0 path: index1 is a metadata node with no images.
+  # printer: the printer's front, at table height. Reports itself as "NexiGo N60 FHD Webcam" with
+  # serial 2021030103. Fixed focus; exposure and white balance automatic. Under 50 Hz anti-flicker
+  # it runs at 25 fps (and at 60 Hz it sends no frames at all).
+  #printer: {type: uvc, device: /dev/v4l/by-id/usb-2M_UVC_CAMERA_NexiGo_N60_FHD_Webcam_2021030103-video-index0,
+  #          width: 640, height: 480, fps: 25, mains_hz: 50}
+  # base2: high, looking down over the arm at the table and the printer. Its firmware reports the
+  # generic Linux "USB Webcam gadget" (no serial number, so a second such camera would share this
+  # path: use by-path then). Automatic exposure only, with no focus or white-balance control.
+  #base2: {type: uvc, device: /dev/v4l/by-id/usb-Linux_Foundation_USB_Webcam_gadget-video-index0,
+  #        width: 640, height: 480, fps: 30, mains_hz: 50}

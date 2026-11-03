@@ -139,25 +139,31 @@ def test_axia_streams_scaled_means_and_counts_drops(axia):
     wait_for(lambda: axia.requests[-1] == RDT_STOP)
 
 
-def test_axia_faults_on_sensor_errors_and_silence_then_recovers(axia):
+def test_axia_faults_on_sensor_errors_but_not_overload_then_recovers(axia):
     s = AxiaFTSensor(axia.cfg(timeout_s=0.1))
     s.connect()
     try:
-        axia.status = 1 << 30
+        axia.status = 1 << 2                                                # broken gage: a real fault
         time.sleep(0.05)
-        assert s.fault() == 'sensor reports F/T out of range'
+        assert s.fault() == 'sensor reports broken gage'
         axia.status = 0
         time.sleep(0.05)
         s.fault()                                                           # any packet already in flight
         time.sleep(0.05)
         assert s.fault() is None                                            # clears once the sensor does
-        axia.sending = False                                                # e.g. another client took it
+        axia.status = 1 << 30                                               # F/T out of range (saturation)
+        time.sleep(0.05)
+        s.fault()
+        time.sleep(0.05)
+        assert s.fault() is None                   # overload is NOT a fatal fault: the limits handle it
+        axia.status = 0
+        axia.sending = False                                               # e.g. another client took it
         time.sleep(0.2)
         assert s.fault().startswith('no data for')
-        wait_for(lambda: s.fault() is None, 3.0)                            # asks again after 1 s
+        wait_for(lambda: s.fault() is None, 3.0)                           # asks again after 1 s
     finally:
         s.close()
-    assert status_errors((1 << 3) | (1 << 16)) == []                        # busy, latched: not errors
+    assert status_errors((1 << 3) | (1 << 16)) == []                       # busy, latched: not errors
 
 
 def test_tare_zeroes_the_sensor_and_reports_what_it_took_out(axia):

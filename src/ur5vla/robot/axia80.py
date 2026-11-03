@@ -40,6 +40,11 @@ _RECORD = struct.Struct('>III6i')               # rdt_seq, ft_seq, status, Fx..T
 STATUS_ERRORS = {0: 'temperature out of range', 1: 'supply voltage out of range', 2: 'broken gage',
                  5: 'other error', 27: 'gage out of range', 28: 'simulated error',
                  29: 'calibration checksum error', 30: 'F/T out of range', 31: 'error'}
+# Out-of-range (saturation) bits. These are NOT treated as a fatal fault: a reading over the rated
+# range is handled by the force/torque limits (the clipped reading trips them) and, for torque, by
+# the ft_limit_nm_estimate fallback. Removing them from fault() is what lets that fallback keep
+# moving past the Axia's torque range instead of pausing on a sensor fault.
+OVERLOAD_BITS = frozenset({27, 30})
 FORCE_UNITS_N, TORQUE_UNITS_NM = ('n', '2'), ('nm', 'n-m', 'n·m', '3')   # XML text, or the unit code
 RESTART_AFTER_S = 1.0           # silent this long: ask for the stream again (a power or cable blip)
 # A tare needs a steady load: over its window, no 20 ms mean may stray further than this from
@@ -147,7 +152,10 @@ class AxiaFTSensor(FTSensor):
                     f'from it, such as Axia80Monitor?)')
         with self._lock:
             status, self._status = self._status, 0
-        errors = status_errors(status)
+        # Out-of-range (saturation) is not a fatal fault: the force/torque limits catch the clipped
+        # reading, and the torque fallback (ft_limit_nm_estimate) handles the torque axes.
+        errors = [name for bit, name in STATUS_ERRORS.items()
+                  if bit not in OVERLOAD_BITS and status & (1 << bit)]
         return f"sensor reports {', '.join(errors)}" if errors else None
 
     def status_text(self) -> str:
@@ -196,6 +204,9 @@ class AxiaFTSensor(FTSensor):
 
     def info(self) -> FTInfo:
         return FTInfo(self._rate, self.dropped, self._range, self._offset, self._t_tared)
+
+    def rated_range(self) -> np.ndarray | None:
+        return None if self._range is None else self._range.copy()
 
     def zero(self) -> np.ndarray | None:
         """Its `setbias`, read now (another program may have changed it, or a power cycle cleared it)."""

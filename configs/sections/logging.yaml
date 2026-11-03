@@ -1,0 +1,4 @@
+logging:
+  root: runs
+  image_format: jpg
+  jpeg_quality: 95

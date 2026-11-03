@@ -53,6 +53,9 @@ class RobotState:
     # calibration pose (ur5vla prepare). None
     # without one. Merged in each tick like `gripper`; the arm itself doesn't read it.
     ft: np.ndarray | None = None
+    # (6,) the F/T sensor's rated range per axis (what it can read before it saturates), N / N·m.
+    # None without a sensor. Used to tell when a torque axis is saturated (ft_limit_nm_estimate).
+    ft_range: np.ndarray | None = None
 
     @property
     def contact_wrench(self) -> np.ndarray | None:

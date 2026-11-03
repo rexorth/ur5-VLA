@@ -209,13 +209,16 @@ class TeleopSession:
 
     def __init__(self, cfg: RunConfig, arm: Arm, gripper: Gripper, pad: Pad | None,
                  ft_sensor: FTSensor | None = None, input: TeleopInput | None = None,
-                 nudge_key=None):
+                 nudge_key=None, compliance=None):
         self.cfg = cfg
         self.arm = arm
         self.gripper = gripper
         self.ft = ft_sensor or NoFTSensor()
         self.pad = pad
         self.input = input if input is not None else GamepadInput(cfg, pad)
+        # Admittance (spring) compliance; None = rigid teleop. While following, the executed command
+        # is the input's reference plus this controller's yield offset (control/compliance.py).
+        self.compliance = compliance
         # A held key (keys.HeldKey) that creeps the arm toward the leader to recover from a stop or
         # a lost arm; only for a leader input (it has nudge()/nudge_gripper()).
         self.nudge_key = nudge_key if hasattr(self.input, 'nudge') else None
@@ -282,6 +285,7 @@ class TeleopSession:
         state = self.arm.read_state()
         state.gripper = self.gripper.position()
         state.ft = self.ft.wrench()
+        state.ft_range = self.ft.rated_range()
         return state
 
     def _device_fault(self) -> Violation | None:
@@ -340,8 +344,11 @@ class TeleopSession:
         resume_hint = inp.resume_hint()
         state = self._read_state()
         q_cmd = state.q.copy()
+        q_ref = q_cmd.copy()            # the input's reference; q_cmd = q_ref + compliance yield offset
         g_cmd = self.gripper.position()
         inp.begin()
+        if self.compliance is not None:
+            self.compliance.reset()
         self.status, self.paused = None, False
         enabled = False
         blocked: Violation | None = None
@@ -416,6 +423,7 @@ class TeleopSession:
                     servoed = False
                     if nudging:                     # recovery: creep toward the leader, past the pause
                         q_cmd, g_cmd, self.status, servoed = self._nudge_paused(q_cmd, g_cmd, state, period)
+                        q_ref = q_cmd               # nudge is rigid: keep the reference in step
                         servoing = servoing or servoed
                     elif blocker is not None:
                         self.status = f'PAUSED: {describe(blocker)} Then {resume_hint}.'
@@ -436,6 +444,9 @@ class TeleopSession:
                                                f'Check the pendant, then {resume_hint}.')
                             else:
                                 q_cmd = fresh.q.copy()
+                                q_ref = q_cmd.copy()
+                                if self.compliance is not None:
+                                    self.compliance.reset()
                                 inp.restart(q_cmd)
                                 pause, blocked, self.status, self.paused = None, None, None, False
                                 self.target = q_cmd
@@ -451,22 +462,36 @@ class TeleopSession:
                     enabled = controls.held
                     rec.log_event('enable' if enabled else 'disable')
                 q_next = None
+                nudging_now = False
                 if enabled:
-                    q_next = inp.step(q_cmd, state, period, rec)
+                    q_next = inp.step(q_ref, state, period, rec)
                     g_cmd = inp.gripper(g_cmd, period)
                 else:
-                    inp.hold(q_cmd)
+                    inp.hold(q_ref)
                     if nudging:                     # recovery: creep a not-following arm to the leader
-                        q_next = inp.nudge(q_cmd, period)
+                        q_next = inp.nudge(q_ref, period)
                         g_cmd = inp.nudge_gripper(g_cmd, period)
                         self.status = 'NUDGING toward the leader (recovery)'
+                        nudging_now = True
                     elif blocked is not None:
                         blocked, self.status = None, None
 
-                if q_next is not None:
-                    refused = self.safety.check_command(q_next, q_cmd, state.q)
+                # Compliance (the spring) is on while following: deadman held, actively engaged, and
+                # not a recovery nudge. It re-applies even on a tick the leader sends no new step, so
+                # it is "always on" during teleop; the rest of the time the controller relaxes and
+                # its last yield is folded into the reference so re-engaging does not jump.
+                following = enabled and not nudging_now and getattr(self.input, 'engaged', True)
+                compliant = self.compliance is not None and following
+                if self.compliance is not None and not compliant:
+                    q_ref = q_cmd.copy()
+                    self.compliance.reset()
+                q_ref_next = q_next if q_next is not None else (q_ref if compliant else None)
+
+                if q_ref_next is not None:
+                    q_exec = q_ref_next + self.compliance.offset(state, period) if compliant else q_ref_next
+                    refused = self.safety.check_command(q_exec, q_cmd, state.q)
                     if refused is None:
-                        q_cmd = q_next
+                        q_ref, q_cmd = q_ref_next, q_exec
                         if blocked is not None:
                             blocked, self.status = None, None
                     else:

@@ -1,0 +1,8 @@
+sim:
+  # MuJoCo dry-run of the leader arm (scripts/leader_mujoco.py, docs/procedures.md#45-leader-arm).
+  # The arm starts at robot.start_q_deg and mirrors the leader; nothing here touches the real robot.
+  scene: ../ur5-workspace/scene_real.xml  # UR5 + 2F-85 scene matched to the real cell: a base_match camera + dark backdrop (make_real_scene.py); path is from the repo root. scene_c5.xml is the plain c5 scene.
+  base:                                  # the robot base's pose in the sim, matching the real mounting
+    xyz_mm:  [0.0, 0.0, 0.0]             # nudge the base in the scene (x y z, mm)
+    rpy_deg: [0.0, 0.0, 90.0]            # roll, pitch, yaw about scene x y z (deg); 90 faces the arm down the table to the printer, matching the real mounting (base_match view). -90 faces it back at the operator (reversed).
+  fps: 60                                 # viewer update rate
