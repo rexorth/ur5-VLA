@@ -962,6 +962,13 @@ this PC — UR's own `forceMode` can't see it, so the spring is done in software
   measured wrench joins `observation.state` ([5.1](#51-ur5vla-to-lerobot)), and set
   `include_ft_state: true` in the policy file ([6.3](#63-policy-files)). The action is still the
   commanded position, as always.
+- **At policy run time.** `ur5vla run` applies the **same spring** when `robot.compliance.enabled:
+  true`: the policy's predicted joint target becomes the reference and the admittance adds the
+  force-driven yield on top, through the same SafetyLayer — so the arm gives to contact exactly as it
+  did while the demos were recorded, closing the train/deploy gap. The offset keeps reacting even
+  while the arm settles on the last chunk, and relaxes whenever the arm holds or stops. The run
+  banner prints `COMPLIANCE on`; `safety.ft_limit_n` stays the hard backstop. It is the one
+  `robot.compliance.enabled` switch, so demos and runs are compliant (or rigid) together.
 
 **See it in MuJoCo (dry run).** To watch the arm follow the leader with no robot connected — a
 visual check of the calibration, the joint signs and the ranges, and the trigger — run the arm
@@ -1050,8 +1057,28 @@ Converts recordings to a LeRobot dataset in format v3.0, for LeRobot training.
 | `--images` | Store frames as images instead of AV1 video |
 | `--no-trim` | Keep the idle frames before the first and after the last motion (default: trimmed, keeping 0.3 s of rest at each end) |
 | `--squeeze-pauses S` | Also cut every pause mid-episode down to S seconds (default: pauses kept whole) |
+| `--allow-config-mismatch` | Convert even when the demos were recorded with different data-collection configs (normally an error — see below) |
 
 How frames are built, trimmed, named and written: [architecture.md](architecture.md#dataset-conversion).
+
+**Config consistency (checked before converting).** The converter checks every episode shares a
+config **fingerprint** — a hash of the setup that decides whether runs are *compatible to pool*: the
+same data columns (cameras, gripper, F/T sensor) and the same compliance (on/off and its settings).
+It deliberately ignores what doesn't change what a frame contains: `policy` (the checkpoint changes
+as you train), `control` (policy-run chunking), `logging`, `sim`, the default `prompt`, the whole
+`safety` section (backstop limits bound motion, they don't shape it), and `robot.start_q_deg` /
+`robot.start_poses` (a per-run choice). A mismatch is an error that names the differing section(s)
+and the example runs; pass `--allow-config-mismatch` to pool them anyway (the largest group's config
+is recorded). This stops demos with, say, a different compliance stiffness or camera exposure being
+silently mixed into one training set — the compliance parameters in particular
+[must match between demo and inference](#45-leader-arm) for a compliant policy.
+
+Beside the dataset it writes `<root>/ur5vla_config.json`: the fingerprint, the `compliance` block,
+the `schema` (state/action columns and cameras — the "number of columns"), `has_reference` (whether
+every episode recorded `q_ref`, the commanded reference — `true` means it can also train the
+reference/Option-2 policy; `false` still trains the standard policy), and the full config. So
+datasets from different demo runs can be matched (same fingerprint) or told apart when several kinds
+of data exist. Each recording also stamps its own `config_fingerprint` into `meta.json`.
 
 **Output**, besides the dataset:
 - **Per episode:** frames and seconds kept, idle frames trimmed, how often the deadman was
@@ -1629,6 +1656,7 @@ difference in success rate can be chance.
 | `chunks arrive every … the arm will hold` | `safety.watchdog_max_s` below the expected gap | Raise or unset it, or raise `refill_fraction` |
 | An episode ends with `safety: step` right after starting | The first targets are far from the current pose (wrong policy or start pose) | `policy-check`: the step-0 distance should be small |
 | An OAK isn't found, or `cameras` times out on it | Another program holds it (OAK Viewer, a second `ur5vla`) | Close that program; one at a time can use an OAK |
+| `[depthai] Device … has crashed` on quit | On exit the OAK is closed first and cleanly so its 1.5 s watchdog shuts down with it, not after it; a stray dump can still appear if a close is slow. The next session also retries the connection for a few seconds while the device re-enumerates | Usually harmless and self-recovers. If the next session still can't find it, replug the OAK. To silence the dumps, `export DEPTHAI_DISABLE_CRASHDUMP_COLLECTION=1` |
 | `Robotiq gripper: no answer on …` | No 24 V, wrong port or address, or RS-485 wiring | Check the gripper's LED, `ls /dev/serial/by-id/`, `gripper.slave_id` |
 | `Permission denied` on the gripper port | No access to the serial device | `sudo usermod -aG dialout $USER`, then log in again |
 | An episode ends with `violation: gripper` | Lost link, a gripper fault, or lost activation | `ur5vla gripper -c configs/cell.yaml` shows it; `--activate` clears a major fault |
