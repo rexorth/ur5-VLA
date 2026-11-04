@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -67,7 +68,7 @@ class OakCamera(ThreadedCamera):
         import depthai as dai
         c = self.cfg
         socket = getattr(dai.CameraBoardSocket, c.socket)
-        self._device = dai.Device(dai.DeviceInfo(c.device_id)) if c.device_id else dai.Device()
+        self._device = self._connect(dai)
         self._autofocus = any(f.socket == socket and f.hasAutofocus
                               for f in self._device.getConnectedCameraFeatures())
         if self._autofocus and c.focus is None and not self.automatic:
@@ -81,6 +82,23 @@ class OakCamera(ThreadedCamera):
         out = cam.requestOutput((c.width, c.height), dai.ImgFrame.Type.RGB888i, fps=c.fps)
         self._queue = out.createOutputQueue(maxSize=2, blocking=False)
         self._pipeline.start()
+
+    def _connect(self, dai, tries: int = 6, delay_s: float = 1.0):
+        """Open the device, retrying for a few seconds. After an unclean exit (e.g. a watchdog
+        reset) the OAK is still re-enumerating on USB, so a single attempt would fail the whole
+        session; a short backoff waits it out."""
+        info = dai.DeviceInfo(self.cfg.device_id) if self.cfg.device_id else None
+        last = None
+        for attempt in range(tries):
+            try:
+                return dai.Device(info) if info is not None else dai.Device()
+            except Exception as exc:
+                last = exc
+                if attempt + 1 < tries:
+                    log.warning('camera %s: device not ready (%s); retry %d/%d in %.0f s',
+                                self.name, exc, attempt + 1, tries - 1, delay_s)
+                    time.sleep(delay_s)
+        raise last
 
     def _fix_settings(self, ctrl, control) -> None:
         c = self.cfg
@@ -117,9 +135,17 @@ class OakCamera(ThreadedCamera):
         return self._settings
 
     def _close(self) -> None:
-        if self._pipeline is not None:
-            self._pipeline.stop()
-            self._pipeline = None
-        if self._device is not None:
-            self._device.close()
-            self._device = None
+        # Always reach device.close(): a failed pipeline.stop() must not leave the device open, or
+        # its watchdog (1.5 s on RVC2) resets the OAK -- a "device crashed" dump on quit, and a
+        # device still re-enumerating when the next session tries to connect. Clear the handles
+        # first so a second close (or GC) is a no-op.
+        pipeline, device, self._pipeline, self._device, self._queue = (
+            self._pipeline, self._device, None, None, None)
+        if pipeline is not None:
+            try:
+                pipeline.stop()
+            except Exception:
+                log.exception('camera %s: stopping the pipeline failed; closing the device anyway',
+                              self.name)
+        if device is not None:
+            device.close()
