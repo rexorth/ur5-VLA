@@ -1,6 +1,7 @@
 """Recorded demos -> frames -> a LeRobot dataset (written and read back with the installed LeRobot)."""
 
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -8,10 +9,11 @@ import pytest
 from ur5vla import config as config_mod
 from ur5vla.cameras import build_cameras
 from ur5vla.control.teleop import TeleopSession
-from ur5vla.convert import (EpisodeReport, check_stats, count_events, coverage_grid, episode_frames,
-                            episode_grasps, find_episodes, kept_frames, state_names, write_coverage,
-                            write_dataset)
-from ur5vla.recording import EpisodeRecorder
+from ur5vla.config import config_fingerprint
+from ur5vla.convert import (Episode, EpisodeReport, check_config_consistency, check_stats, count_events,
+                            coverage_grid, episode_frames, episode_grasps, find_episodes, kept_frames,
+                            state_names, write_coverage, write_dataset)
+from ur5vla.recording import META, EpisodeRecorder
 from ur5vla.robot import NoGripper, SimArm
 from ur5vla.robot.kinematics import tool_point
 from ur5vla.teleop.gamepad import GamepadState
@@ -110,7 +112,8 @@ def scripted_episode(path, rate=125.0, cam_fps=30, ft_zeroed=True):
     ft = np.tile([1.0, -2.0, 5.0, 0.1, -0.05, 0.02], (len(t), 1))
     ft[:, 2] += np.where((s >= 2.5) & (s < 5.0), 2.0, 0.0)
     cols = dict(t=t, q=q_cmd, qd=np.zeros_like(q_cmd), tcp_pose=tcp, wrench=np.zeros_like(q_cmd), gripper=g,
-                q_cmd=q_cmd, g_cmd=g_cmd, mode=np.ones(len(t), int), loop_dt=np.full(len(t), 1 / rate), ft=ft)
+                q_cmd=q_cmd, g_cmd=g_cmd, mode=np.ones(len(t), int), loop_dt=np.full(len(t), 1 / rate), ft=ft,
+                q_ref=q_cmd)   # rigid synthetic demo: reference == command
     path.mkdir(parents=True)
     np.savez(path / TICKS, **{k: cols[k] for k in TICK_FIELDS})
     (path / META).write_text(json.dumps({'kind': 'demo', 'prompt': 'put the cube in the container',
@@ -127,6 +130,61 @@ def scripted_episode(path, rate=125.0, cam_fps=30, ft_zeroed=True):
         rows.append(f'{i},{tc},rgb/{i:06d}.jpg,')
     (cam / 'index.csv').write_text('\n'.join(rows) + '\n')
     return find_episodes([path])[0]
+
+
+def _meta_only_episode(d, config, stamp=True):
+    """A minimal episode dir: just a meta.json carrying a config (optionally the record-time fp)."""
+    import json
+    d.mkdir(parents=True)
+    meta = {'kind': 'demo', 'prompt': 'p', 'outcome': {'label': 'success'}, 'config': config}
+    if stamp:
+        meta['config_fingerprint'] = config_fingerprint(config)
+    (d / META).write_text(json.dumps(meta))
+    return d
+
+
+def test_find_episodes_reads_and_recomputes_the_config_fingerprint(tmp_path):
+    cfg = {'robot': {'ip': 'x', 'compliance': {'enabled': True}}, 'cameras': {'base': {}}}
+    stamped = find_episodes([_meta_only_episode(tmp_path / 'a', cfg, stamp=True)])[0]
+    recomputed = find_episodes([_meta_only_episode(tmp_path / 'b', cfg, stamp=False)])[0]
+    assert stamped.fingerprint == recomputed.fingerprint == config_fingerprint(cfg)  # stamp or compute
+
+
+def _ep_with(config):
+    return Episode(Path('.'), 'p', 'demo', 'success', config=config, fingerprint=config_fingerprint(config))
+
+
+def test_config_consistency_check(tmp_path):
+    base = {'robot': {'ip': '10.0.0.1', 'start_q_deg': [0, 0, 0, 0, 0, 0],
+                      'compliance': {'enabled': True, 'stiffness_n_m': 2000}},
+            'cameras': {'base': {'exposure_us': 20000}}, 'policy': {'host': 'a'}, 'safety': {'ft_limit_n': 90}}
+    run1 = tmp_path / 'run1'
+    for i in range(3):
+        _meta_only_episode(run1 / f'ep_{i:03d}', base)
+    eps = find_episodes([run1])
+    assert len({e.fingerprint for e in eps}) == 1
+    fp = check_config_consistency(eps)
+    assert fp == config_fingerprint(base)
+
+    # Ignored, so still one setup: a new checkpoint (policy), a different start pose, a looser limit.
+    for ignored in ({**base, 'policy': {'host': 'elsewhere', 'pretrained_name_or_path': '/ckpt/v2'}},
+                    {**base, 'robot': {**base['robot'], 'start_q_deg': [9, 9, 9, 9, 9, 9]}},
+                    {**base, 'robot': {**base['robot'], 'start_poses': {'a': [1, 2, 3, 4, 5, 6]}}},
+                    {**base, 'safety': {'ft_limit_n': 100, 'max_tcp_speed_m_s': 1.0}}):
+        assert check_config_consistency(eps + [_ep_with(ignored)]) == fp
+
+    # A different compliance stiffness IS a mismatch -> error that names the section.
+    stiffer = {**base, 'robot': {**base['robot'], 'compliance': {'enabled': True, 'stiffness_n_m': 800}}}
+    with pytest.raises(ValueError) as ei:
+        check_config_consistency(eps + [_ep_with(stiffer)])
+    assert 'different configs' in str(ei.value) and 'robot' in str(ei.value)
+    # A different camera exposure is also a mismatch (it shapes the image).
+    assert config_fingerprint({**base, 'cameras': {'base': {'exposure_us': 9999}}}) != fp
+    # ...but either mismatch is allowed through on request (majority config wins).
+    assert check_config_consistency(eps + [_ep_with(stiffer)], allow_mismatch=True) == fp
+
+    # No config recorded at all (older demos): skipped, not an error.
+    assert check_config_consistency([Episode(tmp_path, 'q', 'demo', 'success')]) == ''
 
 
 def test_idle_frames_are_trimmed_at_both_ends_and_pauses_squeezed(tmp_path):

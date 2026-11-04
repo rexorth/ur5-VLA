@@ -15,6 +15,8 @@ warnings: a typo in a safety limit must not silently fall back to a default.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
@@ -571,3 +573,43 @@ def load(path: str | Path, policy_path: str | Path | None = None,
     cfg = parse(raw, source=source)
     cfg.sources = sources
     return cfg
+
+
+# The fingerprint answers "are these runs incompatible to pool?" -- same data columns and the same
+# compliance (on/off and its settings) -- not "is every setting identical". So it covers the
+# signal-shaping setup (the arm and its compliance, the cameras, the gripper, the F/T sensor, the
+# teleop/leader input) and leaves out what does not change what a frame contains:
+#   policy    the inference target (host/port/checkpoint) -- changes every time you train a model
+#   control   chunking/crossfade, used only when running a policy
+#   logging   recorder verbosity
+#   sim       the MuJoCo viewer scene
+#   prompt    the default task (the real per-episode task is recorded per episode)
+#   safety    backstop limits (force/speed/step caps, workspace) -- bound motion, don't shape it
+#   robot.start_q_deg / robot.start_poses   a per-run choice (e.g. A/B start positions), not a setup
+# An entry is a whole section ("safety") or one field of a section ("robot.start_poses").
+# (Whether q_ref -- the commanded reference -- was recorded is a separate capability, tracked per
+# dataset in convert's sidecar, not here: a dataset without it still trains the non-q_ref policy.)
+FINGERPRINT_EXCLUDE = ('policy', 'control', 'logging', 'sim', 'prompt', 'safety',
+                       'robot.start_q_deg', 'robot.start_poses')
+
+
+def fingerprinted_config(raw: dict[str, Any]) -> dict[str, Any]:
+    """The part of a raw config the fingerprint covers: FINGERPRINT_EXCLUDE removed, whole sections
+    and single section fields alike."""
+    kept = {}
+    for section, value in (raw or {}).items():
+        if section in FINGERPRINT_EXCLUDE:
+            continue
+        drop = {e.split('.', 1)[1] for e in FINGERPRINT_EXCLUDE if e.startswith(section + '.')}
+        if drop and isinstance(value, dict):
+            value = {k: v for k, v in value.items() if k not in drop}
+        kept[section] = value
+    return kept
+
+
+def config_fingerprint(raw: dict[str, Any]) -> str:
+    """A stable SHA-256 of fingerprinted_config(raw), so runs that are compatible to pool share a
+    fingerprint and incompatible ones do not. The serialization is canonical -- key order and
+    formatting do not matter, only content -- so two configs that mean the same thing hash the same."""
+    canon = json.dumps(fingerprinted_config(raw), sort_keys=True, separators=(',', ':'), default=str)
+    return hashlib.sha256(canon.encode()).hexdigest()

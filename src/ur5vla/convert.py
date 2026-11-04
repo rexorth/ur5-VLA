@@ -20,6 +20,14 @@ still. --squeeze-pauses also shortens pauses mid-episode. Alongside the dataset 
 coverage.csv (the TCP at every grasp and release) and prints a grid of where the grasps were,
 then checks the q01/q99 statistics pi0.5 normalizes with.
 
+Before converting, it checks every episode was recorded with the same data-collection config --
+the arm and its compliance, the cameras, the gripper, the F/T sensor, the safety envelope and the
+teleop/leader input (config.FINGERPRINT_EXCLUDE lists what is ignored, e.g. the policy checkpoint).
+A mismatch is an error (--allow-config-mismatch overrides it), so demos with different setups are
+not silently pooled into one training set. The shared config and its fingerprint are written to
+ur5vla_config.json beside the dataset, so datasets from different demo runs can be matched -- or
+told apart -- at a glance when several kinds of data exist.
+
 The writer uses whichever LeRobot is importable:
     lerobot 0.6.x                    -> dataset format v3.0 (what LeRobot 0.6 trains from)
     the lerobot pinned by openpi     -> dataset format v2.1 (what openpi trains from)
@@ -43,10 +51,13 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from .config import FINGERPRINT_EXCLUDE, config_fingerprint, fingerprinted_config
 from .policy.lerobot import FT_NAMES, JOINT_NAMES
 from .recording import CAMERAS, EVENTS, META, TICKS, read_index, read_jsonl
 
 log = logging.getLogger(__name__)
+
+CONFIG_META = 'ur5vla_config.json'  # sidecar: the data-collection config + its fingerprint
 
 # A frame is idle when nothing changed since the frame before it, by more than these:
 IDLE_Q_RAD = 1e-4                   # any joint target
@@ -65,6 +76,9 @@ class Episode:
     kind: str                       # demo | rollout
     label: str                      # success | fail | discard | unlabelled
     ft_zeroed: bool = False         # the F/T sensor was zeroed at its calibration pose first
+    config: dict = field(default_factory=dict)   # the run config it was recorded with (meta 'config')
+    fingerprint: str = ''           # config_fingerprint(config): what makes runs (in)compatible
+    has_reference: bool = False     # q_ref (the commanded reference) was recorded -> can train Option 2
 
 
 @dataclass
@@ -86,8 +100,13 @@ def find_episodes(paths: list[str | Path]) -> list[Episode]:
         for d in dirs:
             meta = json.loads((d / META).read_text())
             outcome = meta.get('outcome') or {}
+            config = meta.get('config') or {}
+            # Prefer the fingerprint stamped at record time; recompute it for older recordings.
+            fingerprint = meta.get('config_fingerprint') or (config_fingerprint(config) if config else '')
             found.append(Episode(d, meta.get('prompt', ''), meta.get('kind', 'rollout'),
-                                 outcome.get('label', 'unlabelled'), 'ft_tare' in meta))
+                                 outcome.get('label', 'unlabelled'), 'ft_tare' in meta,
+                                 config=config, fingerprint=fingerprint,
+                                 has_reference='q_ref' in (meta.get('tick_fields') or [])))
     return found
 
 
@@ -357,6 +376,65 @@ def check_cameras(episodes: list[Episode], names: set[str]) -> None:
             raise ValueError(f'{ep.dir}: no camera {sorted(missing)} recorded (it has {sorted(have)})')
 
 
+def _config_sections_differ(a: dict, b: dict) -> list[str]:
+    """Names of the fingerprinted sections that differ between two raw configs (comparing only what
+    the fingerprint covers, so excluded sections/fields never show up as a difference)."""
+    a, b = fingerprinted_config(a), fingerprinted_config(b)
+    return sorted(k for k in (set(a) | set(b)) if a.get(k) != b.get(k))
+
+
+def check_config_consistency(episodes: list[Episode], allow_mismatch: bool = False) -> str:
+    """Make sure every episode was recorded with the same data-collection config, so the dataset is
+    one coherent setup (config.FINGERPRINT_EXCLUDE says what is ignored -- e.g. the policy checkpoint).
+    Returns the shared fingerprint. Raises ValueError on a mismatch unless allow_mismatch (then it
+    warns and returns the most common one). Episodes with no recorded config are skipped with a note."""
+    with_cfg = [e for e in episodes if e.fingerprint]
+    if not with_cfg:
+        log.warning('no config recorded in these episodes; config consistency not checked')
+        return ''
+    if len(with_cfg) < len(episodes):
+        missing = [e.dir.name for e in episodes if not e.fingerprint]
+        log.warning('%d episode(s) have no recorded config, not checked: %s', len(missing),
+                    ', '.join(missing))
+    groups: dict[str, list[Episode]] = {}
+    for e in with_cfg:
+        groups.setdefault(e.fingerprint, []).append(e)
+    if len(groups) == 1:
+        return next(iter(groups))
+    ordered = sorted(groups.values(), key=len, reverse=True)       # largest group is the reference
+    base = ordered[0][0]
+    lines = [f'episodes were recorded with {len(groups)} different configs; a dataset must be one '
+             f'setup (ignoring {", ".join(FINGERPRINT_EXCLUDE)}):']
+    for grp in ordered:
+        ex = grp[0]
+        diff = _config_sections_differ(base.config, ex.config)
+        where = '' if ex is base else f'  <- differs in: {", ".join(diff) or "(key order only)"}'
+        lines.append(f'  {ex.fingerprint[:12]}  {len(grp):>3} episode(s)  e.g. {ex.dir}{where}')
+    msg = '\n'.join(lines)
+    if not allow_mismatch:
+        raise ValueError(msg + '\n  pass --allow-config-mismatch to convert these together anyway.')
+    log.warning('%s\n  --allow-config-mismatch given: converting anyway.', msg)
+    return ordered[0][0].fingerprint
+
+
+def write_config_meta(root: str | Path, fingerprint: str, config: dict, episodes: list[Episode],
+                      schema: dict) -> None:
+    """A sidecar recording what makes this dataset (in)compatible with others and what it can train,
+    so datasets from different demo runs can be matched -- or told apart -- at a glance:
+      config_fingerprint  equal across datasets -> same columns and same compliance: poolable
+      schema              the state/action columns and cameras (the "number of columns")
+      compliance          on/off and its settings (must match demo-time for a compliant policy)
+      has_reference       every episode recorded q_ref -> can train the reference/Option-2 policy
+                          (false still trains the non-q_ref policy; the action is the command)
+    The full config is kept too, for when the fingerprint says "different" and you want to know why."""
+    data = {'config_fingerprint': fingerprint, 'fingerprint_excludes': list(FINGERPRINT_EXCLUDE),
+            'schema': schema, 'compliance': (config.get('robot') or {}).get('compliance'),
+            'has_reference': all(e.has_reference for e in episodes),
+            'n_episodes': len(episodes), 'source_runs': sorted({e.dir.parent.name for e in episodes}),
+            'config': config}
+    (Path(root) / CONFIG_META).write_text(json.dumps(data, indent=2))
+
+
 def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument('paths', nargs='+', help='episode dirs, or run dirs containing ep_* dirs')
     p.add_argument('--repo-id', required=True, help='dataset name, e.g. <hf-user>/ur5_pick')
@@ -379,6 +457,9 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
                    help='keep the idle frames before the first and after the last motion')
     p.add_argument('--squeeze-pauses', type=float, metavar='S',
                    help='also cut every pause mid-episode down to S seconds (default: pauses kept whole)')
+    p.add_argument('--allow-config-mismatch', action='store_true',
+                   help='convert even if the demos were recorded with different data-collection configs '
+                        '(normally an error; the arm/compliance, cameras, gripper and F/T must match)')
 
 
 def run(args) -> int:
@@ -387,6 +468,12 @@ def run(args) -> int:
     if not episodes:
         print(f'no episodes with label in {sorted(labels)} and kind in {sorted(kinds)}', file=sys.stderr)
         return 2
+    try:
+        fingerprint = check_config_consistency(episodes, allow_mismatch=args.allow_config_mismatch)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    rep_config = next((e.config for e in episodes if e.fingerprint == fingerprint), {})
     if args.camera_set:
         if args.camera:
             print('use --camera or --camera-set, not both', file=sys.stderr)
@@ -413,10 +500,18 @@ def run(args) -> int:
         ds, reports = write_dataset(episodes, repo_id, root, args.fps, cameras,
                                     include_gripper=not args.no_gripper, use_videos=not args.images,
                                     trim=not args.no_trim, squeeze_s=args.squeeze_pauses, include_ft=args.ft)
+        if fingerprint:
+            schema = {'state': state_names(not args.no_gripper, args.ft),
+                      'action': state_names(not args.no_gripper), 'cameras': sorted(cameras.values())}
+            write_config_meta(root, fingerprint, rep_config, episodes, schema)
         written = [r for r in reports if r.frames]
         frames = sum(r.frames for r in written)
         print(f'wrote {frames} frames ({frames / args.fps / 60:.1f} min) in {len(written)} episode(s) to '
-              f'{root}; {sum(r.trimmed for r in reports)} idle frames trimmed')
+              f'{root}; {sum(r.trimmed for r in reports)} idle frames trimmed'
+              + (f'; config {fingerprint[:12]} ({CONFIG_META})' if fingerprint else ''))
+        if fingerprint and not all(e.has_reference for e in episodes):
+            print('  note: not every episode recorded q_ref (the commanded reference); this dataset '
+                  'trains the standard (non-reference) policy only')
         if args.camera_set:
             print(f"  its policy file: camera_map: {{{', '.join(f'{c}: {c}' for c in cameras.values())}}}")
         if k:
