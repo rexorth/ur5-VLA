@@ -30,7 +30,7 @@ import numpy as np
 from PIL import Image
 
 from .cameras.base import CameraSource
-from .config import LoggingConfig
+from .config import LoggingConfig, config_fingerprint
 from .types import Frame
 
 log = logging.getLogger(__name__)
@@ -44,8 +44,14 @@ INDEX = 'index.csv'
 SETTING_FIELDS = ('focus', 'exposure_us', 'iso', 'gain', 'white_balance_k')   # Frame.settings
 INDEX_FIELDS = ('seq', 't_capture', 'rgb', 'depth', *SETTING_FIELDS)
 
-# Columns of ticks.npz, in the order log_tick() receives them.
-TICK_FIELDS = ('t', 'q', 'qd', 'tcp_pose', 'wrench', 'gripper', 'q_cmd', 'g_cmd', 'mode', 'loop_dt', 'ft')
+# Columns of ticks.npz, in the order log_tick() receives them. q_ref pairs with q_cmd: q_cmd is the
+# executed command sent to servoJ, q_ref the pre-compliance reference (the leader or policy target
+# before the admittance yield). With rigid control the two are equal; the spring offset, if it is
+# ever wanted, is q_cmd - q_ref, so it is not stored separately. q_ref lets a future conversion use
+# the reference as the action and re-apply the spring live at inference (docs/procedures.md
+# compliance, "At policy run time"). Older recordings predate the field; readers must guard on it.
+TICK_FIELDS = ('t', 'q', 'qd', 'tcp_pose', 'wrench', 'gripper', 'q_cmd', 'g_cmd', 'mode', 'loop_dt',
+               'ft', 'q_ref')
 
 
 def _jsonable(x: Any) -> Any:
@@ -112,6 +118,9 @@ class EpisodeRecorder:
             'git_commit': git_commit(),
             'tick_fields': list(TICK_FIELDS),
         }
+        # Self-identify the data-collection setup: convert checks every demo in a dataset shares it.
+        if 'config' in meta:
+            self._meta['config_fingerprint'] = config_fingerprint(meta['config'])
         self._write_meta()
         self._chunks_f = (self.dir / CHUNKS).open('w')
         self._events_f = (self.dir / EVENTS).open('w')
@@ -215,7 +224,7 @@ class EpisodeRecorder:
         rows = self._ticks
         arrays = {}
         for i, key in enumerate(TICK_FIELDS):
-            col = [r[i] for r in rows]
+            col = [r[i] if i < len(r) else None for r in rows]   # a caller that omits a trailing field -> NaN
             proto = next((v for v in col if isinstance(v, np.ndarray)), None)
             if proto is not None:   # None (e.g. no command this tick) -> a row of NaN
                 nan = np.full(proto.shape, np.nan)

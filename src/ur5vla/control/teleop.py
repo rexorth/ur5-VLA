@@ -455,7 +455,8 @@ class TeleopSession:
                                 log.info('teleop: resumed')
                     rec.log_tick(now, state.q, state.qd, state.tcp_pose, state.wrench, state.gripper,
                                  q_cmd.copy() if servoed else None, g_cmd if servoed else None,
-                                 int(Mode.SERVO if servoed else Mode.HOLD), loop_dt, state.ft)
+                                 int(Mode.SERVO if servoed else Mode.HOLD), loop_dt, state.ft,
+                                 q_ref.copy() if servoed else None)   # rigid while paused: q_ref == q_cmd
                     self.arm.wait_period(token)
                     continue
 
@@ -515,7 +516,8 @@ class TeleopSession:
                 self.target = q_cmd
                 self.gripper.command(g_cmd)
                 rec.log_tick(now, state.q, state.qd, state.tcp_pose, state.wrench, state.gripper,
-                             q_cmd.copy(), g_cmd, int(Mode.SERVO), loop_dt, state.ft)
+                             q_cmd.copy(), g_cmd, int(Mode.SERVO), loop_dt, state.ft,
+                             q_ref.copy())   # the reference behind q_cmd; q_cmd - q_ref = the spring yield
                 self.arm.wait_period(token)
         except Exception as exc:
             log.exception('teleop loop failed')

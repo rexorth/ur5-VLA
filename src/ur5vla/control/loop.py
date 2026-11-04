@@ -18,6 +18,14 @@ What stops the arm:
       anything unexpected as `error`.
 If the buffer runs dry without tripping either, the last target is re-sent: the arm settles on
 it and stays in servo mode until the next chunk or the watchdog.
+
+Compliance (optional): with an AdmittanceController the executed command is the policy's joint
+target plus a force-driven yield offset -- the same spring used in teleop and demo recording
+(control/compliance.py) -- so the arm gives to contact instead of pushing rigidly to the target,
+matching how the demonstrations were collected. The offset is re-applied every tick the arm is
+servoing (including while it settles on the last target, so the spring keeps reacting when no fresh
+chunk has arrived) and relaxed whenever the arm stops or holds. The executed command, not the raw
+target, goes through SafetyLayer.check_command, and safety.ft_limit_n stays the hard backstop.
 """
 
 from __future__ import annotations
@@ -68,7 +76,8 @@ class EpisodeResult:
 
 class ControlLoop:
     def __init__(self, cfg: RunConfig, arm: Arm, gripper: Gripper, cameras: dict[str, CameraSource],
-                 backend: PolicyBackend, policy_info: PolicyInfo, ft_sensor: FTSensor | None = None):
+                 backend: PolicyBackend, policy_info: PolicyInfo, ft_sensor: FTSensor | None = None,
+                 compliance=None):
         missing = set(policy_info.cameras) - set(cameras)
         if missing:
             raise ValueError(f'policy wants camera(s) {sorted(missing)} that are not configured')
@@ -76,6 +85,10 @@ class ControlLoop:
         self.arm = arm
         self.gripper = gripper
         self.ft = ft_sensor or NoFTSensor()
+        # Admittance (spring) compliance, matching teleop/demo recording; None = rigid position
+        # control. When set, the policy's joint target is the reference and this controller adds a
+        # force-driven yield offset on top (control/compliance.py), run through the same SafetyLayer.
+        self.compliance = compliance
         self.cameras = cameras
         self.backend = backend
         self.policy_info = policy_info
@@ -197,7 +210,8 @@ class ControlLoop:
         period = self.cfg.robot.period_s
         rec = self._recorder
         mode = Mode.IDLE
-        q_cmd: np.ndarray | None = None
+        q_ref: np.ndarray | None = None     # the policy's latest joint target (no compliance offset)
+        q_cmd: np.ndarray | None = None     # the last executed command (q_ref + yield offset) the arm tracks
         g_cmd = 0.0
         t_prev = None
         try:
@@ -218,6 +232,8 @@ class ControlLoop:
                     violation = Violation('ft_sensor', {'fault': ft_fault})
                 hold_reason = None
                 target = None
+                q_exec = None           # the command to send this tick (reference + any yield offset)
+                g_next = g_cmd
                 if violation is None:
                     deadline = self._watchdog_deadline
                     if self._stale.is_set():
@@ -226,9 +242,18 @@ class ControlLoop:
                         hold_reason = 'watchdog'
                     else:
                         target = self.buffer.sample(now)
-                        if target is not None:
-                            ref = q_cmd if mode == Mode.SERVO else state.q
-                            violation = self.safety.check_command(target[0], ref, state.q)
+                        if target is not None or mode == Mode.SERVO:
+                            if target is not None:
+                                q_ref, g_next = target          # fresh chunk; else settle on the last ref
+                            # The spring adds a force-driven yield offset on top of the reference, so
+                            # the executed command -- not the raw target -- is what we validate and send.
+                            q_exec = (q_ref + self.compliance.offset(state, period)
+                                      if self.compliance is not None else q_ref)
+                            # A fresh target is always checked; a settle tick only when the spring moved
+                            # it (otherwise it is the command we already validated and sent last tick).
+                            if target is not None or self.compliance is not None:
+                                ref = q_cmd if mode == Mode.SERVO else state.q
+                                violation = self.safety.check_command(q_exec, ref, state.q)
 
                 sent = None
                 if violation is not None:
@@ -243,24 +268,25 @@ class ControlLoop:
                         self._holds += 1
                         mode = Mode.HOLD
                         rec.log_event('hold', reason=hold_reason)
-                elif target is not None or mode == Mode.SERVO:
-                    if target is None:
-                        target = q_cmd, g_cmd   # buffer ran dry: settle on the last target
-                    elif mode == Mode.HOLD:
+                        if self.compliance is not None:
+                            self.compliance.reset()         # relax the spring while the arm is stopped
+                elif q_exec is not None:
+                    if target is not None and mode == Mode.HOLD:
                         rec.log_event('resume')
                     try:
-                        self.arm.servo_j(target[0])
+                        self.arm.servo_j(q_exec)
                     except ArmError:
                         violation = self.safety.refusal(self.arm.read_state())
                         mode = Mode.STOPPED
                         self._stop(violation)
                     else:
-                        q_cmd, g_cmd = target
+                        q_cmd, g_cmd = q_exec, g_next
                         self.gripper.command(g_cmd)
                         mode, sent = Mode.SERVO, q_cmd
 
                 rec.log_tick(now, state.q, state.qd, state.tcp_pose, state.wrench, state.gripper,
-                             sent, g_cmd if sent is not None else None, int(mode), loop_dt, state.ft)
+                             sent, g_cmd if sent is not None else None, int(mode), loop_dt, state.ft,
+                             q_ref if sent is not None else None)   # reference behind q_cmd; q_cmd - q_ref = spring
                 if mode == Mode.STOPPED:
                     return
                 self.arm.wait_period(token)

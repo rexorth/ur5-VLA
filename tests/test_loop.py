@@ -21,7 +21,7 @@ SINE = {'backend': 'replay', 'action_hz': 15, 'chunk_len': 15, 'latency_s': 0.05
 
 
 def run(tmp_path, cameras_cfg, policy, *, name='ep', seconds=1.5, cameras=None, gripper=None, arm=None,
-        ft=None, **cfg_over):
+        ft=None, compliance=None, **cfg_over):
     raw = {'robot': {'dry_run': True}, 'cameras': cameras_cfg,
            'policy': policy if isinstance(policy, dict) else {}, **cfg_over}
     cfg = config_mod.parse(raw)
@@ -31,7 +31,12 @@ def run(tmp_path, cameras_cfg, policy, *, name='ep', seconds=1.5, cameras=None, 
     try:
         arm = arm or SimArm(cfg.robot)
         backend = policy if isinstance(policy, PolicyBackend) else build_backend(cfg.policy)
-        loop = ControlLoop(cfg, arm, gripper or NoGripper(), cams, backend, backend.connect(), ft)
+        comp = None
+        if compliance is not None:
+            from ur5vla.control.compliance import AdmittanceController
+            comp = AdmittanceController(compliance, cfg.safety.tcp_offset_m)
+        loop = ControlLoop(cfg, arm, gripper or NoGripper(), cams, backend, backend.connect(), ft,
+                           compliance=comp)
         loop.warmup('test')
         rec = EpisodeRecorder(tmp_path / name, cams, cfg.logging)
         rec.start({'test': True})
@@ -227,3 +232,77 @@ def test_watchdog_hard_cap_still_applies(tmp_path):
     result, ep, _ = run(tmp_path, {}, LONG_CHUNKS, seconds=4.0, safety={'watchdog_max_s': 1.0})
     kinds = events(ep)
     assert 'timing_warning' in kinds and result.holds >= 1
+
+
+class SteadyFT:
+    """An F/T sensor that always reports the same wrench: a steady contact force to yield to."""
+    def __init__(self, wrench):
+        self._w = np.asarray(wrench, dtype=float)
+
+    def connect(self):
+        pass
+
+    def close(self):
+        pass
+
+    def wrench(self):
+        return self._w.copy()
+
+    def fault(self):
+        return None
+
+    def rated_range(self):
+        return np.array([200.0, 200.0, 200.0, 10.0, 10.0, 10.0])
+
+
+class HoldBackend(PolicyBackend):
+    """Commands a fixed joint target (the first pose it sees): rigidly the arm holds still, so any
+    motion of the command is the compliance spring."""
+    def __init__(self):
+        self.q0 = None
+
+    def connect(self):
+        return PolicyInfo('hold', 10, 0.1, [])
+
+    def infer(self, obs):
+        if self.q0 is None:
+            self.q0 = obs.q.copy()
+        return ActionChunk(np.tile(self.q0, (10, 1)), np.zeros(10), 0.1, obs.t)
+
+    def reset(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_compliance_yields_the_command_to_a_steady_force(tmp_path):
+    """With an admittance controller the policy's target is a reference the arm springs off under
+    force -- the same spring teleop/demos use -- instead of tracking it rigidly."""
+    from ur5vla.config import ComplianceConfig
+    from ur5vla.robot.kinematics import fk
+    force = [0.0, 0.0, -20.0, 0.0, 0.0, 0.0]        # 20 N on the flange, under ft_limit_n (30 N)
+
+    def sent(ticks):
+        m = ~np.isnan(ticks['q_cmd'][:, 0])
+        return ticks['q_cmd'][m], ticks['q_ref'][m]
+
+    # Rigid: the held command never moves, and the reference equals the command (no spring).
+    rigid, ep_r, _ = run(tmp_path, {}, HoldBackend(), name='rigid', ft=SteadyFT(force))
+    cmd_r, ref_r = sent(np.load(ep_r / TICKS))
+    assert rigid.end_reason == 'timeout', rigid
+    assert np.abs(cmd_r - cmd_r[0]).max() < 1e-9
+    assert np.array_equal(cmd_r, ref_r)                             # q_cmd == q_ref: spring offset is zero
+
+    # Compliant: the same force springs the command off the held pose and settles there.
+    comp, ep_c, _ = run(tmp_path, {}, HoldBackend(), name='compliant', ft=SteadyFT(force),
+                        compliance=ComplianceConfig(enabled=True))
+    cmd_c, ref_c = sent(np.load(ep_c / TICKS))
+    assert comp.end_reason == 'timeout', comp
+    assert np.abs(cmd_c[-1] - cmd_c[0]).max() > 1e-3                 # the spring moved the command
+    yielded = np.linalg.norm(fk(cmd_c[-1])[:3, 3] - fk(cmd_c[0])[:3, 3])
+    assert 0.002 < yielded < 0.02                   # ~ |F_deadbanded| / stiffness = 15 N / 2000 N/m
+    # q_ref is recorded, holds the policy's reference (never moved), and q_cmd - q_ref is the yield:
+    # exactly what a future Option-2 conversion needs to recover the reference.
+    assert np.abs(ref_c - ref_c[0]).max() < 1e-9                    # the reference is the held target
+    assert np.abs(cmd_c[-1] - ref_c[-1]).max() > 1e-3              # offset = q_cmd - q_ref is nonzero
