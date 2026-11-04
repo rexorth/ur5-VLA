@@ -249,7 +249,7 @@ def test_start_pose_outside_our_limits_is_refused_without_moving(capsys):
     cfg = _cfg(safety={'workspace_min_m': [-0.1, -0.1, 0.5], 'workspace_max_m': [0.1, 0.1, 0.6]})
     cfg.robot.start_q_deg = [0.0, -90.0, 90.0, -90.0, -90.0, 0.0]
     arm = SimArm(cfg.robot)
-    assert cli._move_to_start(cfg, arm, assume_yes=True) is False
+    assert cli._move_to_start(cfg, arm, assume_yes=True) == cli.REFUSED
     assert 'start pose refused: The TCP would leave the workspace box' in capsys.readouterr().out
 
 
@@ -258,7 +258,7 @@ def test_failed_move_to_start_returns_false(capsys):
     cfg.robot.start_q_deg = [0.0, -90.0, 90.0, -90.0, -90.0, 0.0]
     arm = SimArm(cfg.robot)
     arm.simulate_stop(3)
-    assert cli._move_to_start(cfg, arm, assume_yes=True) is False
+    assert cli._move_to_start(cfg, arm, assume_yes=True) == cli.REFUSED
     assert 'move to the start pose failed' in capsys.readouterr().out
 
 

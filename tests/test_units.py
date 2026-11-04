@@ -461,6 +461,33 @@ def test_move_to_refuses_the_swing_before_asking_or_moving(capsys):
     cfg = config_mod.parse({'robot': {'dry_run': True, 'start_q_deg': np.rad2deg(SWEEP_FROM).tolist()},
                             'safety': {'workspace_min_m': lo, 'workspace_max_m': hi, 'tcp_offset_m': TOOL}})
     arm = SimArm(cfg.robot)
-    assert cli._move_to(cfg, arm, np.rad2deg(SWEEP_TO).tolist(), 'start pose', assume_yes=True) is False
+    assert cli._move_to(cfg, arm, np.rad2deg(SWEEP_TO).tolist(), 'start pose', assume_yes=True) == cli.REFUSED
     assert 'start pose refused: On the way there' in capsys.readouterr().out
     assert np.allclose(arm.read_state().q, SWEEP_FROM)                    # it never moved
+
+
+def test_move_to_distinguishes_declined_from_moved(monkeypatch):
+    from ur5vla import cli
+    from ur5vla.robot import SimArm
+    start = [0.0, -90.0, 90.0, -90.0, -90.0, 0.0]
+    cfg = config_mod.parse({'robot': {'dry_run': True, 'start_q_deg': start}})
+    arm = SimArm(cfg.robot)
+    q_to = [0.0, -90.0, 80.0, -90.0, -90.0, 0.0]
+    monkeypatch.setattr(cli, '_confirm', lambda *a, **k: False)              # the operator declines
+    assert cli._move_to(cfg, arm, q_to, 'start pose', assume_yes=False) == cli.DECLINED
+    assert np.allclose(arm.read_state().q, np.deg2rad(start))              # declining does not move
+    monkeypatch.setattr(cli, '_confirm', lambda *a, **k: True)              # the operator agrees
+    assert cli._move_to(cfg, arm, q_to, 'start pose', assume_yes=False) == cli.MOVED
+    assert np.allclose(arm.read_state().q, np.deg2rad(q_to))               # and now it moved
+
+
+def test_start_meta_is_honest_when_the_start_move_is_declined():
+    import argparse
+    from ur5vla import cli
+    from ur5vla.robot import SimArm
+    args = argparse.Namespace(start=None)
+    cfg = config_mod.parse({'robot': {'dry_run': True, 'start_q_deg': [0, -90, 90, -90, -90, 0]}})
+    arm = SimArm(cfg.robot)
+    assert cli._start_meta(cfg, args) == {'name': None, 'q_deg': cfg.robot.start_q_deg}   # moved (default)
+    declined = cli._start_meta(cfg, args, moved=False, arm=arm)
+    assert declined['moved_to_start'] is False and len(declined['q_deg_actual']) == 6

@@ -24,6 +24,36 @@ def test_scenarios_parse_strings_and_mappings(tmp_path):
     assert scenarios[0].label == 'put the cube in the box' and scenarios[1].label == 'reset'
 
 
+def test_scenario_accepts_raw_start_joints(tmp_path):
+    f = tmp_path / 'd.yaml'
+    f.write_text('scenarios:\n'
+                 '  - prompt: "put the cube in the box"\n'
+                 '    start_q_deg: [0, -90, 90, -90, -90, 0]\n')
+    scenarios, _ = load_demos(f)
+    assert scenarios[0].start is None
+    assert scenarios[0].start_q_deg == (0.0, -90.0, 90.0, -90.0, -90.0, 0.0)
+
+
+def test_scenario_rejects_both_start_and_raw_joints(tmp_path):
+    f = tmp_path / 'd.yaml'
+    f.write_text('scenarios:\n'
+                 '  - {prompt: z, start: pick_table, start_q_deg: [0, 0, 0, 0, 0, 0]}\n')
+    with pytest.raises(DemoError, match='both `start` and `start_q_deg`'):
+        load_demos(f)
+
+
+def test_scenario_rejects_malformed_raw_joints(tmp_path):
+    def load(joints):
+        p = tmp_path / 'x.yaml'
+        p.write_text(f'scenarios:\n  - {{prompt: z, start_q_deg: {joints}}}\n')
+        return load_demos(p)
+
+    with pytest.raises(DemoError, match='needs 6 joint angles'):
+        load('[0, 0, 0]')
+    with pytest.raises(DemoError, match='must be 6 numbers'):
+        load('[a, b, c, d, e, f]')
+
+
 def test_demos_file_errors(tmp_path):
     def load(text):
         p = tmp_path / 'x.yaml'
@@ -71,6 +101,16 @@ def test_schedule_from_file_uses_its_rounds(tmp_path):
 def test_schedule_legacy_single_prompt_uses_episodes():
     scenarios, rounds, scheduled = cli._demo_schedule(_args(prompt='solo', episodes=4), _cfg())
     assert [s.prompt for s in scenarios] == ['solo'] and rounds == 4 and not scheduled
+
+
+def test_schedule_accepts_raw_start_joints_without_a_named_pose(tmp_path):
+    f = tmp_path / 'd.yaml'
+    f.write_text('scenarios:\n  - {prompt: z, start_q_deg: [0, -90, 90, -90, -90, 0]}\n')
+    # cfg has no start_poses at all, yet raw joints need no name lookup
+    scenarios, _, scheduled = cli._demo_schedule(_args(demos=str(f)), config_mod.parse({}))
+    assert scheduled and scenarios[0].start_q_deg == (0.0, -90.0, 90.0, -90.0, -90.0, 0.0)
+    assert cli._scenario_start(config_mod.parse({}), scenarios[0]) == (
+        [0.0, -90.0, 90.0, -90.0, -90.0, 0.0], 'start pose')
 
 
 def test_schedule_rejects_an_unknown_start_pose(tmp_path):

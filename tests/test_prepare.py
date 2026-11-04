@@ -227,7 +227,7 @@ def test_declining_the_calibration_move_offers_running_on_the_last_tare(tmp_path
     monkeypatch.chdir(tmp_path)
     cfg = config_mod.load(cell(tmp_path))
     _write_record(tmp_path)
-    monkeypatch.setattr(cli, '_ask', lambda *a, **k: 'r')             # operator: run anyway
+    monkeypatch.setattr(cli, '_enter_or_esc', lambda *a, **k: True)   # operator: Enter = run anyway
     ft = RecallFT()
     meta = cli._skip_tare_or_exit(cfg, ft)
     assert meta['ft_tare'] == {'q_deg': TARE_Q, 'time': 100.0, 'drift': [0.0] * 6,
@@ -240,7 +240,7 @@ def test_declining_the_calibration_move_can_exit(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     cfg = config_mod.load(cell(tmp_path))
     _write_record(tmp_path)
-    monkeypatch.setattr(cli, '_ask', lambda *a, **k: '')              # operator: exit
+    monkeypatch.setattr(cli, '_enter_or_esc', lambda *a, **k: False)  # operator: Esc = exit
     ft = RecallFT()
     assert cli._skip_tare_or_exit(cfg, ft) is None
     assert ft.recalled is None

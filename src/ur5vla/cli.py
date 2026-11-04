@@ -30,8 +30,10 @@ import logging
 import math
 import queue
 import sys
+import termios
 import threading
 import time
+import tty
 from collections.abc import Callable
 from pathlib import Path
 
@@ -107,11 +109,54 @@ def _ask(prompt: str, assume_yes: bool, default: str = '') -> str:
     return input(prompt).strip().lower()
 
 
-def _move_to_start(cfg: config_mod.RunConfig, arm, assume_yes: bool, name: str | None = None) -> bool:
-    """moveJ to robot.start_q_deg (set from robot.start_poses[name] by --start) after
-    confirmation; True at once if none is set."""
+def _confirm(question: str, assume_yes: bool) -> bool:
+    """A yes/no question: Enter or y/yes is yes, n/no is no, anything else re-asks (never a silent
+    no). True at once with assume_yes (--yes/--no-prompt)."""
+    if assume_yes:
+        return True
+    while True:
+        answer = input(f'{question} [Y/n] ').strip().lower()
+        if answer in ('', 'y', 'yes'):
+            return True
+        if answer in ('n', 'no'):
+            return False
+        print('please answer y or n (Enter = yes)')
+
+
+def _enter_or_esc(prompt: str) -> bool:
+    """A single-key choice: Enter is True, Esc is False, anything else re-asks. Reads one keypress
+    (no Enter needed) in cbreak mode. False (the safe default) when stdin is not a terminal."""
+    if not sys.stdin.isatty():
+        return False
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while True:
+            print(prompt, end='', flush=True)
+            key = sys.stdin.read(1)
+            print(flush=True)
+            if key in ('\r', '\n'):
+                return True
+            if key in ('\x1b', ''):             # Esc, or EOF (stdin closed)
+                return False
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+# Outcome of a confirmed moveJ (_move_to / _move_to_start). DECLINED (the operator said no) is kept
+# apart from REFUSED (the pose/path is unsafe or the move failed) so a caller can let a decline carry
+# on from where the arm is while a refusal still stops.
+MOVED, DECLINED, REFUSED = 'moved', 'declined', 'refused'
+
+
+def _move_to_start(cfg: config_mod.RunConfig, arm, assume_yes: bool, name: str | None = None) -> str:
+    """moveJ to robot.start_q_deg (set from robot.start_poses[name] by --start) after confirmation.
+    MOVED at once if none is set. Returns MOVED / DECLINED / REFUSED."""
+    if cfg.robot.start_q_deg is None:
+        return MOVED
     what = f"start pose '{name}'" if name else 'start pose'
-    return cfg.robot.start_q_deg is None or _move_to(cfg, arm, cfg.robot.start_q_deg, what, assume_yes)
+    return _move_to(cfg, arm, cfg.robot.start_q_deg, what, assume_yes)
 
 
 def _warn_if_not_zeroed(ft) -> None:
@@ -123,24 +168,41 @@ def _warn_if_not_zeroed(ft) -> None:
                     "zeroes it at the calibration pose.")
 
 
-def _start_meta(cfg: config_mod.RunConfig, args) -> dict:
+def _start_meta(cfg: config_mod.RunConfig, args, moved: bool = True, arm=None) -> dict:
     """The start pose an episode used, for its meta.json (the saved config shows the file's, not
-    --start's): its name in robot.start_poses (None = robot.start_q_deg) and its joints."""
-    return {'name': args.start, 'q_deg': cfg.robot.start_q_deg}
+    --start's): its name in robot.start_poses (None = robot.start_q_deg) and its joints. When the
+    operator declined the move (moved=False), the episode began wherever the arm was: record that,
+    and the actual joints, so the start is honest rather than the pose it didn't go to."""
+    meta = {'name': args.start, 'q_deg': cfg.robot.start_q_deg}
+    if not moved and cfg.robot.start_q_deg is not None:
+        meta['moved_to_start'] = False
+        if arm is not None:
+            meta['q_deg_actual'] = np.round(np.rad2deg(arm.read_state().q), 2).tolist()
+    return meta
+
+
+def _scenario_start(cfg: config_mod.RunConfig, sc) -> tuple[list[float], str] | None:
+    """Where a scheduled scenario starts, as (joints in deg, a label), or None to continue from the
+    current state. From its raw `start_q_deg`, else its `start` name in robot.start_poses."""
+    if sc.start_q_deg is not None:
+        return list(sc.start_q_deg), 'start pose'
+    if sc.start is not None:
+        return list(cfg.robot.start_poses[sc.start]), f"start pose '{sc.start}'"
+    return None
 
 
 def _move_to(cfg: config_mod.RunConfig, arm, q_deg: list[float], what: str, assume_yes: bool,
-             confirm: Callable[[str], bool] | None = None) -> bool:
-    """moveJ to q_deg after confirmation. False if the operator declines, the pose is outside our
-    limits or the robot's, the TCP would leave the workspace box on the way (check_path), or the
-    move doesn't complete. `confirm`: ask the question some other way (the --view modal) instead of
-    the terminal [y/N] prompt."""
+             confirm: Callable[[str], bool] | None = None) -> str:
+    """moveJ to q_deg after confirmation. Returns MOVED, DECLINED (the operator said no), or REFUSED
+    (the pose is outside our limits or the robot's, the TCP would leave the workspace box on the way
+    (check_path), or the move didn't complete). `confirm`: ask the question some other way (the
+    --view modal) instead of the terminal [Y/n] prompt."""
     q = np.deg2rad(q_deg)
     check = SafetyLayer(cfg.safety, cfg.robot.period_s)
     refused = check.check_command(q, q)
     if refused is not None:
         print(f'{what} refused: {describe(refused)}')
-        return False
+        return REFUSED
     try:
         inside = arm.within_robot_limits(q)
     except Exception as exc:                # a check, not a requirement
@@ -149,23 +211,23 @@ def _move_to(cfg: config_mod.RunConfig, arm, q_deg: list[float], what: str, assu
     if not inside:
         print(f"{what} refused: it is outside the robot's own safety limits (the pendant's joint "
               f"limits or safety planes) or out of reach")
-        return False
+        return REFUSED
     q_now = arm.read_state().q
     refused = check.check_path(q_now, q)
     if refused is not None:
         print(f'{what} refused: {describe(refused)}')
-        return False
+        return REFUSED
     print(f'{what} {list(q_deg)} deg (now {np.round(np.rad2deg(q_now), 1).tolist()})')
     question = f'move there at {cfg.robot.move_speed_deg_s:.0f} deg/s?'
-    ok = confirm(question) if confirm is not None else _ask(f'{question} [y/N] ', assume_yes, 'y') == 'y'
+    ok = confirm(question) if confirm is not None else _confirm(question, assume_yes)
     if not ok:
-        return False
+        return DECLINED
     try:
         arm.move_j(q, np.deg2rad(cfg.robot.move_speed_deg_s), np.deg2rad(cfg.robot.move_accel_deg_s2))
     except ArmError as exc:
         print(f'move to the {what} failed: {exc}')
-        return False
-    return True
+        return REFUSED
+    return MOVED
 
 
 def _wait_still(arm, settle_s: float = 0.5, timeout_s: float = 5.0) -> bool:
@@ -252,8 +314,8 @@ def _skip_tare_or_exit(cfg: config_mod.RunConfig, ft) -> dict | None:
               'sensor would be un-zeroed. Stopping.')
         return None
     age = panels.age_text(time.time() - record['time'])
-    if _ask(f'not zeroing. [r] run anyway on the last tare ({age} ago, its zero NOT re-checked) / '
-            f'[enter] exit: ', assume_yes=False) != 'r':
+    if not _enter_or_esc(f'not zeroing. [Enter] run anyway on the last tare ({age} ago, its zero '
+                         f'NOT re-checked) / [Esc] exit: '):
         return None
     ft.recall_tare(record['time'])
     print(f'running on the F/T zero from {age} ago (not re-verified at the calibration pose)', flush=True)
@@ -302,7 +364,7 @@ def _prepare(cfg: config_mod.RunConfig, arm, gripper, ft, assume_yes: bool,
     if reading is not None and reading.object_detected:
         print('the gripper is holding something: empty it before the F/T sensor is zeroed')
         return None
-    if not _move_to(cfg, arm, cfg.ft_sensor.tare_q_deg, 'calibration pose', assume_yes):
+    if _move_to(cfg, arm, cfg.ft_sensor.tare_q_deg, 'calibration pose', assume_yes) != MOVED:
         return _skip_tare_or_exit(cfg, ft)
     if not _wait_still(arm):
         print('the arm did not come to rest at the calibration pose')
@@ -385,9 +447,21 @@ def _check_robot_settings(cfg: config_mod.RunConfig, arm) -> None:
         log.warning('the robot is in REDUCED mode: its reduced safety limits apply')
 
 
+def _ask_label(assume_yes: bool) -> str:
+    """The episode outcome: Enter or s is success, f fail, d discard; anything else re-asks (never a
+    silent default). 'unlabelled' with assume_yes (--no-prompt), which never prompts."""
+    if assume_yes:
+        return 'unlabelled'
+    labels = {'': 'success', 's': 'success', 'f': 'fail', 'd': 'discard'}
+    while True:
+        answer = input('outcome [Enter/s]uccess / [f]ail / [d]iscard: ').strip().lower()
+        if answer in labels:
+            return labels[answer]
+        print('please answer s, f, or d (Enter = success)')
+
+
 def _ask_outcome(assume_yes: bool, interventions: bool = True) -> dict:
-    label = _ask('outcome [s]uccess / [f]ail / [d]iscard: ', assume_yes, '')
-    out = {'label': {'s': 'success', 'f': 'fail', 'd': 'discard'}.get(label, 'unlabelled')}
+    out = {'label': _ask_label(assume_yes)}
     if interventions:
         n = _ask('operator interventions (Enter = 0): ', assume_yes, '0')
         out['interventions'] = int(n) if n.isdigit() else 0
@@ -754,12 +828,19 @@ def _run_episodes(args, cfg: config_mod.RunConfig, prompt: str, run_name: str, r
         _connect_arm(cfg, arm)
         gripper.connect()
         ft.connect()
-        loop = ControlLoop(cfg, arm, gripper, cameras, backend, info, ft)
+        compliance = _open_compliance(cfg)      # the same spring teleop/demos used, if enabled
+        loop = ControlLoop(cfg, arm, gripper, cameras, backend, info, ft, compliance=compliance)
+        if compliance is not None:
+            print(f'COMPLIANCE on: the arm yields to force like a spring (stiffness '
+                  f'{cfg.robot.compliance.stiffness_n_m:.0f} N/m), as it did while the demos were '
+                  f'recorded. safety.ft_limit_n {cfg.safety.ft_limit_n} N stays the hard limit.',
+                  flush=True)
         log.info('warm-up inference: %.2f s', loop.warmup(prompt))
 
         for ep in range(args.episodes):
             prepared = _prepare(cfg, arm, gripper, ft, args.yes, args.reuse_tare)   # as each demo did
-            if prepared is None or not _move_to_start(cfg, arm, args.yes, args.start):
+            # A rollout needs a controlled start (A/B comparisons), so declining stops it too.
+            if prepared is None or _move_to_start(cfg, arm, args.yes, args.start) != MOVED:
                 break
             if _ask(f'episode {ep}: Enter to start, q to quit ', args.yes) == 'q':
                 break
@@ -787,12 +868,12 @@ def _run_episodes(args, cfg: config_mod.RunConfig, prompt: str, run_name: str, r
             if result.end_reason == 'safety':
                 _wait_until_ready(cfg, arm)
     finally:
-        backend.close()
-        ft.close()
+        _stop_cameras(cameras)          # close the OAK first, while the process is still responsive:
+        backend.close()                 # a clean close shuts its watchdog down, so it doesn't reset
+        ft.close()                      # (and leave USB re-enumerating for the next session)
         gripper.close()
         arm.close()
         _close_viewer(viewer)
-        _stop_cameras(cameras)
     return 0
 
 
@@ -968,7 +1049,7 @@ def _offer_move_to_leader(cfg: config_mod.RunConfig, arm, leader, viewer=None) -
         def confirm(question: str) -> bool:
             print('answer in the camera window ([Enter]/[Space] = yes, [Esc] = no)', flush=True)
             answer = viewer.ask(f'Move the arm to the leader?\n{question}')
-            return _ask(f'{question} [y/N] ', False, 'y') == 'y' if answer is None else answer
+            return _confirm(question, False) if answer is None else answer
     _move_to(cfg, arm, np.round(np.rad2deg(q), 2).tolist(), "the leader's pose", assume_yes=False,
              confirm=confirm)
 
@@ -1027,14 +1108,14 @@ def _teleop(args, cfg: config_mod.RunConfig) -> int:
             print(f'or to zero the F/T sensor here before each demo (still, touching nothing), under ft_sensor:\n'
                   f'  tare_q_deg: {q_text}')
     finally:
-        ft.close()
+        _stop_cameras(cameras)          # close the OAK first, before the slower closes below, so it
+        ft.close()                      # gets a clean watchdog shutdown and doesn't reset on quit
         gripper.close()
         arm.close()
         devices.close()
         _close_viewer(viewer)
         if leader_sim is not None:
             leader_sim()
-        _stop_cameras(cameras)
     return 0
 
 
@@ -1305,15 +1386,22 @@ def _demos(args, cfg: config_mod.RunConfig, scenarios, rounds: int, scheduled: b
             if prepared is None:
                 break
             if scheduled:
-                if sc.start is not None and not _move_to(cfg, arm, list(cfg.robot.start_poses[sc.start]),
-                                                         f"start pose '{sc.start}'", args.yes):
-                    break
-                start_meta = {'name': sc.start,
-                              'q_deg': list(cfg.robot.start_poses[sc.start]) if sc.start else None}
+                target = _scenario_start(cfg, sc)
+                if target is not None:
+                    outcome = _move_to(cfg, arm, target[0], target[1], args.yes)
+                    if outcome == REFUSED:
+                        break
+                    if outcome == DECLINED:
+                        print('continuing this demo from the current position (not moving to the start)')
+                        target = None           # recorded as no start pose: it began where the arm is
+                start_meta = {'name': sc.start, 'q_deg': target[0] if target is not None else None}
             else:
-                if not _move_to_start(cfg, arm, args.yes, args.start):
+                outcome = _move_to_start(cfg, arm, args.yes, args.start)
+                if outcome == REFUSED:
                     break
-                start_meta = _start_meta(cfg, args)
+                if outcome == DECLINED:
+                    print('continuing this demo from the current position (not moving to the start)')
+                start_meta = _start_meta(cfg, args, moved=outcome == MOVED, arm=arm)
             where = f' [{sc.label}]' if scheduled else ''
             if _ask(f'demo {ep + 1}/{len(plan)}{where}: Enter to start recording, q to quit ', args.yes) == 'q':
                 break
@@ -1345,14 +1433,14 @@ def _demos(args, cfg: config_mod.RunConfig, scenarios, rounds: int, scheduled: b
             elif result.end_reason not in ('operator', 'timeout'):
                 break
     finally:
-        ft.close()
+        _stop_cameras(cameras)          # close the OAK first, before the slower closes below, so it
+        ft.close()                      # gets a clean watchdog shutdown and doesn't reset on quit
         gripper.close()
         arm.close()
         devices.close()
         _close_viewer(viewer)
         if leader_sim is not None:
             leader_sim()
-        _stop_cameras(cameras)
     return 0
 
 
@@ -1441,8 +1529,8 @@ def cmd_workspace(args) -> int:
               f'{list(cfg.safety.tcp_offset_m)} m. Take the extremes: the corners of the table area, '
               f'the lowest and the highest the tool should go.\n'
               f'keys: [Enter] record  [u] undo  [d] done  [q] quit without saving')
-        if _ask('Start freedrive? The arm goes limp, so hold it. Its payload must be right on the '
-                'pendant, or it sags or drifts. [y/N] ', args.yes, 'y') != 'y':
+        if not _confirm('Start freedrive? The arm goes limp, so hold it. Its payload must be right on '
+                        'the pendant, or it sags or drifts.', args.yes):
             return 0
         keys: queue.Queue[str] = queue.Queue()
 

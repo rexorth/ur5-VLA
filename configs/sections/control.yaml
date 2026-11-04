@@ -1,5 +1,4 @@
 control:
-  refill_fraction: 0.25       # ask for a chunk when a quarter is left: commit more of each chunk before
-                              # re-planning, so fewer conflicting re-plans (was 0.5) -- damps hover/stab
+  refill_fraction: 0.5       # ask for a chunk when a quarter is left
   crossfade_steps: 12         # blend a new chunk in over more steps (was 5) so plan changes ease in, not stab
   max_episode_s: 120

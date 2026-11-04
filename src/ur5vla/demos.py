@@ -10,6 +10,13 @@ Scenarios come from `--scenario` (repeatable) or a demos file under `configs/dem
         start: pick_table      # optional: a robot.start_poses name to move to first
         name: reset            # optional: a short label (meta, logs); defaults to the prompt
 
+A scenario can instead give its start pose as raw joint angles, `start_q_deg` (6 values, degrees),
+rather than a `robot.start_poses` name; give one of `start`/`start_q_deg`, not both:
+
+    scenarios:
+      - prompt: "put the cube in the box"
+        start_q_deg: [0, -90, 90, -90, -90, 0]
+
 The sequence runs in order and repeats `rounds` times (total demos = rounds x len(scenarios)); the
 arm continues from the current state between demos, so the recorded reset undoes the task. Each demo
 is one episode whose `prompt` is the scenario's, so `to-lerobot` yields a multi-task dataset.
@@ -32,13 +39,23 @@ class Scenario:
     prompt: str
     start: str | None = None        # a robot.start_poses name to move to first; None = continue
     name: str | None = None         # a short label for meta/logs; defaults to the prompt
+    start_q_deg: tuple[float, ...] | None = None    # raw start joints (deg), an alternative to `start`
 
     @property
     def label(self) -> str:
         return self.name or self.prompt
 
 
-_ALLOWED = ('prompt', 'start', 'name')
+_ALLOWED = ('prompt', 'start', 'start_q_deg', 'name')
+
+
+def _joints(value, prompt: str) -> tuple[float, ...]:
+    if not isinstance(value, (list, tuple)) or len(value) != 6:
+        raise DemoError(f'scenario {prompt!r}: `start_q_deg` needs 6 joint angles in degrees')
+    try:
+        return tuple(float(x) for x in value)
+    except (TypeError, ValueError):
+        raise DemoError(f'scenario {prompt!r}: `start_q_deg` must be 6 numbers') from None
 
 
 def _scenario(item) -> Scenario:
@@ -55,9 +72,13 @@ def _scenario(item) -> Scenario:
         if not prompt:
             raise DemoError('each scenario needs a non-empty prompt')
         start = item.get('start')
+        start_q_deg = item.get('start_q_deg')
+        if start is not None and start_q_deg is not None:
+            raise DemoError(f'scenario {prompt!r} has both `start` and `start_q_deg`; give one')
         name = item.get('name')
         return Scenario(prompt, str(start) if start is not None else None,
-                        str(name) if name is not None else None)
+                        str(name) if name is not None else None,
+                        _joints(start_q_deg, prompt) if start_q_deg is not None else None)
     raise DemoError(f'a scenario must be a prompt string or a mapping, got {type(item).__name__}')
 
 
