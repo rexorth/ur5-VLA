@@ -206,17 +206,71 @@ def test_reuse_tare_without_an_earlier_one_tares_once_then_keeps_it(tmp_path, mo
     assert [m['ft_tare']['reused'] for m in demo_metas(tmp_path)] == [False, True]
 
 
+class RecallFT:
+    """A sensor that only records which tare was recalled (for the decline path)."""
+
+    def __init__(self):
+        self.recalled = None
+
+    def recall_tare(self, t_wall):
+        self.recalled = t_wall
+
+
+def _write_record(tmp_path, **over):
+    rec = {'sensor': '192.0.2.1', 'zero': [1.0] * 6, 'q_deg': TARE_Q, 'time': 100.0, 'drift': [0.0] * 6}
+    rec.update(over)
+    (tmp_path / 'runs').mkdir(exist_ok=True)
+    (tmp_path / 'runs' / 'ft_tare.json').write_text(json.dumps(rec))
+
+
+def test_declining_the_calibration_move_offers_running_on_the_last_tare(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    cfg = config_mod.load(cell(tmp_path))
+    _write_record(tmp_path)
+    monkeypatch.setattr(cli, '_ask', lambda *a, **k: 'r')             # operator: run anyway
+    ft = RecallFT()
+    meta = cli._skip_tare_or_exit(cfg, ft)
+    assert meta['ft_tare'] == {'q_deg': TARE_Q, 'time': 100.0, 'drift': [0.0] * 6,
+                               'reused': True, 'confirmed': False}
+    assert ft.recalled == 100.0
+    assert 'running on the F/T zero' in capsys.readouterr().out
+
+
+def test_declining_the_calibration_move_can_exit(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    cfg = config_mod.load(cell(tmp_path))
+    _write_record(tmp_path)
+    monkeypatch.setattr(cli, '_ask', lambda *a, **k: '')              # operator: exit
+    ft = RecallFT()
+    assert cli._skip_tare_or_exit(cfg, ft) is None
+    assert ft.recalled is None
+
+
+def test_declining_with_no_earlier_tare_stops(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    cfg = config_mod.load(cell(tmp_path))                             # no ft_tare.json written
+    assert cli._skip_tare_or_exit(cfg, RecallFT()) is None
+    assert 'no earlier tare to fall back on' in capsys.readouterr().out
+
+
 def test_a_tare_is_kept_only_while_the_sensor_still_holds_its_zero(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     cfg = config_mod.load(cell(tmp_path))
     cfg.robot.dry_run = False                                            # the real sensor's record
 
+    from ur5vla.robot.ft_sensor import FTInfo
+
     class Sensor:
-        def __init__(self, zero):
+        def __init__(self, zero, mem=None, t_tared=None):
             self.z = None if zero is None else np.asarray(zero, dtype=float)
+            self.mem = None if mem is None else np.asarray(mem, dtype=float)   # in-memory offset
+            self.t_tared = t_tared
 
         def zero(self):
             return self.z
+
+        def info(self):
+            return FTInfo(983.0, 0, None, self.mem, self.t_tared)
 
     held = [-4.0, 10.7, -38.8, -0.76, 0.06, -0.07]
     (tmp_path / 'runs').mkdir()
@@ -225,6 +279,40 @@ def test_a_tare_is_kept_only_while_the_sensor_still_holds_its_zero(tmp_path, mon
     assert cli._kept_tare(cfg, Sensor(held)) is not None
     assert cli._kept_tare(cfg, Sensor([0.0] * 6)) is None                # power-cycled: its zero is gone
     assert cli._kept_tare(cfg, Sensor([v + 0.5 for v in held])) is None  # zeroed again by something else
-    assert cli._kept_tare(cfg, Sensor(None)) is None                     # can't read it back
+    assert cli._kept_tare(cfg, Sensor(None)) is None                     # can't read it back, none in memory
     cfg.ft_sensor.tare_q_deg = START_Q
     assert cli._kept_tare(cfg, Sensor(held)) is None                     # a different calibration pose
+
+
+def test_a_transient_read_failure_keeps_the_tare_set_this_session(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.time, 'sleep', lambda s: None)               # don't wait out the retries
+    cfg = config_mod.load(cell(tmp_path))
+    cfg.robot.dry_run = False
+    from ur5vla.robot.ft_sensor import FTInfo
+
+    held = [-4.0, 10.7, -38.8, -0.76, 0.06, -0.07]
+    (tmp_path / 'runs').mkdir()
+    (tmp_path / 'runs' / 'ft_tare.json').write_text(json.dumps(
+        {'sensor': cfg.ft_sensor.host, 'zero': held, 'q_deg': TARE_Q, 'time': 0.0, 'drift': [0.0] * 6}))
+
+    class FlakyZero:
+        """zero() (the HTTP read-back) always fails; info() is the live, in-memory state."""
+
+        def __init__(self, mem, t_tared):
+            self.mem, self.t_tared, self.tries = mem, t_tared, 0
+
+        def zero(self):
+            self.tries += 1
+            return None
+
+        def info(self):
+            return FTInfo(983.0, 0, None, None if self.mem is None else np.asarray(self.mem), self.t_tared)
+
+    # Read-back fails, but it was tared this session and the offset still matches: keep it.
+    s = FlakyZero(held, t_tared=123.0)
+    assert cli._kept_tare(cfg, s) is not None and s.tries == cli.ZERO_READ_TRIES
+    # No in-memory tare to fall back on (fresh process, --reuse-tare): don't guess, re-tare.
+    assert cli._kept_tare(cfg, FlakyZero(None, t_tared=None)) is None
+    assert cli._kept_tare(cfg, FlakyZero(held, t_tared=None)) is None    # offset there but never tared here
+    assert cli._kept_tare(cfg, FlakyZero([v + 1 for v in held], t_tared=123.0)) is None  # offset moved

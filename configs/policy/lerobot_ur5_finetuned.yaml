@@ -9,11 +9,15 @@ host: localhost
 port: 8080
 policy_type: pi05                   # what you trained: pi05, pi0, smolvla, act, ...
 # lerobot-train's output: <output_dir>/checkpoints/last/pretrained_model (merge LoRA first).
-pretrained_name_or_path: /home/omey/abhay_ws/outputs/pi05_ur5/checkpoints/last/pretrained_model
+pretrained_name_or_path: /home/omey/abhay_ws/checkpoints/ckpt_cube_12000_merged/pretrained_model
 policy_device: cuda
 actions_per_chunk: 50               # <= the policy's chunk_size
 action_hz: 15                       # = the dataset fps (to-lerobot --fps)
 camera_map: {base: base, wrist: wrist}   # logical camera -> dataset camera name
 image_size: null                    # native: the dataset stores native resolution
 include_gripper_state: true         # the dataset's state is 6 joints + gripper
+# Force in the state: set true ONLY if you converted with `to-lerobot --ft` (recommended for
+# contact tasks -- door, bed-pull, insertion). The state is then 6 joints + gripper + 6 F/T, and
+# this MUST match the dataset the checkpoint was trained on. Leave false for a vision-only dataset.
+include_ft_state: false              # ur5_cube checkpoint: state is [7] = 6 joints + gripper (no F/T)
 action_mode: absolute

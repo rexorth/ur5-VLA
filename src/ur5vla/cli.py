@@ -194,10 +194,30 @@ def _sensor_id(cfg: config_mod.RunConfig) -> str:
     return 'simulated' if cfg.robot.dry_run else str(cfg.ft_sensor.host)
 
 
+ZERO_READ_TRIES = 3          # reading the sensor's zero back is an HTTP request; ride out a flake
+
+
+def _sensor_zero(ft, tries: int = ZERO_READ_TRIES):
+    """The zero the sensor holds, read back from it, retrying a few times: the read is an HTTP
+    request to the sensor and transiently fails while it streams at full rate. None if every try
+    failed."""
+    for attempt in range(tries):
+        if (zero := ft.zero()) is not None:
+            return zero
+        if attempt + 1 < tries:
+            time.sleep(0.15)
+    return None
+
+
 def _kept_tare(cfg: config_mod.RunConfig, ft) -> dict | None:
     """The last tare at the calibration pose (its record), if the sensor still holds its zero: the
     same sensor and calibration pose, and the zero the sensor reports now is the one that tare
-    left, so it hasn't been power-cycled or zeroed by anything else since. None otherwise."""
+    left, so it hasn't been power-cycled or zeroed by anything else since. None otherwise.
+
+    The read-back is an HTTP request that can flake while the sensor streams, so it is retried; and
+    if it still can't be read, we fall back to the zero this process set and still holds in memory.
+    That is sound here because _prepare has already confirmed the stream is live (fault() is None),
+    so the sensor has not been power-cycled -- only the HTTP side is unreachable."""
     try:
         record = json.loads(_tare_record_path(cfg).read_text())
     except (OSError, ValueError):
@@ -206,8 +226,39 @@ def _kept_tare(cfg: config_mod.RunConfig, ft) -> dict | None:
     if (record.get('sensor') != _sensor_id(cfg) or record.get('q_deg') != list(cfg.ft_sensor.tare_q_deg)
             or not isinstance(kept, list) or len(kept) != 6):
         return None
-    zero = ft.zero()
-    return record if zero is not None and np.allclose(zero, kept, atol=1e-4) else None
+    zero = _sensor_zero(ft)
+    if zero is not None:
+        return record if np.allclose(zero, kept, atol=1e-4) else None
+    info = ft.info()                      # couldn't read it back: trust the zero set this session
+    if (info is not None and info.t_tared is not None and info.offset is not None
+            and np.allclose(info.offset, kept, atol=1e-4)):
+        log.info('F/T sensor: could not read its zero back (HTTP), but the stream is live and the '
+                 'tare set this session still matches the record -- keeping it')
+        return record
+    return None
+
+
+def _skip_tare_or_exit(cfg: config_mod.RunConfig, ft) -> dict | None:
+    """The operator declined the move to the calibration pose. If an earlier tare exists, offer to
+    run anyway on the sensor's current zero (the one it still holds from that tare) rather than
+    exiting; returns the ft_tare meta to record (marked unconfirmed), or None to stop. With no
+    earlier tare the sensor would be un-zeroed, so there is nothing to fall back on -- stop."""
+    try:
+        record = json.loads(_tare_record_path(cfg).read_text())
+    except (OSError, ValueError):
+        record = None
+    if not isinstance(record, dict) or 'time' not in record:
+        print('not moving to the calibration pose, and no earlier tare to fall back on: the F/T '
+              'sensor would be un-zeroed. Stopping.')
+        return None
+    age = panels.age_text(time.time() - record['time'])
+    if _ask(f'not zeroing. [r] run anyway on the last tare ({age} ago, its zero NOT re-checked) / '
+            f'[enter] exit: ', assume_yes=False) != 'r':
+        return None
+    ft.recall_tare(record['time'])
+    print(f'running on the F/T zero from {age} ago (not re-verified at the calibration pose)', flush=True)
+    return {'ft_tare': {'q_deg': record.get('q_deg'), 'time': record['time'],
+                        'drift': record.get('drift'), 'reused': True, 'confirmed': False}}
 
 
 def _prepare(cfg: config_mod.RunConfig, arm, gripper, ft, assume_yes: bool,
@@ -252,7 +303,7 @@ def _prepare(cfg: config_mod.RunConfig, arm, gripper, ft, assume_yes: bool,
         print('the gripper is holding something: empty it before the F/T sensor is zeroed')
         return None
     if not _move_to(cfg, arm, cfg.ft_sensor.tare_q_deg, 'calibration pose', assume_yes):
-        return None
+        return _skip_tare_or_exit(cfg, ft)
     if not _wait_still(arm):
         print('the arm did not come to rest at the calibration pose')
         return None
@@ -1226,6 +1277,7 @@ def _demos(args, cfg: config_mod.RunConfig, scenarios, rounds: int, scheduled: b
     arm, gripper = make_arm(cfg.robot), make_gripper(cfg.gripper, cfg.robot.dry_run)
     ft = make_ft_sensor(cfg.ft_sensor, cfg.robot.dry_run)
     viewer = None
+    leader_sim = None
     try:
         viewer = _start_viewer(args, cameras, f'ur5vla demo {run_name}')
         _connect_arm(cfg, arm)
@@ -1233,6 +1285,10 @@ def _demos(args, cfg: config_mod.RunConfig, scenarios, rounds: int, scheduled: b
         ft.connect()
         session = TeleopSession(cfg, arm, gripper, devices.pad, ft, input=_session_input(cfg, devices),
                                 nudge_key=devices.nudge_key, compliance=_open_compliance(cfg))
+        if args.view is not None and leader is not None:
+            # The leader mirrored on a UR5 in MuJoCo (a second window), as in `ur5vla teleop`: an
+            # alignment reference, reusing the session's own leader reading (no second serial open).
+            leader_sim = _start_leader_sim(cfg, lambda: getattr(getattr(session.input, 'reading', None), 'q', None))
         if session.compliance is not None:
             print(f'COMPLIANCE on: the arm yields to force like a spring (stiffness '
                   f'{cfg.robot.compliance.stiffness_n_m:.0f} N/m). safety.ft_limit_n '
@@ -1267,12 +1323,16 @@ def _demos(args, cfg: config_mod.RunConfig, scenarios, rounds: int, scheduled: b
                             'config': cfg.raw, 'dry_run': cfg.robot.dry_run, 'start': start_meta,
                             'teleop_input': 'leader' if leader else 'gamepad', **prepared})
             mode = 'leader arm' if leader is not None else f'{session.frame} frame'
-            print(f'recording{where}, {mode} | {_keys_text(devices)}', flush=True)
-            keys = _episode_keys(session.estop, session.end_request,
+            resume = session.input.resume_hint().replace(' to resume', '')
+            print(f'recording{where}, {mode} | {_keys_text(devices)}, [r] resume\n'
+                  f'  a force/torque stop PAUSES (recording continues): back the arm off and {resume} '
+                  f'to continue this demo, or [d] to end it', flush=True)
+            keys = _episode_keys(session.estop, session.end_request, session.resume_request,
                                  deadman_key=devices.keyboard.name if devices.keyboard else None)
             with _operator_keys(keys, viewer), \
                     _teleop_display(session, cfg.safety.tcp_offset_m, viewer, terminal=False):
-                result = session.run_episode(recorder, args.max_seconds or cfg.control.max_episode_s)
+                result = session.run_episode(recorder, args.max_seconds or cfg.control.max_episode_s,
+                                             pause_on_stop=True)
             print(f'demo {ep} ended: {result.end_reason} {result.detail or ""} ({result.duration_s:.1f} s)')
             outcome = {'result': dataclasses.asdict(result)}
             if result.end_reason in ('operator', 'timeout'):
@@ -1290,6 +1350,8 @@ def _demos(args, cfg: config_mod.RunConfig, scenarios, rounds: int, scheduled: b
         arm.close()
         devices.close()
         _close_viewer(viewer)
+        if leader_sim is not None:
+            leader_sim()
         _stop_cameras(cameras)
     return 0
 

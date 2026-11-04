@@ -2,14 +2,15 @@
 # configuration is the backstop. Keep each of these inside its pendant counterpart:
 # docs/procedures.md#25-safety-limits-the-pendant-and-cellyaml-together
 safety:
-  max_step_rad: 0.02          # per 8 ms tick, any joint: 0.02 rad = 143 deg/s
-  max_tcp_speed_m_s: 0.5      # at tcp_offset_m; null = off
-  max_tracking_error_deg: 15  # target vs. where the arm is: larger = the robot is slowing itself
+  max_step_rad: 0.02          # TEMP DRY-RUN DIAGNOSTIC (normal value 0.02 = 143 deg/s). 0.35/8ms = ~2500 deg/s.
+                              # !!! RESTORE TO 0.02 BEFORE RUNNING ON THE REAL ARM — this allows violent jerks. !!!
+  max_tcp_speed_m_s: 0.75      # at tcp_offset_m; null = off
+  max_tracking_error_deg: 15  # TEMP DRY-RUN DIAGNOSTIC (normal value 15). RESTORE TO 15 BEFORE THE REAL ARM.
   # On |F| and |T|, tared per episode: the F/T sensor when ft_sensor is set, else the CB3's
   # joint-current ESTIMATE (noisy: hence 90 N). With the sensor, tighten to ~30-40 N. With
   # robot.compliance on, these stay as the HARD backstop (the spring keeps normal contact below
   # them); set them above the compliant working force.
-  ft_limit_n: 90
+  ft_limit_n: 100
   ft_limit_nm: 4.8           # N·m; set once the sensor is mounted (the estimate's torque is poor)
   # Torque fallback: when the Axia's torque saturates (reads at its rated range, ~5 N·m on the
   # SI-150-8 -- e.g. pulling a stuck part), its torque reading is unreliable. With this set, the

@@ -2,11 +2,11 @@ robot:
   ip: 192.168.10.125          # CB3 UR5. No External Control URCap program may be running.
   rate_hz: 125                # CB3 RTDE maximum
   servoj: {lookahead: 0.1, gain: 300}
-  start_q_deg: null         # teach and set before A/B runs: every trial starts here
+  start_q_deg: [-18.1, -65.7, -86.4, -91.7, 95.4, -15.2]     # teach and set before A/B runs: every trial starts here
   # Named start poses, say one per task: `ur5vla demo ... --start printer` (and run) starts each
   # episode there instead of start_q_deg. Teleop prints the joints to paste when it ends, e.g.
   #   printer: [0.0, -90.0, 90.0, -90.0, -90.0, 0.0]
-  start_poses: {}
+  start_poses: {start_old: [-18.43, -73.42, -62.21, -102.04, 99.66, -13.09]}
   move_speed_deg_s: 20
   move_accel_deg_s2: 40
 

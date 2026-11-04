@@ -24,25 +24,39 @@
 #   1. Stage the dataset at  $HF_LEROBOT_HOME/$DATASET   (see README.md "Move the dataset up").
 #   2. Set DATASET and STEPS below (from tonight's episode/frame count).
 
-set -euo pipefail
+set -eo pipefail   # no -u: it breaks `conda activate` in non-interactive shells
 source "${SLURM_SUBMIT_DIR:-$(dirname "$0")}/carc_env.sh"
 
-DATASET=ur5_pick          # <-- TODO: dataset dir name under $HF_LEROBOT_HOME
-STEPS=15000               # <-- TODO: set from data volume. Eval checkpoints from ~6k and stop when good.
+DATASET=ur5_cube          # 76 success demos, 2 tasks (put-in / take-out), ~18-22k frames @ 15 fps
+STEPS=20000               # ~18 epochs at batch 16. Eval checkpoints from ~8k and stop when good.
 RUN=pi05_ur5_lora_r16
 
 module purge
 module load conda
 eval "$(conda shell.bash hook)"
 conda activate "$CONDA_ENV"
+# AFTER activate: let torchcodec's dlopen find the env's FFmpeg libs (libavutil.so.*)
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+# Use the LOCAL dataset + cached pi05_base only; the gpu partition has no internet, so any Hub
+# lookup would hang or 401. (pi05_base was pre-fetched to $HF_HOME by setup_carc.sh.)
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+# Let the CUDA allocator grow segments instead of fragmenting (the OOM error recommends this).
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+# Memory: the L40S is 48 GB (~44 usable). batch_size=32 with gradient_checkpointing OFF OOM'd
+# (needed ~45 GB of activations). gradient_checkpointing=true recomputes activations in the
+# backward pass -> cuts activation memory several-fold for a ~20-30% step-time cost; combined with
+# batch_size=16 this uses roughly ~15-18 GB, a large safety margin. 20000 steps x 16 ~= 18 epochs
+# over 17,227 frames, still plenty for LoRA. Eval from ~8k and keep the best checkpoint.
 lerobot-train \
   --dataset.repo_id="$NETID/$DATASET" --dataset.root="$HF_LEROBOT_HOME/$DATASET" \
   --policy.type=pi05 --policy.pretrained_path=lerobot/pi05_base \
   --policy.dtype=bfloat16 --policy.device=cuda --policy.push_to_hub=false \
+  --policy.gradient_checkpointing=true \
   --peft.method_type=LORA --peft.r=16 \
   --dataset.image_transforms.enable=true \
-  --batch_size=32 --steps="$STEPS" --save_freq=2000 \
+  --batch_size=16 --steps="$STEPS" --save_freq=2000 \
   --output_dir="$CARC_WORK/runs/$RUN" --job_name="$RUN"
 
 # Checkpoints: $CARC_WORK/runs/$RUN/checkpoints/<step>/  (and .../checkpoints/last -> newest)

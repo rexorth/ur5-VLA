@@ -7,6 +7,8 @@
 # a short label. `to-lerobot` trains a multi-task policy on the per-demo prompts.
 rounds: 20
 scenarios:
-  - "put the cube in the box"
+  - prompt: "put the cube in the box"
   - prompt: "take the cube out of the box and put it on the table"
-    name: reset
+
+  
+

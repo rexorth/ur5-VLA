@@ -18,4 +18,15 @@ export HF_LEROBOT_HOME="$CARC_WORK/datasets/lerobot"   # LeRobot dataset root
 export PIP_CACHE_DIR="$CARC_WORK/cache/pip"
 export CONDA_PKGS_DIRS="$CARC_WORK/cache/conda_pkgs"
 
+# Login nodes cap threads/processes per user, and a compute node shouldn't let BLAS spawn one
+# thread per physical core (64) when far fewer CPUs are reserved. Constrain the CPU thread pools;
+# PyTorch and the LeRobot dataloader manage their own parallelism. Without this, numpy/OpenBLAS
+# crash on the login node ("pthread_create failed ... Resource temporarily unavailable").
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
 CONDA_ENV="$CARC_WORK/envs/lerobot"                    # conda env lives on scratch, not home
+# NOTE: LD_LIBRARY_PATH for FFmpeg/torchcodec is set in each script AFTER `conda activate`
+# (using $CONDA_PREFIX) — setting it here, before activation, breaks conda's base Python.

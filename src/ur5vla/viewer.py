@@ -312,10 +312,12 @@ def _window(frames, keys, names: list[str], title: str, width: int) -> None:
         if text is None:
             return
         frame = tk.Frame(root, bg='black', highlightbackground=COLOURS[WARN], highlightthickness=2)
-        tk.Label(frame, text=text, fg='white', bg='black', font='TkFixedFont', justify='center',
-                 padx=20, pady=(14, 4)).pack()
+        # Asymmetric (top, bottom) padding goes on pack(), the geometry manager; a widget's own
+        # -padx/-pady option takes a single screen distance and rejects a 2-tuple ("14 4").
+        tk.Label(frame, text=text, fg='white', bg='black', font='TkFixedFont',
+                 justify='center').pack(padx=20, pady=(14, 4))
         tk.Label(frame, text='[Enter]/[Space] = yes    [Esc] = no', fg=COLOURS[WARN], bg='black',
-                 font='TkFixedFont', padx=20, pady=(0, 14)).pack()
+                 font='TkFixedFont').pack(padx=20, pady=(0, 14))
         frame.place(relx=0.5, rely=0.5, anchor='center')
         frame.lift()
         modal['frame'] = frame

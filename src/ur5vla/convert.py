@@ -287,9 +287,22 @@ def write_dataset(episodes: list[Episode], repo_id: str, root: str | Path, fps: 
     LeRobotDataset = dataset_class()
     if Path(root).exists():
         raise FileExistsError(f'{root} already exists; pick a new --root')
+    # LeRobot 0.6's default RGB codec is libsvtav1 (SVT-AV1), which fans out across every core and
+    # allocates large per-stream buffers -- enough to hang a workstation encoding two camera streams.
+    # H.264 is light, fast, low-memory and decodes everywhere (torchcodec/PyAV on the GPU node). Cap
+    # the encoder threads too. Guarded: the older lerobot openpi pins (v2.1) has no RGBEncoderConfig,
+    # so there we fall back to its own default codec.
+    extra = {}
+    if use_videos:
+        try:
+            from lerobot.datasets.video_utils import RGBEncoderConfig
+            extra['rgb_encoder'] = RGBEncoderConfig(vcodec='h264', pix_fmt='yuv420p', g=2, crf=30)
+            extra['encoder_threads'] = 12
+        except Exception:
+            pass
     ds = LeRobotDataset.create(repo_id=repo_id, fps=fps, root=root, robot_type='ur5',
                                features=features(episodes[0], cameras, include_gripper, use_videos, include_ft),
-                               use_videos=use_videos)
+                               use_videos=use_videos, **extra)
     reports = []
     for ep in episodes:
         report = EpisodeReport(events=count_events(ep), grasps=episode_grasps(ep))

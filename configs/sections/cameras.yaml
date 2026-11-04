@@ -15,9 +15,15 @@ cameras:
   # values it was taken with. Exposure steps with the 50 Hz mains so the lights don't flicker, and
   # the OAK's stays under 20 ms to limit motion blur (the D415's can't be capped below 33 ms).
   base:  {type: oak, device_id: "14442C10F10E3BD400", width: 640, height: 480, fps: 30,       # OAK-D
-          focus: 107, max_exposure_us: 20000, mains_hz: 50}
+          # LOCKED to the demo-run averages (58768 frames across 88 demo episodes): auto-exposure sat
+          # at the 20 ms cap the whole time, iso floated ~697, white balance ~3370 K. Fixed so the
+          # policy sees the same image it was trained on (no auto drift / settle). Was: max_exposure_us 20000.
+          focus: 107, exposure_us: 19989, iso: 697, white_balance_k: 3370, mains_hz: 50}
   wrist: {type: realsense, serial: "234422064578", width: 640, height: 480, fps: 30,         # D415, fixed focus
-          mains_hz: 50}
+          # LOCKED to a 30s live read of its auto values (exposure 16600 us, gain 64, WB 4600 K). The
+          # D415 doesn't record its auto choices, so no demo data existed; measured under the current
+          # (night) light, which matches when the demos were collected. Fixes the auto-exposure settle.
+          exposure_us: 16600, gain: 64, white_balance_k: 4600, mains_hz: 50}
   # More scene cameras, to compare placements (docs/procedures.md#74-comparing-camera-sets). Every
   # camera here is recorded; a policy uses the ones in its camera_map. USB webcams go by their
   # stable path (ls /dev/v4l/by-id/), never /dev/videoN.

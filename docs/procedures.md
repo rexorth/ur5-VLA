@@ -649,7 +649,7 @@ and the pose. Control names assume the `xpad` numbering ([4.4](#44-teleop-settin
   - **WORKSPACE BOX** and **JOINT LIMITS:** where the TCP and each joint are in their range, and
     how far to the nearer end. **F/T SENSOR RANGE:** the load on each axis of the sensor, the
     gripper's weight included, within its calibration's range (111 / 111 / 493 N and 5 / 5 / 8
-    N·m on SI-150-8). Past an end it faults, which pauses teleop or ends a demo.
+    N·m on SI-150-8). Past an end it faults, which pauses teleop and demos alike.
 
   Each value with a limit has a bar. A line turns yellow near its limit (80 % of it, or within
   10 % of the range from an end) and red at or past it; a detected object shows green.
@@ -714,7 +714,7 @@ ur5vla demo -c configs/cell.yaml --prompt "pick up the black block and place it 
 | `--tag` | Appended to the run directory name |
 | `--start NAME` | Start each demo at `robot.start_poses[NAME]` instead of `robot.start_q_deg` ([3.7](#37-teleop-on-the-arm)) |
 | `--reuse-tare` | Skip the calibration-pose move and tare while the F/T sensor still holds the last tare's zero ([3.10](#310-ur5vla-prepare)) |
-| `--view [CAMERA ...]` | Show the cameras live, in a window that can be resized ([how it works](architecture.md#live-camera-window)). Names after it: show only those; every camera is still recorded |
+| `--view [CAMERA ...]` | Show the cameras live, in a window that can be resized ([how it works](architecture.md#live-camera-window)). Names after it: show only those; every camera is still recorded. With a leader arm it also opens a second window showing the leader's pose on a UR5 in MuJoCo (`sim.scene`), as an alignment reference, exactly as `ur5vla teleop` does |
 | `--dry-run` | Simulated arm |
 | `-y` | No prompts: start demos at once, confirm the calibration-pose and start-pose moves, leave labels `unlabelled` |
 
@@ -737,10 +737,12 @@ ur5vla demo -c configs/cell.yaml --prompt "pick up the black block and place it 
    - `f`: fail;
    - `d`: discard.
 
-A robot stop, the force limit or a gripper fault ends the demo, which is saved without the label
-prompt; `demo` then waits until the robot is ready (the terminal says what to clear on the
-pendant) and goes on to the next demo. The e-stop, an error or a lost
-controller end the session.
+A robot stop, the force/torque limit or a gripper fault **pauses** the demo (as in
+[4.2](#42-ur5vla-teleop)) rather than ending it: recording continues, the arm holds, and the
+terminal says what to clear on the pendant. Back the arm off the obstacle — hold the nudge key to
+creep it toward the leader, or move the leader out — then resume (a fresh deadman press, or `r`) to
+carry on the **same** demo, or press `d` to end it and label it. The e-stop, an error or a lost
+controller still end the session.
 
 **Scheduling a task and its reset (no manual reset).** Give several scenarios and `demo` records
 each as its own demo, in order, cycling the sequence `--rounds` times. Record the **reset as a demo
@@ -1398,8 +1400,40 @@ system RAM.
    `<output_dir>/checkpoints/last/pretrained_model`, as an absolute path.
 2. Follow [6.1](#61-start-the-lerobot-server), then [6.4](#64-ur5vla-policy-check), then [6.5](#65-ur5vla-run).
 
-LoRA checkpoints must be merged into the base model first, because the server's `from_pretrained`
-ignores adapters. There's no merge script in this repo yet.
+**LoRA checkpoints must be merged into the base model first.** The server has no PEFT path — it calls
+`from_pretrained(path)` directly (bypassing `make_policy`'s adapter branch), which expects a full
+`model.safetensors` and will not load or apply a raw LoRA adapter dir. lerobot has no merge-to-disk entrypoint — its PEFT path, `make_policy(... use_peft=True)`,
+returns a *live* adapter model for in-process inference (and needs dataset/env metadata to derive the
+feature shapes); it never writes a merged checkpoint. So merge with `scripts/merge_lora.py`, which
+calls lerobot's own load primitives + peft's `merge_and_unload` (it reads the feature shapes baked into
+the checkpoint's `config.json`, so it needs no dataset present):
+
+    # 1. (cloud runs) Pull the checkpoint off the RunPod network volume over its S3 API — no pod needed.
+    #    Make an "S3 API key" at console.runpod.io/user/credentials (the S3 API keys tab; this is a
+    #    SEPARATE credential from the RunPod API key), then `aws configure` with it. In lerobot the
+    #    `last` entry is a 6-byte symlink-target string over S3, and step dirs are zero-padded (012000),
+    #    so copy the numbered dir, not `last`.
+    E=https://s3api-us-nc-1.runpod.io/        # endpoint for the volume's datacenter (here US-NC-1)
+    aws s3 ls --region US-NC-1 --endpoint-url $E s3://<VOLUME_ID>/runs/<RUN>/checkpoints/   # see steps
+    aws s3 cp --recursive --region US-NC-1 --endpoint-url $E \
+        s3://<VOLUME_ID>/runs/<RUN>/checkpoints/<STEP>/  ~/abhay_ws/checkpoints/<RUN>_<STEP>/
+
+    # 2. Merge the adapter into the base weights. CPU is the default and the right call: a one-time,
+    #    latency-insensitive op needing ~8–9 GB RAM, vs a 12 GB GPU being tight for the transient
+    #    base+adapter peak. Downloads pi05_base (~8 GB, public) on first run; `export HF_TOKEN=hf_...`
+    #    if the PaliGemma processor trips a gated-repo error. `--device cuda` works but can OOM on 12 GB.
+    ~/abhay_ws/lerobot/.venv/bin/python scripts/merge_lora.py \
+        ~/abhay_ws/checkpoints/<RUN>_<STEP>/pretrained_model \
+        ~/abhay_ws/checkpoints/<RUN>_<STEP>_merged/pretrained_model
+
+    # 3. Point `pretrained_name_or_path` (above) at the *_merged/pretrained_model dir. Set
+    #    `include_ft_state` to match the checkpoint's `observation.state` dim: 7 = 6 joints + gripper
+    #    (no F/T, leave false); 13 = +6 F/T (set true). merge_lora.py prints these dims; or read them
+    #    from the checkpoint's config.json `input_features`.
+
+`merge_lora.py` also copies the `policy_preprocessor*`/`policy_postprocessor*` files, which
+`save_pretrained` does NOT write — they hold the q01/q99 normalization statistics, and without them the
+merged model de/normalizes wrong and the arm gets garbage actions.
 
 ### 7.3 openpi
 

@@ -20,8 +20,9 @@ Limits:
     then resumes on a fresh deadman press (or resume_request): the control script is uploaded
     again if it stopped and the command restarts from where the arm is; force readings carry on
     as they are (an F/T sensor keeps its zero from the calibration pose). While the robot is still stopped nothing is sent to it; if its data go silent,
-    the link is reconnected, nothing more. Without pause_on_stop (recording demos) the episode
-    ends.
+    the link is reconnected, nothing more. Both live teleop and demo recording pause this way, so a
+    stop mid-demo can be backed off and the demo continued; without pause_on_stop a stop ends the
+    episode.
   * The software e-stop, the done button and a lost gamepad (or leader) always end the session.
 
 The deadman stops motion the instant it is released; the ramp only shapes motion while held.

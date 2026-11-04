@@ -160,8 +160,9 @@ class AxiaFTSensor(FTSensor):
 
     def status_text(self) -> str:
         w = self._last
+        tared = 'tared' if self._offset is not None and np.any(self._offset) else 'not tared'
         reading = '' if w is None else (f'|F| {np.linalg.norm(w[:3]):.1f} N, '
-                                        f'|T| {np.linalg.norm(w[3:]):.2f} N·m (not tared), ')
+                                        f'|T| {np.linalg.norm(w[3:]):.2f} N·m ({tared}), ')
         return (f'F/T sensor {self.cfg.host}: {reading}{self._rate:.0f} samples/s, '
                 f'{self.dropped} dropped')
 
