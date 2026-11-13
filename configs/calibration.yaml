@@ -1,0 +1,30 @@
+# The cell set up for HAND-EYE CALIBRATION. Use it for `calibrate-handeye` and nothing else:
+#
+#   ur5vla calibrate-handeye -c configs/calibration.yaml
+#
+# WHY THIS EXISTS. configs/engineered.yaml tightens the joint limits to the envelope the cube skill
+# needs and nothing more, which is right for unattended collection and wrong for calibration. A
+# top-down grasp pins wrist_2 at 90 deg, so engineered.yaml allows it only 79..101 deg -- but the
+# hand-eye solve is conditioned by how much the WRIST TURNS between views, and that 22 deg band is
+# the single limit that blocks the orbit. Measured on the real geometry: with wrist_2 held to
+# 79..101 only 16 of 76 planned views are reachable and all of them sit on the overhead ring, which
+# is a near-degenerate set; opening it to 50..130 gives 48 views spread over four tilts, and over
+# 300 noise trials the mounting error falls from 1.8 mm to 0.8 mm.
+#
+# So: calibrate with the wrist free, then collect with it pinned. The envelope is relaxed only
+# while a human is watching a 39-view orbit, never for an unattended run.
+include:
+  - engineered.yaml
+
+safety:
+  # wrist_2 opened up (see above). Every other joint is left exactly as engineered.yaml sets it --
+  # measured: wrist_2 is the only limit the orbit ever reaches.
+  #                  base shoulder elbow wrist_1 wrist_2 wrist_3
+  joint_min_deg: [    -37,   -145,  -132,   -150,     50,   -172]
+  joint_max_deg: [     31,    -71,     8,    -49,    130,      1]
+  # The close orbit brings the fingertips to within ~90 mm of the tag, so the tool point drops
+  # lower than any grasp goes. The table itself is guarded separately and far more tightly, by the
+  # clearance model in collect.py (a cylinder out to the fingertips, checked along every moveJ),
+  # which is what this floor cannot express -- a box has no idea which way the gripper is pointing.
+  workspace_min_m: [0.38, -0.42, -0.03]
+  workspace_max_m: [0.74, 0.12, 0.50]

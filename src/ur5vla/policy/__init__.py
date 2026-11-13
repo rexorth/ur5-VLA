@@ -15,6 +15,8 @@ BACKENDS: dict[str, str] = {
     'openpi': 'ur5vla.policy.openpi:OpenPIBackend',
     'lerobot': 'ur5vla.policy.lerobot:LeRobotBackend',
     'replay': 'ur5vla.policy.replay:ReplayBackend',
+    # Not a model: an engineered skill driving the arm, to collect training data (skills/).
+    'scripted': 'ur5vla.policy.scripted:ScriptedBackend',
 }
 
 

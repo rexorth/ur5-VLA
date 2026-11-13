@@ -32,4 +32,19 @@ safety:
   joint_max_deg: [360, 360, 360, 360, 360, 360]
   workspace_min_m: [-0.9, -0.9, -0.05]   # UR base frame, as the pendant shows it
   workspace_max_m: [1.5, 0.9, 1.0]
-  tcp_offset_m: [0, 0, 0.2147]               # flange -> fingertip: F/T sensor and couplers 72.4 mm + gripper 142.3 mm
+  # Flange -> fingertip. MEASURED on the arm 2026-11-12, not added up from datasheets: the arm was
+  # hand-guided until the OPEN fingertips just touched the table (1.9 N on the Axia) at joints
+  # [-9.23, -108.84, -99.99, -61.21, 90, -9.23], putting the flange at z = 219.88 mm, against a
+  # table the wrist camera measures at -14.0 mm (3300-point plane fit, 1.6 mm RMS). The CAD model
+  # in ../ur5-workspace/scene_real.xml puts its nominal pinch point at 237.35 mm, 3.5 mm away.
+  #
+  # This was 0.2147 (72.4 mm of sensor and couplers + a datasheet 142.3 mm for the gripper), which
+  # is 19.2 mm SHORT, and nothing caught it: the pendant TCP had been set to the same wrong value,
+  # so the two layers agreed with each other and the cross-check stayed quiet. Every scripted grasp
+  # would have driven the fingers ~19 mm into the table. KEEP THE PENDANT TCP EQUAL TO THIS.
+  #
+  # Measured at the gripper OPEN, which is the state all the Cartesian motion happens in. The
+  # 2F-85's pads swing on a four-bar, so the pinch point moves AWAY from the flange as it closes --
+  # 243.5 mm at gripper 0.37. That is why a grasp needs clearance under the pads before it closes
+  # (grasp.grasp_offset_m), or they scuff the table on the way shut.
+  tcp_offset_m: [0, 0, 0.2339]

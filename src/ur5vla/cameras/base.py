@@ -16,7 +16,7 @@ from collections import deque
 import numpy as np
 
 from ..config import ConfigError
-from ..types import CameraHealth, Frame
+from ..types import CameraHealth, CameraIntrinsics, Frame
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +54,12 @@ class CameraSource(ABC):
         """The image settings in use (focus, exposure, gain or ISO, white balance), under the
         config keys that fix them: as the latest frame reports them (Frame.settings), or as read
         back from the device. Only what the camera reports; None if nothing."""
+        return None
+
+    def intrinsics(self) -> CameraIntrinsics | None:
+        """The pinhole model of the frames this camera delivers, already turned to match any
+        `rotate:`. None if the driver does not report one (then nothing can be deprojected from
+        this camera: perception/ needs it). Valid only once start() has opened the device."""
         return None
 
 

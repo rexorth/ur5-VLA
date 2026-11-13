@@ -21,7 +21,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..config import ConfigError, from_dict
-from ..types import Frame
+from ..types import CameraIntrinsics, Frame
 from .base import AUTO_SETTLE_S, ThreadedCamera, check_range
 
 log = logging.getLogger(__name__)
@@ -59,6 +59,7 @@ class OakCamera(ThreadedCamera):
         if c.exposure_us is None or c.white_balance_k is None:
             self.settle_s = AUTO_SETTLE_S
         self._device = None
+        self._intrinsics: CameraIntrinsics | None = None
         self._pipeline = None
         self._queue = None
         self._autofocus = False
@@ -76,12 +77,39 @@ class OakCamera(ThreadedCamera):
             raise ConfigError(f'cameras.{self.name}: its lens has autofocus, which is kept off: set '
                               f'focus (0..255, larger = nearer). `ur5vla cameras --measure` prints '
                               f'the value autofocus picks.')
+        self._intrinsics = self._read_intrinsics(socket)
         self._pipeline = dai.Pipeline(self._device)
         cam = self._pipeline.create(dai.node.Camera).build(socket)
         self._fix_settings(cam.initialControl, dai.CameraControl)
         out = cam.requestOutput((c.width, c.height), dai.ImgFrame.Type.RGB888i, fps=c.fps)
         self._queue = out.createOutputQueue(maxSize=2, blocking=False)
         self._pipeline.start()
+
+    def _read_intrinsics(self, socket) -> CameraIntrinsics | None:
+        """The colour sensor's pinhole model, from the factory calibration stored on the OAK.
+
+        Scaled to the requested output size by depthai itself. That is exact here because the
+        output keeps the sensor's 4:3 aspect (640x480 from a 4:3 sensor), so the frame is a pure
+        resize with no crop; a different aspect would crop, and depthai's keepAspectRatio handling
+        applies. Recorded with every episode, so the base view can be used for 3D work later
+        without the camera in hand. None (and a warning) if the device has no calibration.
+        """
+        c = self.cfg
+        try:
+            calib = self._device.readCalibration()
+            K = np.asarray(calib.getCameraIntrinsics(socket, c.width, c.height), dtype=float)
+            dist = tuple(float(v) for v in calib.getDistortionCoefficients(socket))
+        except Exception as exc:                    # uncalibrated unit, or an old firmware
+            log.warning('camera %s: no factory calibration readable (%s); intrinsics not recorded',
+                        self.name, exc)
+            return None
+        return CameraIntrinsics(fx=float(K[0, 0]), fy=float(K[1, 1]), cx=float(K[0, 2]),
+                                cy=float(K[1, 2]), width=c.width, height=c.height, coeffs=dist)
+
+    def intrinsics(self) -> CameraIntrinsics | None:
+        if self._intrinsics is None:
+            return None
+        return self._intrinsics.rotated(self.rotate_deg)
 
     def _connect(self, dai, tries: int = 6, delay_s: float = 1.0):
         """Open the device, retrying for a few seconds. After an unclean exit (e.g. a watchdog

@@ -25,6 +25,51 @@ class Frame:
     settings: dict[str, float] | None = None
 
 
+@dataclass(frozen=True)
+class CameraIntrinsics:
+    """A camera's pinhole model, for the frames it actually delivers.
+
+    Needed to turn a pixel plus a depth into a 3D point (perception/). `fx`, `fy`, `cx`, `cy` are
+    in pixels and already match `width` x `height` AFTER any `rotate:` the driver applies, so they
+    line up with Frame.rgb and Frame.depth as recorded. Distortion coefficients are OpenCV order
+    (k1 k2 p1 p2 k3 ...); RealSense colour streams are rectified, so they are usually all zero.
+    """
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    width: int
+    height: int
+    coeffs: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0)
+
+    @property
+    def matrix(self) -> np.ndarray:
+        """The 3x3 camera matrix K, as OpenCV wants it."""
+        return np.array([[self.fx, 0.0, self.cx], [0.0, self.fy, self.cy], [0.0, 0.0, 1.0]])
+
+    @property
+    def dist(self) -> np.ndarray:
+        return np.asarray(self.coeffs, dtype=float)
+
+    def rotated(self, deg: int) -> CameraIntrinsics:
+        """The same camera's intrinsics for a frame turned `deg` clockwise (ThreadedCamera.rotate_deg
+        rotates rgb and depth, so the model has to follow or every deprojection is wrong)."""
+        deg %= 360
+        if deg == 0:
+            return self
+        if deg == 180:
+            return CameraIntrinsics(self.fx, self.fy, self.width - 1 - self.cx,
+                                    self.height - 1 - self.cy, self.width, self.height, self.coeffs)
+        if deg not in (90, 270):
+            raise ValueError(f'rotate must be 0, 90, 180 or 270, got {deg}')
+        # A quarter turn swaps the axes: x' = (h-1) - y, y' = x for 90 clockwise.
+        if deg == 90:
+            cx, cy = self.height - 1 - self.cy, self.cx
+        else:
+            cx, cy = self.cy, self.width - 1 - self.cx
+        return CameraIntrinsics(self.fy, self.fx, cx, cy, self.height, self.width, self.coeffs)
+
+
 @dataclass
 class CameraHealth:
     name: str

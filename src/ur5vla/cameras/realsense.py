@@ -22,7 +22,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..config import ConfigError, from_dict
-from ..types import Frame
+from ..types import CameraIntrinsics, Frame
 from .base import AUTO_SETTLE_S, ThreadedCamera, check_range
 
 log = logging.getLogger(__name__)
@@ -58,6 +58,7 @@ class RealSenseCamera(ThreadedCamera):
         self._align = None
         self._depth_scale = 1.0
         self._settings: dict[str, float] | None = None
+        self._intrinsics = None
 
     def _open(self) -> None:
         import pyrealsense2 as rs
@@ -76,6 +77,11 @@ class RealSenseCamera(ThreadedCamera):
             if sensor.supports(rs.option.global_time_enabled):
                 sensor.set_option(rs.option.global_time_enabled, 1)
         self._fix_settings(device.first_color_sensor())
+        # Depth is aligned to colour below, so the colour intrinsics describe both streams: one
+        # model deprojects a (pixel, depth) pair straight into the camera frame.
+        i = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+        self._intrinsics = CameraIntrinsics(i.fx, i.fy, i.ppx, i.ppy, i.width, i.height,
+                                            tuple(float(v) for v in i.coeffs))
         if c.depth:
             self._align = rs.align(rs.stream.color)
             self._depth_scale = device.first_depth_sensor().get_depth_scale()
@@ -107,6 +113,11 @@ class RealSenseCamera(ThreadedCamera):
 
     def settings(self) -> dict[str, float] | None:
         return self._settings
+
+    def intrinsics(self) -> CameraIntrinsics | None:
+        if self._intrinsics is None:
+            return None
+        return self._intrinsics.rotated(self.rotate_deg)
 
     def _grab(self) -> Frame | None:
         ok, frames = self._pipeline.try_wait_for_frames(1000)

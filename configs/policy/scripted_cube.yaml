@@ -1,0 +1,111 @@
+# The engineered pick-and-place skill, as a policy block. Not a model: a scripted skill driving
+# the arm so the control loop records it like any other episode (src/ur5vla/skills/pickplace.py).
+#
+#   ur5vla collect -c configs/engineered.yaml -p configs/policy/scripted_cube.yaml --episodes 40 -y
+#
+# THREE NUMBERS TO SET ON HARDWARE BEFORE THE FIRST RUN. Everything else has a sane default.
+#   1. cube.table_z_m      how high the table is, base frame. `ur5vla cube-check` prints the
+#                          measured value every time it fails to find the cube -- read it off
+#                          there. More than cube.table_tol_m out and NOTHING is detected.
+#   2. cube.roi_*_m        the patch of table to search. Must be inside what the camera sees from
+#                          the `cube_look` pose, and inside the safety workspace box.
+#   3. grasp.finger_axis_deg   the yaw that makes the fingers close ACROSS a cube face. Hover over
+#                          the cube and look: if the fingers line up with a diagonal, it is 45.
+backend: scripted
+skill: pick_place_cube
+handeye: configs/calibration/wrist_handeye.yaml   # from `ur5vla calibrate-handeye`
+camera: wrist                                     # the only camera reporting intrinsics
+
+# Engineered episodes are recorded RIGID: this overrides robot.compliance.enabled, so the recorded
+# action is exactly the joint target the skill asked for. Do not turn it on to collect data.
+compliance: false
+
+control:
+  refill_fraction: 0.5      # a new chunk when half of the last one is left
+  crossfade_steps: 5
+  max_episode_s: 90         # a full pick-and-place runs 20-30 s; this is the runaway cut-off
+
+cube:
+  cube_size_m: 0.060        # the cell's cube: 60 mm
+  # MEASURED 2026-11-12 with `cube-check --start cube_look`: a 3300-point plane fit put the table
+  # at -0.014 m, flat to under 1 deg, 1.6 mm RMS, stable over every frame. The CAD scene has the
+  # table level with the robot's base (z = 0), so the real surface sits 14 mm below that.
+  # The plane is still fitted from depth at run time; this only says which depth points are
+  # candidates for being table, within table_tol_m.
+  table_z_m: -0.014
+  table_tol_m: 0.06
+  # Base frame metres: the table patch the cube is looked for in. DERIVED, not guessed, from the
+  # wrist camera's actual footprint at the `cube_look` pose and the arm's actual reach:
+  #
+  #   * project the central 80% of the frame onto the table (the edges are clipped and D415 depth
+  #     is worst in the corners), take the INSCRIBED axis-aligned rectangle of that quad -- the
+  #     camera is tilted 14 deg, so its footprint is a skewed trapezoid, and its bounding box is
+  #     not all visible;
+  #   * clip to safety.workspace_*_m and inset by a cube half-width, so a cube sitting on the
+  #     boundary is still wholly inside;
+  #   * keep only where a top-down grasp solves at every yaw the skill can ask for (-45/0/+45) at
+  #     all three heights it visits (grasp, standoff, lift).
+  #
+  # That envelope is x 0.410..0.618, y -0.379..-0.004. The ROI below sits inside it with 30/8 mm
+  # of margin in x and 29/46 mm in y -- short of the maximum on purpose, because the real table
+  # has edges this derivation cannot see. If you move the camera, the look pose or the table,
+  # re-derive it and confirm with `ur5vla cube-check --start cube_look`.
+  #
+  # It must also CONTAIN the place target and the whole scatter region, with a cube half-width to
+  # spare; `collect` refuses to start otherwise.
+  roi_min_m: [0.44, -0.35]
+  roi_max_m: [0.61, -0.05]
+  # Appearance. value_max is the V of HSV below which a pixel counts as "black": raise it if the
+  # cube is missed in dim light, lower it if shadows get picked up instead. Check with
+  # `ur5vla cube-check --view wrist`.
+  value_max: 70
+  saturation_max: 120
+  # An object sits between these heights above the fitted plane. Rejects the table itself below,
+  # and the arm, the gripper and anything tall above.
+  min_height_m: 0.015
+  max_height_m: 0.10
+  size_tol: 0.45            # the blob must measure within 45% of one cube across
+  min_pixels: 60
+  check_min_pixels: 40      # cube depth pixels needed before the cross-check runs at all
+  check_tol_m: 0.025        # ray-plane vs depth disagreement that voids the detection
+  # What counts as a real depth reading, metres. The D415 reports some unmeasurable pixels as the
+  # uint16 saturation value, which arrives as 65.535 m; outside this band a reading is treated as
+  # UNKNOWN rather than as something far away, which is what keeps the (IR-absorbing) cube's own
+  # pixels in the blob. Widen depth_max_m only if the camera is ever more than 2 m from the table.
+  depth_min_m: 0.10
+  depth_max_m: 2.00
+
+grasp:
+  # Where the fingertips go relative to the cube's CENTRE height. safety.tcp_offset_m puts the tool
+  # point at the very fingertip, so 0 grips the cube across its middle. Raise a few mm if the
+  # fingers scuff the table; lower it if the grip is shallow and the cube tips out.
+  grasp_offset_m: 0.0
+  standoff_m: 0.12          # hover height above the cube's top face before descending
+  pre_grasp_m: 0.03         # the last height from which a retreat is free
+  lift_m: 0.15
+  carry_m: 0.15
+  place_clearance_m: 0.004  # released this far above the surface, so it drops rather than presses
+  # The mounting offset that aligns the fingers with a cube face (note 3 above).
+  finger_axis_deg: 0.0
+  gripper_open: 0.0
+  # Commanded past contact so the fingers grip firmly and stall on the cube. The MEASURED gripper
+  # will read about 0.33 on a 60 mm cube -- which is why the dataset must be converted with
+  # --gripper-source command, never the measured value.
+  gripper_closed: 0.75
+  empty_grip_above: 0.60    # measured gripper at or past this after closing = nothing in the hand
+  grip_dwell_s: 0.6
+  settle_s: 0.25
+
+motion:
+  # Collect at the speed you want the POLICY to move: a policy trained on slow data moves slowly.
+  tcp_m_s: 0.12
+  yaw_rad_s: 0.8
+  joint_rad_s: 0.5          # the joint-space return to the look pose
+  chunk_s: 1.0
+  dt: 0.0333333             # 30 Hz steps inside a chunk
+  pos_tol_m: 0.003          # a leg is done when the tool is this close
+  ik_pos_tol_m: 0.0001      # per-step IK: tight, so the action stream is smooth not jittery
+
+perceive:
+  tries: 5                  # detection attempts before the episode is given up as no_cube
+  keep_table: true          # reuse the first fitted plane: the arm covers the table once it moves

@@ -1,0 +1,81 @@
+# The cell set up for ENGINEERED data collection: the wrist camera streams depth, the arm runs
+# rigid (no compliance), and the safety envelope is tightened to the cube task.
+#
+#   ur5vla calibrate-handeye -c configs/calibration.yaml   # NOT this file: it frees wrist_2
+#   ur5vla cube-check        -c configs/engineered.yaml -p configs/policy/scripted_cube.yaml --view wrist
+#   ur5vla collect           -c configs/engineered.yaml -p configs/policy/scripted_cube.yaml --episodes 40 -y
+#
+# This is a separate master from configs/default.yaml on purpose. It changes `cameras` (depth on),
+# which is part of the data-collection FINGERPRINT, so episodes recorded here will not pool with
+# the existing teleoperated cube datasets without --allow-config-mismatch. That is the intended
+# trade: the cube detector needs depth, and the default config stays untouched for policy runs.
+include:
+  - sections/robot.yaml
+  - sections/cameras.yaml
+  - sections/control.yaml
+  - sections/safety.yaml
+  - sections/teleop.yaml
+  - sections/gripper.yaml
+  - sections/ft_sensor.yaml
+  - sections/leader.yaml
+  - sections/sim.yaml
+  - sections/logging.yaml
+
+cameras:
+  # Depth, aligned to colour by the driver, is what the cube detector deprojects. It costs host
+  # CPU, which is why it is off in the shared cameras.yaml and on only here.
+  wrist: {depth: true}
+  # Only ONE OAK: two of them brown out the current USB hubs (see sections/cameras.yaml). The base
+  # view is still recorded, so the dataset has a fixed camera as well as the wrist one.
+  base2: null
+
+robot:
+  # Engineered episodes are recorded RIGID. With the admittance spring on, the executed command is
+  # the skill's target plus a force-driven yield, so the recorded action is not what the skill
+  # asked for -- the contamination that made the earlier cube policy fail. The scripted policy file
+  # also sets `compliance: false`; this is the belt to that braces.
+  compliance: {enabled: false}
+  start_poses:
+    # Straight above the middle of the task area, tool pointing down, so the wrist camera looks
+    # flat at the table. TCP (0.550, -0.200, 0.380), yaw -90 deg -- 20 mm lower than when this was
+    # first computed, because safety.tcp_offset_m was corrected from 214.7 to 233.9 mm; the joints
+    # and so the camera's view are unchanged. VERIFIED ON HARDWARE 2026-11-12 with
+    # `ur5vla cube-check --start cube_look`: 16/16 detections of the cube at (0.571, -0.131),
+    # repeatable to the millimetre, all passing the depth cross-check.
+    cube_look: [-9.23, -110.53, -37.24, -122.27, 90.0, -9.23]
+
+safety:
+  # TIGHTENED FOR UNATTENDED MOTION. A scripted run has nobody holding a deadman, so these are set
+  # to the envelope the skill actually needs and nothing more: anything outside is a bug, and is
+  # refused rather than driven. Measured by sweeping the IK over the whole task area at every
+  # height and yaw the skill can ask for, then padded 10 deg / ~5 cm.
+  #
+  # wrist_3 RE-DERIVED 2026-11-13, when the grasp started taking the cube orientation nearest the
+  # wrist instead of a fixed [-45, +45) in the base frame (which spun the wrist 87.5 deg on average,
+  # up to 130, for nothing -- a cube repeats every 90). Swept the real planner over the whole ROI,
+  # every cube yaw in 5 deg steps, every leg, with the look-pose jitter: wrist_3 needs -70.8..+52.2,
+  # padded to -81..+63. It was -172..+1, derived the same way for the OLD behaviour; at +1, 42% of
+  # the new, shorter grasps were refused. The new range is narrower in total (144 vs 173 deg) and
+  # centred on the look pose (wrist_3 -9.2): at most ~72 deg either side of it, where the old one
+  # went 163 deg one way. BUT the positive side is new: the skill never turned that way before.
+  # Check the wrist cables (D415 USB, gripper, Axia80) have slack at wrist_3 +63 before a long run.
+  joint_min_deg: [-37, -145, -132, -150, 79, -81]
+  joint_max_deg: [31, -71, 8, -49, 101, 63]
+  # Tool-point box, base frame. It MUST contain the table surface: if cube.table_z_m is not ~0,
+  # move workspace_min_m z below it or the grasp is refused at the bottom of the approach.
+  workspace_min_m: [0.38, -0.42, -0.03]
+  workspace_max_m: [0.74, 0.12, 0.50]
+  # NOT tightened, deliberately (it is 0.75 in the shared safety.yaml too). This limit is measured
+  # between CONSECUTIVE COMMANDS and divided by the nominal 8 ms tick, so it reads high whenever the
+  # execution thread overruns its tick -- the buffer is then sampled two or three ticks ahead and a
+  # perfectly smooth trajectory looks like a jump. Tightening it does not make the arm slower (the
+  # skill's own motion.tcp_m_s does that, at 0.12 m/s, and the max_tcp_m_s ceiling the collector
+  # passes enforces it); it just turns a host scheduling hiccup into a lost episode. The meaningful
+  # guards against a real runaway are the joint limits and the workspace box above, plus
+  # max_step_rad. If episodes do stop on this, the machine is too loaded to run a 125 Hz loop --
+  # look at `overruns` in the episode's outcome rather than raising the limit further.
+  max_tcp_speed_m_s: 0.75
+  # Rigid motion against a table: a scripted grasp that misjudges the height pushes straight down,
+  # so keep this low enough that the arm gives up rather than leaning on the table.
+  ft_limit_n: 40
+  ft_limit_nm: 5

@@ -9,6 +9,7 @@ from ur5vla import config as config_mod
 from ur5vla.config import ConfigError, SafetyConfig
 from ur5vla.control.chunks import ChunkBuffer
 from ur5vla.control.safety import SafetyLayer, describe
+from ur5vla.policy import BACKENDS
 from ur5vla.policy.base import ActionMapping
 from ur5vla.robot.kinematics import fk, tool_point
 from ur5vla.types import ActionChunk, Observation, RobotState
@@ -230,7 +231,8 @@ def test_mapping_absolute_delta_and_gripper_range():
 @pytest.mark.parametrize('policy', sorted((CONFIGS / 'policy').glob('*.yaml')), ids=lambda p: p.stem)
 def test_shipped_configs_parse(policy):
     cfg = config_mod.load(CONFIGS / 'cell.yaml', policy)
-    assert cfg.policy['backend'] in ('openpi', 'lerobot', 'replay')
+    # Against the registry, not a hand-written list, so adding a backend does not break this.
+    assert cfg.policy['backend'] in BACKENDS
     assert cfg.robot.ip == '192.168.10.125'
     assert config_mod.load(CONFIGS / 'dry_run.yaml', policy).robot.dry_run
 

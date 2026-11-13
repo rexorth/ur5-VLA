@@ -509,7 +509,11 @@ def parse(raw: dict[str, Any], source: str | None = None) -> RunConfig:
     unknown = sorted(set(raw) - set(SECTIONS))
     if unknown:
         raise ConfigError(f'unknown top-level key(s) {unknown}; expected some of {list(SECTIONS)}')
-    cameras = raw.get('cameras') or {}
+    # `name: null` in a master removes a camera one of its includes defined, so a master can run a
+    # subset of the cell's cameras without editing the shared cameras.yaml (configs/engineered.yaml
+    # drops the second OAK that way). Sections merge by key, so there is otherwise no way to take
+    # an entry away.
+    cameras = {name: cam for name, cam in (raw.get('cameras') or {}).items() if cam is not None}
     for name, cam in cameras.items():
         if not isinstance(cam, dict) or 'type' not in cam:
             raise ConfigError(f'cameras.{name} needs a `type`')
@@ -518,7 +522,7 @@ def parse(raw: dict[str, Any], source: str | None = None) -> RunConfig:
                               f'got {cam["rotate"]!r}')
     policy = raw.get('policy') or {}
     if policy and 'backend' not in policy:
-        raise ConfigError('policy.backend is required (openpi | lerobot | replay)')
+        raise ConfigError('policy.backend is required (openpi | lerobot | replay | scripted)')
     return RunConfig(
         robot=from_dict(RobotConfig, raw.get('robot'), 'robot'),
         cameras=cameras,

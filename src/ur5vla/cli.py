@@ -16,6 +16,11 @@ Demonstrations:
     ur5vla demo         -c configs/cell.yaml --prompt "..." --episodes 10    drive and record
     ur5vla to-lerobot   runs/<run> --repo-id <user>/<name> --root <dir> --fps 15
 
+Engineered (scripted) data collection -- docs/engineered-collection.md:
+    ur5vla calibrate-handeye -c configs/engineered.yaml --start cube_look    where the wrist camera is
+    ur5vla cube-check        -c configs/engineered.yaml -p configs/policy/scripted_cube.yaml
+    ur5vla collect           -c configs/engineered.yaml -p configs/policy/scripted_cube.yaml -y
+
 `--view` on cameras, run, teleop and demo opens a window with every camera live; `--view wrist`
 shows only the cameras named. Resize the window to resize the images.
 """
@@ -40,6 +45,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import collect as collect_mod
 from . import config as config_mod
 from . import convert, panels, sessionlog, workspace
 from .cameras import CameraSource, build_cameras
@@ -47,12 +53,20 @@ from .control import ControlLoop, SafetyLayer
 from .control.safety import cause, describe
 from .keys import KeyListener
 from .policy import build_backend
+from .perception.cube import CubeError
+from .perception.handeye import CalibrationError
+from .perception.tags import TagError
 from .recording import EpisodeRecorder
+from .skills.pickplace import SkillError
 from .robot import ArmError, RobotNotReady, make_arm, make_ft_sensor, make_gripper
 from .robot.kinematics import tool_point
 from .types import ROBOT_MODES, SAFETY_MODES
 
 log = logging.getLogger('ur5vla')
+
+# Where `calibrate-handeye` writes, and what the scripted policy files point at by default.
+HANDEYE_PATH = 'configs/calibration/wrist_handeye.yaml'
+TAG_SIZE_M = 0.0362                 # the cell's AprilTag 36h11 tags: 36.2 mm black square
 
 
 def _load(args) -> config_mod.RunConfig:
@@ -1576,6 +1590,464 @@ def _demos(args, cfg: config_mod.RunConfig, scenarios, rounds: int, scheduled: b
     return 0
 
 
+# ---- engineered data collection (collect.py, skills/, perception/) ----
+
+def _perception_camera(cfg: config_mod.RunConfig, cameras: dict, name: str):
+    """The camera perception runs on, with its intrinsics. Exits with a usable message rather than
+    a traceback when it is missing, undeclared or has no intrinsics (no driver support)."""
+    if name not in cameras:
+        raise SystemExit(f"camera '{name}' is not in the cameras config "
+                         f"({', '.join(cameras) or 'none'}): perception needs it")
+    cam = cameras[name]
+    intr = cam.intrinsics()
+    if intr is None:
+        raise SystemExit(f"camera '{name}' reports no intrinsics, so nothing can be deprojected "
+                         f"from it. Perception needs a RealSense (the wrist D415); an OAK does not "
+                         f"report them through this driver yet.")
+    return cam, intr
+
+
+def _guarded_mover(cfg: config_mod.RunConfig, arm):
+    """A move_j that refuses a pose our own limits or the controller's would not allow. Used by the
+    calibration orbit, which generates far more poses than it keeps."""
+    check = SafetyLayer(cfg.safety, cfg.robot.period_s)
+    speed = math.radians(cfg.robot.move_speed_deg_s)
+    accel = math.radians(cfg.robot.move_accel_deg_s2)
+
+    def move(q) -> bool:
+        q = np.asarray(q, dtype=float)
+        q_now = arm.read_state().q
+        # `check_command(q, q)` is the same idiom _move_to uses, and the `q, q` is deliberate: the
+        # step check in check_command is a PER-TICK servo limit (0.02 rad), so comparing a moveJ
+        # destination tens of degrees away against where the arm is now would refuse every single
+        # pose. Passing the target as its own predecessor zeroes that term while still checking for
+        # NaN, the joint limits and the workspace box at the destination; check_path then covers
+        # the swept path, which is what a moveJ actually needs.
+        if check.check_command(q, q) is not None or check.check_path(q_now, q) is not None:
+            return True             # skip this pose, keep the run going
+        if not cfg.robot.dry_run and not arm.within_robot_limits(q):
+            return True
+        try:
+            arm.move_j(q, speed, accel)
+        except ArmError as exc:
+            log.warning('move refused: %s', exc)
+            return False
+        return True
+    return move
+
+
+def _tag_layout(args):
+    ids = tuple(int(i) for i in (args.tag_ids or '0').split(','))
+    return collect_mod.default_layout(ids, args.tag_size, args.tag_spacing)
+
+
+def cmd_calibrate_handeye(args) -> int:
+    cfg = _load(args)
+    cameras = _start_cameras(cfg, [args.camera])
+    arm = make_arm(cfg.robot)
+    viewer = None
+    try:
+        viewer = _start_viewer(args, cameras, 'ur5vla calibrate-handeye')
+        cam, intr = _perception_camera(cfg, cameras, args.camera)
+        print(f'{args.camera}: {intr.width}x{intr.height}, fx={intr.fx:.1f} fy={intr.fy:.1f} '
+              f'cx={intr.cx:.1f} cy={intr.cy:.1f}')
+        _connect_arm(cfg, arm)
+        layout = _tag_layout(args)
+        print(f'AprilTag 36h11, {layout.tag_size_m * 1000:.1f} mm black square, '
+              f'tag(s) {sorted(layout.centres)}')
+        if args.start:
+            if _move_to_start(cfg, arm, args.yes, args.start) == REFUSED:
+                return 1
+        n = len(collect_mod.plan_orbit(np.array([0.55, -0.20, 0.0]), cfg.safety.tcp_offset_m))
+        print(f'The arm will orbit the tag TWICE, pausing at each view to photograph it: up to {n} '
+              f'views standing off at about {collect_mod.COARSE_CAM_DIST_M * 1000:.0f} mm, then the '
+              f'same again closing in to about {collect_mod.FINE_CAM_DIST_M * 1000:.0f} mm once the '
+              f'first pass has located the tag properly.')
+        print(f'Views that cannot be reached, that would bring the tool within '
+              f'{collect_mod.MIN_TOOL_CLEARANCE_M * 1000:.0f} mm of the table (modelled as a '
+              f'{collect_mod.TOOL_RADIUS_M * 1000:.0f} mm-radius cylinder out to the fingertips at '
+              f'{np.linalg.norm(cfg.safety.tcp_offset_m) * 1000:.0f} mm), or where the tag is not '
+              f'in frame, are skipped.')
+        if not _confirm('Start the calibration orbit?', args.yes):
+            return 1
+        result = collect_mod.calibrate(arm, cam, intr, layout, cfg.safety.tcp_offset_m,
+                                       _guarded_mover(cfg, arm), args.camera,
+                                       note=args.note or '',
+                                       q_min=np.deg2rad(cfg.safety.joint_min_deg),
+                                       q_max=np.deg2rad(cfg.safety.joint_max_deg))
+        if result is None:
+            return 1
+        print()
+        print(result.residuals.summary())
+        if not result.residuals.ok:
+            # Do NOT write this over the real file. A rejected calibration used to be saved to the
+            # same path as a good one, so re-running it after a knock and getting a worse fit
+            # destroyed the calibration that was working -- and nothing downstream would notice,
+            # because a wrong hand-eye transform does not fail, it just makes every grasp miss.
+            # Keep it beside the real one for inspection instead.
+            path = result.save(str(args.out) + '.rejected')
+            print('This is too loose to grasp a 60 mm cube with. The usual cause is too few '
+                  'DIFFERENT wrist orientations: move the tag so it stays in view at steeper '
+                  'tilts, then run it again.')
+            print(f'NOT saved as the calibration. Written to {path} for inspection; '
+                  f'{args.out} is untouched.')
+            return 1
+        path = result.save(args.out)
+        print(f'written: {path}')
+        print(f'T_flange_cam translation (mm): '
+              f'{np.round(result.T_flange_cam[:3, 3] * 1000, 1).tolist()}')
+        return 0
+    finally:
+        with _ignore_sigint('calibrate-handeye cleanup'):
+            _run_closers(('cameras', lambda: _stop_cameras(cameras)), ('arm', arm.close),
+                         ('viewer', lambda: _close_viewer(viewer)))
+
+
+LOOK_DOWN_WARN_DEG = 35.0       # beyond this the depth of a table is too oblique to trust
+
+
+def _warn_if_not_looking_down(T_base_cam, _said=[]) -> None:
+    """Say so, once, if the camera is not looking anywhere near down at the table.
+
+    The cube detector fits the table plane from depth and rays the cube's centroid onto it. Both
+    degrade badly at grazing incidence -- a few millimetres of depth noise across a shallow angle
+    becomes centimetres of position -- so a steeply tilted view does not give a wrong-ish answer,
+    it gives a meaningless one that changes every frame. Worth naming, because it is exactly what a
+    broken calibration looks like from the outside.
+    """
+    axis = np.asarray(T_base_cam, float)[:3, :3] @ np.array([0.0, 0.0, 1.0])
+    tilt = math.degrees(math.acos(float(np.clip(-axis[2], -1.0, 1.0))))
+    if tilt > LOOK_DOWN_WARN_DEG and not _said:
+        _said.append(True)
+        log.warning('the camera is looking %.0f deg off vertical, not down at the table. Depth at '
+                    'this angle is unreliable and the table fit below will be meaningless. Move to '
+                    'the look pose first: add `--start cube_look`.', tilt)
+
+
+def cmd_cube_check(args) -> int:
+    """What the detector makes of the scene right now. Moves nothing unless --start is given.
+
+    --start exists because this check is only meaningful from a pose that looks FLAT DOWN at the
+    table, and the obvious time to run it is straight after `calibrate-handeye`, which leaves the
+    arm parked on a steep close-in orbit pose instead. Run from there, the detector reports a table
+    tilted 76 deg at z = -0.62 that moves between frames, which reads like a broken calibration and
+    is really just a camera looking sideways across the table at grazing incidence.
+    """
+    from .perception.cube import CubeDetectorConfig, survey_table
+    from .perception.cube import detect as detect_cube
+    from .perception.handeye import HandEye
+    cfg = _load(args)
+    policy = dict(cfg.policy)
+    cam_name = args.camera or policy.get('camera', 'wrist')
+    cameras = _start_cameras(cfg, [cam_name])
+    arm = make_arm(cfg.robot)
+    viewer = None
+    try:
+        viewer = _start_viewer(args, cameras, 'ur5vla cube-check')
+        cam, intr = _perception_camera(cfg, cameras, cam_name)
+        if args.start:
+            _connect_arm(cfg, arm)              # takes control, because it is about to move
+            if _move_to_start(cfg, arm, args.yes, args.start) == REFUSED:
+                return 1
+        else:
+            arm.connect(receive_only=True)      # takes no control: it cannot move
+        handeye = HandEye.load(args.handeye or policy.get('handeye'))
+        det = CubeDetectorConfig(**(policy.get('cube') or {}))
+        print(f'hand-eye: {args.handeye or policy.get("handeye")}'
+              + (f' ({handeye.residuals.summary()})' if handeye.residuals else ''))
+        print(f'ROI x {det.roi_min_m[0]:.3f}..{det.roi_max_m[0]:.3f}, '
+              f'y {det.roi_min_m[1]:.3f}..{det.roi_max_m[1]:.3f}, table z~{det.table_z_m:.3f}, '
+              f'cube {det.cube_size_m * 1000:.0f} mm')
+        deadline = time.monotonic() + (args.seconds if args.seconds is not None else 10.0)
+        hits = misses = 0
+        while time.monotonic() < deadline:
+            frame = cam.latest()
+            if frame is None:
+                time.sleep(0.1)
+                continue
+            if frame.depth is None:
+                raise SystemExit(f"camera '{cam_name}' delivers no depth. Set `depth: true` on it "
+                                 f'in configs/sections/cameras.yaml -- the cube detector needs it.')
+            q = arm.read_state().q
+            T_base_cam = handeye.base_from_camera(q)
+            _warn_if_not_looking_down(T_base_cam)
+            pose = detect_cube(frame.rgb, frame.depth, intr, T_base_cam, det)
+            if pose is None:
+                misses += 1
+                # Say how high the table actually is, with no prior: that is the number
+                # cube.table_z_m needs, and a wrong one is the usual reason nothing is found.
+                seen = survey_table(frame.depth, intr, T_base_cam, det.roi_min_m, det.roi_max_m,
+                                    cfg=det)
+                where = (f'table in the ROI measures z={seen.d:+.3f} m '
+                         f'(tilt {np.rad2deg(np.arccos(min(1.0, abs(seen.n[2])))):.1f} deg, '
+                         f'{seen.inliers} points)' if seen is not None
+                         else 'no depth in the ROI at all -- is the camera looking at it?')
+                print(f'no cube | {where}', flush=True)
+            else:
+                hits += 1
+                print(f'cube x={pose.centre_m[0]:+.3f} y={pose.centre_m[1]:+.3f} '
+                      f'z={pose.centre_m[2]:+.3f}  yaw={np.rad2deg(pose.yaw_rad):+6.1f} deg  '
+                      f'{pose.size_m * 1000:4.0f} mm  {pose.pixels:5d} px  '
+                      f'table z={pose.table.d:+.3f} (rms {pose.table.rms_m * 1000:.1f} mm)  '
+                      f'{pose.source}', flush=True)
+            time.sleep(max(0.0, args.interval))
+        print(f'\n{hits} detections, {misses} misses')
+        if hits == 0:
+            print('Nothing found. Check, in this order: is the cube inside the ROI above; does '
+                  '`--view` show it lit well enough (raise cube.value_max if it is dim); is '
+                  'cube.table_z_m within 6 cm of the real table height?')
+        return 0 if hits else 1
+    finally:
+        with _ignore_sigint('cube-check cleanup'):
+            _run_closers(('cameras', lambda: _stop_cameras(cameras)), ('arm', arm.close),
+                         ('viewer', lambda: _close_viewer(viewer)))
+
+
+def cmd_collect(args) -> int:
+    cfg = _load(args)
+    if cfg.policy.get('backend') != 'scripted':
+        raise SystemExit('collect needs a scripted policy: -p configs/policy/scripted_cube.yaml')
+    run_name = f'{time.strftime("%Y%m%d-%H%M%S")}_collect' + (f'_{args.tag}' if args.tag else '')
+    run_dir = Path(cfg.logging.root) / run_name
+    with sessionlog.session_log(run_dir / sessionlog.NAME):
+        return _collect_episodes(args, cfg, run_name, run_dir)
+
+
+# Exit codes for `collect`, so a loop around it can tell a finished batch from a broken scene.
+EXIT_STOPPED = 1            # e-stop, error, quit, or a move the safety layer refused
+EXIT_FAILURE_STREAK = 3     # --max-consecutive-failures reached: the scene needs a human
+
+
+def _handeye_record(backend) -> dict | None:
+    """The hand-eye calibration the backend is actually using, as plain JSON."""
+    he = getattr(backend, 'handeye', None)
+    if he is None:
+        return None
+    return {'camera': he.camera, 'path': str(getattr(backend, 'handeye_path', '')),
+            'T_flange_cam': np.asarray(he.T_flange_cam, float).tolist(),
+            'frame': 'UR tool0 (flange) -> camera optical frame (OpenCV: +z forward, +y down)',
+            'residuals': vars(he.residuals) if he.residuals is not None else None,
+            'solved_at': he.solved_at}
+
+
+def _check_place_reachable(cfg: config_mod.RunConfig, backend, place, place_z,
+                           scatter_min=None, scatter_max=None) -> None:
+    """Refuse a run whose place target the cube detector could never find again.
+
+    Also checks the scatter region, for the same reason one step removed: a reset drops the cube
+    at a random point in it, and the task episode after that has to detect it there.
+    """
+    det = dict((cfg.policy or {}).get('cube') or {})
+    lo = tuple(det.get('roi_min_m', (0.0, 0.0)))
+    hi = tuple(det.get('roi_max_m', (0.0, 0.0)))
+
+    def outside(p):
+        return not (lo[0] <= p[0] <= hi[0] and lo[1] <= p[1] <= hi[1])
+
+    if outside(place):
+        raise SystemExit(
+            f'collect: the place target {tuple(round(v, 3) for v in place)} is outside the cube '
+            f'detector\'s ROI (x {lo[0]:.3f}..{hi[0]:.3f}, y {lo[1]:.3f}..{hi[1]:.3f}).\n'
+            f'  A task episode puts the cube there and the next reset episode has to FIND it '
+            f'there, so every episode after the first would end NO_CUBE.\n'
+            f'  Either move the target inside the ROI (--place X Y) or widen cube.roi_*_m -- but '
+            f'only to a patch the wrist camera actually sees from the look pose, checked with '
+            f'`ur5vla cube-check --start <pose>`.')
+
+    if scatter_min is not None and scatter_max is not None:
+        corners = [(scatter_min[0], scatter_min[1]), (scatter_max[0], scatter_min[1]),
+                   (scatter_min[0], scatter_max[1]), (scatter_max[0], scatter_max[1])]
+        bad = [c for c in corners if outside(c)]
+        if bad:
+            raise SystemExit(
+                f'collect: {len(bad)} corner(s) of the scatter region '
+                f'({tuple(scatter_min)}..{tuple(scatter_max)}) fall outside the cube detector\'s '
+                f'ROI (x {lo[0]:.3f}..{hi[0]:.3f}, y {lo[1]:.3f}..{hi[1]:.3f}). A reset episode '
+                f'drops the cube anywhere in that region and the task episode after it has to '
+                f'detect it there, so those drops would end NO_CUBE. Shrink --scatter-min/'
+                f'--scatter-max to sit inside the ROI.')
+
+    table_z = det.get('table_z_m')
+    if table_z is not None and abs(float(place_z) - float(table_z)) > 0.005:
+        log.warning('--place-z %.3f is %.0f mm off cube.table_z_m %.3f. The cube is released '
+                    'place_clearance_m above the place surface, so if that surface is really the '
+                    'table the drop is this much larger -- enough to bounce the cube out of the '
+                    'ROI.', float(place_z), (float(place_z) - float(table_z)) * 1000, float(table_z))
+
+
+def _collect_episodes(args, cfg: config_mod.RunConfig, run_name: str, run_dir: Path) -> int:
+    from .skills.pickplace import Target
+    cameras = _start_cameras(cfg)
+    arm = make_arm(cfg.robot)
+    gripper = make_gripper(cfg.gripper, cfg.robot.dry_run)
+    ft = make_ft_sensor(cfg.ft_sensor, cfg.robot.dry_run)
+    backend = build_backend(cfg.policy)
+    viewer = None
+    try:
+        viewer = _start_viewer(args, cameras, f'ur5vla collect {run_name}')
+        _, intr = _perception_camera(cfg, cameras, backend.camera)
+        info = backend.connect()
+        _connect_arm(cfg, arm)
+        gripper.connect()
+        ft.connect()
+        look_q_deg = cfg.robot.start_poses.get(args.start)
+        if look_q_deg is None:
+            raise SystemExit(f"collect: --start '{args.start}' is not in robot.start_poses "
+                             f"({', '.join(cfg.robot.start_poses) or 'none'}). It must be the pose "
+                             f"the wrist camera looks at the table from.")
+        look_q = np.deg2rad(look_q_deg)
+        backend.bind(intr, cfg.safety.tcp_offset_m, look_q,
+                     q_min=np.deg2rad(cfg.safety.joint_min_deg),
+                     q_max=np.deg2rad(cfg.safety.joint_max_deg),
+                     # Well under the per-tick step limit, so the skill slows itself rather than
+                     # having an episode stopped mid-grasp by a `step` violation.
+                     #
+                     # The factor is 0.4, not ~1, because of the crossfade. ChunkBuffer.merge
+                     # blends the old trajectory into the new chunk over control.crossfade_steps,
+                     # and the blend WEIGHT has its own velocity: fading from a standing hold into
+                     # a chunk that moves at full speed from its first step roughly DOUBLES the
+                     # instantaneous joint rate at the boundary (measured: an 85 deg/s chunk came
+                     # out of the buffer at 159 deg/s). Half the limit, less a margin, keeps the
+                     # executed command inside safety.max_step_rad even at the boundary.
+                     max_joint_rad_s=0.4 * cfg.safety.max_step_rad / cfg.robot.period_s,
+                     max_tcp_m_s=(None if cfg.safety.max_tcp_speed_m_s is None
+                                  else 0.4 * cfg.safety.max_tcp_speed_m_s))
+        # Compliance must be OFF for engineered data: with the spring on, the executed command is
+        # the skill's target plus a force-driven yield, so the recorded action no longer matches
+        # what the skill asked for. That mismatch is what made the earlier cube policy unusable.
+        if cfg.robot.compliance.enabled:
+            raise SystemExit(
+                'robot.compliance.enabled is true. Engineered collection must record RIGID motion, '
+                'or every action in the dataset carries the spring\'s yield offset and a policy '
+                'trained on it learns to fight a force that is not there. Set `compliance: false` '
+                'in the scripted policy file (it overrides robot.compliance.enabled), or turn it '
+                'off in configs/sections/robot.yaml.')
+        # The place target MUST be somewhere the detector looks. The schedule alternates
+        # reset -> task: a task episode puts the cube on this fixed target, and the next RESET has
+        # to find it there, because nothing is tracked between episodes -- every one re-detects
+        # from scratch. Put the target outside cube.roi_*_m and the run does not degrade, it dies:
+        # the first task episode parks the cube where nothing can see it and every episode after
+        # that ends NO_CUBE, with the cube sitting there for the rest of the night. The shipped
+        # defaults had exactly this bug, the target 20 mm outside the ROI.
+        if args.place_z is None:
+            args.place_z = float(((cfg.policy or {}).get('cube') or {}).get('table_z_m', 0.0))
+            log.info('--place-z not given; using the detector\'s table height %.3f m', args.place_z)
+        _check_place_reachable(cfg, backend, tuple(args.place), args.place_z,
+                               tuple(args.scatter_min), tuple(args.scatter_max))
+        loop = ControlLoop(cfg, arm, gripper, cameras, backend, info, ft, compliance=None,
+                           on_violation='stop')
+        # One throwaway inference before anything moves, as `run` does. It is not about a server
+        # here: it runs the cube detector and the IK once so OpenCV's and numpy's code paths are
+        # warm. Without it the FIRST inference of the first episode takes twice as long, holds the
+        # GIL, and makes the execution thread overrun its tick -- which the step check sees as a
+        # jump and turns into a safety stop seconds into the run. Its result is discarded, and
+        # run_episode resets the skill, so it cannot leak into an episode.
+        try:
+            log.info('warm-up inference (discarded): %.3f s', loop.warmup(args.task_prompt))
+        except TimeoutError as exc:
+            raise SystemExit(f'collect: no usable observation to warm up on ({exc}). Are the '
+                             f'cameras delivering frames?') from None
+        plan = collect_mod.schedule(
+            args.episodes, args.task_prompt, args.reset_prompt,
+            tuple(args.place), args.place_z, tuple(args.scatter_min), tuple(args.scatter_max),
+            args.seed, record_reset=not args.no_record_reset, reset_yaw_deg=args.reset_yaw_deg)
+        print(f'{len(plan)} episodes: {args.episodes} x [reset, task]' if not args.no_record_reset
+              else f'{len(plan)} task episodes (resets run but are not recorded)')
+        print(f'look pose: {args.start}  place target: {tuple(args.place)} z={args.place_z}  '
+              f'scatter {tuple(args.scatter_min)}..{tuple(args.scatter_max)}  seed {args.seed}')
+        # A small per-episode offset on the look pose: it gives wrist_2 (pinned at 90 deg by every
+        # top-down grasp) a non-zero range in the dataset, and stops every episode starting from a
+        # pixel-identical view.
+        jitter = collect_mod.look_jitter(len(plan), args.look_jitter_deg, args.seed)
+        print(f'look-pose jitter: +-{args.look_jitter_deg} deg per episode')
+        counts: dict[str, int] = {}
+        # Why the run ended early, if it did. A wrapper running collect in a loop reads the exit
+        # code: 0 means every planned episode ran and it is safe to start the next batch; anything
+        # else means stop and look.
+        stopped: str | None = None
+        streak = 0
+        for ep, sc in enumerate(plan):
+            prepared = _prepare(cfg, arm, gripper, ft, args.yes, args.reuse_tare or ep > 0)
+            if prepared is None:
+                stopped = 'prepare'
+                break
+            look_q_ep = look_q + jitter[ep]
+            look_deg_ep = np.rad2deg(look_q_ep).tolist()
+            if _move_to(cfg, arm, look_deg_ep, f'the look pose ({args.start})', args.yes) != MOVED:
+                stopped = 'look-pose move refused'
+                break
+            _wait_still(arm)        # the cube is detected from the first frames: do not photograph a moving arm
+            backend.set_episode(place=Target(xy=sc.place_xy, z=sc.place_z,
+                                             yaw_deg=sc.place_yaw_deg), look_q=look_q_ep)
+            if _ask(f'episode {ep + 1}/{len(plan)} [{sc.name}]: Enter to start, q to quit ',
+                    args.yes) == 'q':
+                stopped = 'quit'
+                break
+            recorder = EpisodeRecorder(run_dir / f'ep_{ep:03d}', cameras, cfg.logging)
+            recorder.start({'run': run_name, 'episode': ep, 'kind': 'demo', 'scenario': sc.name,
+                            'prompt': sc.prompt, 'config_path': cfg.source, 'config': cfg.raw,
+                            'dry_run': cfg.robot.dry_run, 'engineered': True,
+                            'policy_info': dataclasses.asdict(info),
+                            'place': {'xy': list(sc.place_xy), 'z': sc.place_z,
+                                      'yaw_deg': sc.place_yaw_deg},
+                            # The MATRIX, not just the path the config names. The path points at a
+                            # file that gets overwritten every recalibration, so an episode that
+                            # only knew the path would silently pick up a later mounting -- and
+                            # its depth, which is only meaningful in the base frame through this
+                            # transform, would be wrong without anything looking wrong.
+                            'handeye': _handeye_record(backend),
+                            'seed': args.seed,
+                            'start': {'name': args.start, 'q_deg': look_deg_ep,
+                                      'nominal_q_deg': list(look_q_deg),
+                                      'jitter_deg': args.look_jitter_deg},
+                            **prepared})
+            print(f'running [{sc.name}] "{sc.prompt}": [space]/[e] e-stop, [d] end', flush=True)
+            with _operator_keys(_episode_keys(loop.estop, loop.end_request), viewer):
+                result = loop.run_episode(sc.prompt, recorder, args.max_seconds)
+            label = collect_mod.label_for(result.end_reason, backend.outcome.value)
+            counts[f'{sc.name}:{label}'] = counts.get(f'{sc.name}:{label}', 0) + 1
+            print(f'episode {ep} [{sc.name}]: {result.end_reason} '
+                  f'{result.detail or ""} -> {label}  ({result.duration_s:.1f} s, '
+                  f'skill {backend.outcome.value} {backend.detail or ""})')
+            recorder.finish({'result': dataclasses.asdict(result), 'label': label,
+                             'skill_outcome': backend.outcome.value,
+                             'skill_detail': backend.detail, 'auto_labelled': True})
+            _report_saved(recorder)
+            if result.end_reason in ('estop', 'error'):
+                stopped = result.end_reason
+                break
+            if result.end_reason == 'safety':
+                _wait_until_ready(cfg, arm)
+            # A failure streak means the scene is broken, not that the skill is unlucky: the usual
+            # cause is a grasp that knocked the cube out of the ROI, after which EVERY episode ends
+            # NO_CUBE. Left alone, an unattended run records hours of an arm staring at an empty
+            # table -- 200 MB of video per episode -- until the disk fills. Stop instead.
+            streak = 0 if label == 'success' else streak + 1
+            if args.max_consecutive_failures and streak >= args.max_consecutive_failures:
+                stopped = f'{streak} failures in a row'
+                log.error('collect: %d episodes failed in a row; stopping. The last ended %s (%s). '
+                          'Check the cube is inside the ROI with `ur5vla cube-check --start %s`.',
+                          streak, backend.outcome.value, backend.detail or '', args.start)
+                break
+        print('\n'.join(f'{k}: {v}' for k, v in sorted(counts.items())) or 'nothing recorded')
+        print(f'\nconvert the successes with:\n  ur5vla to-lerobot {run_dir} --repo-id '
+              f'<user>/<name> --root <dir> --fps 15 --action-source command --gripper-source command')
+        if stopped is None:
+            return 0
+        print(f'\nrun stopped early: {stopped}')
+        return EXIT_FAILURE_STREAK if stopped.endswith('in a row') else EXIT_STOPPED
+    finally:
+        with _ignore_sigint('ur5vla collect cleanup'):
+            _run_closers(
+                ('cameras', lambda: _stop_cameras(cameras)),
+                ('policy backend', backend.close),
+                ('F/T sensor', ft.close),
+                ('gripper', gripper.close),
+                ('arm', arm.close),
+                ('viewer', lambda: _close_viewer(viewer)),
+            )
+
+
 WORKSPACE_KEYS = {'\n': 'record', 'p': 'record', 'u': 'undo', 'd': 'done', 'q': 'quit'}
 
 
@@ -1689,7 +2161,13 @@ def cmd_to_lerobot(args) -> int:
     return convert.run(args)
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The whole CLI, built separately from main() so the shipped defaults can be TESTED.
+
+    They are not cosmetic: `collect`'s --place default was 20 mm outside the cube detector's ROI,
+    which would have ended every episode after the first with NO_CUBE. A default that cannot be
+    asserted on is a default nobody checks.
+    """
     parser = argparse.ArgumentParser(prog='ur5vla', description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('-v', '--verbose', action='store_true')
@@ -1814,11 +2292,94 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument('--points', metavar='FILE',
                    help='no robot: recompute the box from a saved points file, at the current tcp_offset_m')
     p.add_argument('-y', '--yes', action='store_true', help='start freedrive without asking')
+    # ---- engineered data collection ----
+    p = add('calibrate-handeye', cmd_calibrate_handeye, dry=True, view=True)
+    p.add_argument('--camera', default='wrist',
+                   help='the camera to calibrate (default wrist: the only one reporting intrinsics)')
+    p.add_argument('--out', default=HANDEYE_PATH, metavar='FILE',
+                   help=f'where to write the calibration (default {HANDEYE_PATH})')
+    p.add_argument('--tag-ids', metavar='IDS', default='0',
+                   help='AprilTag 36h11 id(s) of the target, comma separated (default 0). Several '
+                        'ids need --tag-spacing and are treated as a row-major grid')
+    p.add_argument('--tag-size', type=float, default=TAG_SIZE_M, metavar='M',
+                   help=f'the BLACK SQUARE edge in metres (default {TAG_SIZE_M}, the cell\'s 36.2 mm '
+                        f'tags). Measure it: a wrong size scales the whole calibration')
+    p.add_argument('--tag-spacing', type=float, metavar='M',
+                   help='centre-to-centre spacing of a tag grid, metres (with several --tag-ids)')
+    p.add_argument('--start', metavar='NAME',
+                   help='move to robot.start_poses[NAME] first (the pose that sees the tag)')
+    p.add_argument('--note', help='recorded in the calibration file (e.g. why it was redone)')
+    p.add_argument('-y', '--yes', action='store_true', help='no prompts: move without asking')
+
+    p = add('cube-check', cmd_cube_check, policy=True, dry=True, view=True)
+    p.add_argument('--camera', help='override the policy file\'s perception camera')
+    p.add_argument('--handeye', metavar='FILE', help="override the policy file's hand-eye file")
+    p.add_argument('--seconds', type=float, help='how long to watch (default 10)')
+    p.add_argument('--interval', type=float, default=0.5, help='seconds between detections')
+    p.add_argument('--start', metavar='NAME',
+                   help='move to robot.start_poses[NAME] first (e.g. cube_look). Without it the '
+                        'command takes no control of the arm and cannot move')
+    p.add_argument('-y', '--yes', action='store_true', help='no prompts: move without asking')
+
+    p = add('collect', cmd_collect, policy=True, dry=True, view=True)
+    p.add_argument('--episodes', type=int, default=20,
+                   help='task episodes; each is preceded by a reset episode (default 20 -> 40 recorded)')
+    p.add_argument('--start', metavar='NAME', default='cube_look',
+                   help='robot.start_poses entry the wrist camera looks at the table from')
+    # Inside cube.roi_*_m with a cube half-width to spare, and clear of the scatter region so the
+    # two scenarios stay distinct (70 mm apart in y). It was [0.60, -0.06], 20 mm OUTSIDE the ROI,
+    # which would have ended every episode after the first with NO_CUBE.
+    p.add_argument('--place', type=float, nargs=2, default=[0.52, -0.09], metavar=('X', 'Y'),
+                   help='the task place target in the base frame, metres (where the cube is put)')
+    # None -> the detector's measured cube.table_z_m. The cube is placed ON THE TABLE, so the
+    # table height is the right default; hard-coding 0.0 silently added the table's own depth to
+    # every release drop.
+    p.add_argument('--place-z', type=float, default=None, metavar='Z',
+                   help='height of the surface the cube is placed on, base frame metres '
+                        '(default: the policy file\'s cube.table_z_m)')
+    # Every corner at least a cube half-width inside the ROI: a reset drops the cube anywhere in
+    # here and the task episode after it has to detect it there.
+    p.add_argument('--scatter-min', type=float, nargs=2, default=[0.47, -0.31], metavar=('X', 'Y'),
+                   help='corner of the region a reset scatters the cube into')
+    p.add_argument('--scatter-max', type=float, nargs=2, default=[0.58, -0.16], metavar=('X', 'Y'),
+                   help='opposite corner of the scatter region')
+    p.add_argument('--task-prompt', default='put the black cube on the target',
+                   help='prompt recorded for the task episodes')
+    p.add_argument('--reset-prompt', default='put the black cube down on the table',
+                   help='prompt recorded for the reset episodes')
+    p.add_argument('--no-record-reset', action='store_true',
+                   help='run the resets but do not record them (task episodes only)')
+    p.add_argument('--seed', type=int, default=0,
+                   help='seed for the scatter positions and look jitter; change it between runs '
+                        'for new scenes')
+    p.add_argument('--look-jitter-deg', type=float, default=3.0, metavar='DEG',
+                   help='random per-joint offset on the look pose each episode (default 3). It '
+                        'varies the starting view AND gives wrist_2 -- which a top-down grasp pins '
+                        'at 90 deg -- a non-zero range in the dataset, which pi0.5 normalization '
+                        'needs. 0 disables it')
+    p.add_argument('--max-seconds', type=float, help='overrides control.max_episode_s')
+    p.add_argument('--tag', help='appended to the run directory name')
+    p.add_argument('--reset-yaw-deg', type=float, default=collect_mod.RESET_YAW_DEG, metavar='DEG',
+                   help='resets set the cube down at a random yaw in [-DEG, +DEG) (default 45, every '
+                        'distinct cube orientation), so task episodes pick up rotated cubes. 0 '
+                        'places every cube square, and the grasp then never turns')
+    p.add_argument('--max-consecutive-failures', type=int, default=3, metavar='N',
+                   help='stop after N episodes in a row that are not successes (default 3; 0 = '
+                        'never). Exits 3, so a loop around collect stops too')
+    p.add_argument('--reuse-tare', action='store_true',
+                   help='skip the calibration-pose move and F/T tare on the first episode too')
+    p.add_argument('-y', '--yes', action='store_true',
+                   help='no prompts: this is what makes a long run unattended')
+
     p = sub.add_parser('to-lerobot', help='write recorded episodes as a LeRobot dataset')
     convert.add_arguments(p)
     p.set_defaults(fn=cmd_to_lerobot)
 
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format='%(asctime)s %(levelname).1s %(name)s: %(message)s')
     try:
@@ -1828,6 +2389,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except ArmError as exc:             # e.g. the robot is unreachable: a clear line, not a traceback
         print(f'robot: {exc}', file=sys.stderr)
+        return 2
+    except CalibrationError as exc:     # no hand-eye file yet: the first thing a new cell hits
+        print(f'calibration: {exc}', file=sys.stderr)
+        return 2
+    except (SkillError, CubeError, TagError) as exc:
+        print(f'skill: {exc}', file=sys.stderr)
         return 2
     except KeyboardInterrupt:           # Ctrl-C at a prompt or while waiting for the robot
         print()

@@ -66,6 +66,25 @@ def _jsonable(x: Any) -> Any:
     return x
 
 
+def _intrinsics_record(cam) -> dict[str, Any] | None:
+    """A camera's intrinsics as plain JSON, plus what its depth frames mean, or None."""
+    try:
+        intr = cam.intrinsics()
+    except Exception:                       # a driver without the method, or not yet open
+        intr = None
+    if intr is None:
+        return None
+    rec = {'fx': intr.fx, 'fy': intr.fy, 'cx': intr.cx, 'cy': intr.cy,
+           'width': intr.width, 'height': intr.height,
+           'distortion': list(intr.coeffs), 'distortion_model': 'opencv'}
+    if getattr(getattr(cam, 'cfg', None), 'depth', False):
+        # The RealSense driver aligns depth to the colour stream, so one model covers both and a
+        # depth pixel (u, v) is the colour pixel (u, v). Units as written by _write_frames.
+        rec['depth'] = {'aligned_to': 'rgb', 'unit': 'millimetre', 'dtype': 'uint16',
+                        'invalid': [0, 65535]}
+    return rec
+
+
 def git_commit() -> str | None:
     try:
         out = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True,
@@ -114,6 +133,11 @@ class EpisodeRecorder:
             **meta,
             # What each camera reports of its focus, exposure, gain and white balance (cameras/).
             'camera_settings': {name: cam.settings() for name, cam in self.cameras.items()},
+            # Each camera's pinhole model, AS RECORDED (already matching any rotate:). Without it
+            # the depth frames are just images: turning a pixel and a depth into a 3D point needs
+            # fx/fy/cx/cy, and those live in the camera, not the dataset. Stored per episode so the
+            # recording stays usable after the camera is swapped, refocused or recalibrated.
+            'camera_intrinsics': {name: _intrinsics_record(cam) for name, cam in self.cameras.items()},
             'clock': {'monotonic': time.monotonic(), 'wall': time.time()},
             'git_commit': git_commit(),
             'tick_fields': list(TICK_FIELDS),
