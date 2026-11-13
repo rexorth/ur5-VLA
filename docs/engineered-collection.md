@@ -275,6 +275,28 @@ MAX_BATCHES=6 scripts/collect_loop.sh                     # a bounded session
 EXTRA="--dry-run --max-seconds 25" MAX_BATCHES=1 scripts/collect_loop.sh   # rehearse: nothing moves
 ```
 
+While it runs, every trial prints where the session is — at its start (`>>`), every 10 s during
+it (`..`, with the phase of the grasp it is in) and when it ends (`<<`):
+
+```
+>> [batch 2/6 | trial 119/240 | 4/40 in batch | task | 118 trials/h | ok 110/118 = 93% (task 92%) | elapsed 1h00m | batch ETA 18m49s | ETA 1h02m]
+.. [batch 2/6 | trial 119/240 | 4/40 in batch | task:carry 12s | 118 trials/h | ... | ETA 1h01m]
+<< [batch 2/6 | trial 119/240 | 4/40 in batch | task | 118 trials/h | ok 111/119 = 93% (task 92%) | ... | ETA 1h01m]  task -> success
+```
+
+A *trial* is one recorded episode (a reset or a task). Totals and the ETA are exact with
+`MAX_BATCHES`; without it they are the disk guard's estimate, shown with `~` and `(disk)`. The rate
+is wall clock over the whole session — moves, tares and batch start-up included — measured to the
+last *finished* trial, so the ETA counts down steadily instead of climbing during each trial. The
+counts live in `collect_loop_<time>.progress.json` next to the loop log, which is how they carry
+across batches (each batch is a separate `collect` process). `--progress-every` changes the
+heartbeat (0 = start and end only).
+
+**Editing the script mid-run is safe now, and was not.** bash reads a script from disk as it runs it,
+so rewriting it in place made a running loop resume, when it stopped, at its old byte offset in the
+new text. `collect_loop.sh` is now a launcher that `exec`s `collect_loop_main.sh`, whose body is one
+function called and exited on the same line, so bash has parsed all of it before running any.
+
 It runs `collect` in **batches** (default 20 task + 20 reset episodes, ~20 minutes, ~8.4 GB),
 each with a new `--seed` and its own run directory, and stops on:
 

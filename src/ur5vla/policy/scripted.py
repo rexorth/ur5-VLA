@@ -140,6 +140,18 @@ class ScriptedBackend(PolicyBackend):
     def detail(self) -> dict:
         return dict(self._skill.state.detail) if self._skill is not None else {}
 
+    @property
+    def phase(self) -> str:
+        """The leg running now (standoff, grasp, carry, ...), for progress display. Read from
+        another thread, so it only reads attributes: worst case it is one leg stale."""
+        sk = self._skill
+        if sk is None:
+            return '-'
+        if not sk.state.plan:
+            return 'perceive'
+        leg = sk.leg
+        return leg.name if leg is not None else 'done'
+
     def infer(self, obs: Observation) -> ActionChunk:
         if not self._bound or self._skill is None:
             raise SkillError('ScriptedBackend.infer() before bind(): the backend has no camera '

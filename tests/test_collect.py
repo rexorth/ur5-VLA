@@ -562,14 +562,14 @@ class TestTheLoopCanTellAFinishedBatchFromABrokenScene:
         assert build_parser().parse_args(['collect']).max_consecutive_failures == 3
 
     def test_the_loop_script_stops_on_every_nonzero_exit(self):
-        src = open('scripts/collect_loop.sh').read()
+        src = open('scripts/collect_loop_main.sh').read()
         assert '0)   say "batch' in src, 'exit 0 must continue'
         for code in ('3)', '130)', '*)'):
             branch = src[src.index(f'        {code}'):]
             assert 'break' in branch.split(';;')[0], f'exit {code} must stop the loop'
 
     def test_the_loop_script_has_a_disk_guard(self):
-        src = open('scripts/collect_loop.sh').read()
+        src = open('scripts/collect_loop_main.sh').read()
         assert 'df ' in src and 'need_gb' in src, 'a continuous run fills /data in ~6 h'
 
 
@@ -609,3 +609,96 @@ class TestResetsVaryTheCubesOrientation:
     def test_the_cli_default_is_on(self):
         from ur5vla.cli import build_parser
         assert build_parser().parse_args(['collect']).reset_yaw_deg == collect.RESET_YAW_DEG > 0
+
+
+class TestProgressAcrossASession:
+    """Each batch is a separate `collect` process, so the counts live in a file. These pin that the
+    numbers carry across, and that the ETA counts DOWN -- measured to now, it saw-toothed: up all
+    through every trial, down at its end."""
+
+    def _p(self, tmp_path, batch=1, batches=3, per=4):
+        return collect.Progress.load(tmp_path / 'p.json', batch, batches, False, per)
+
+    def test_counts_carry_from_one_batch_process_to_the_next(self, tmp_path):
+        a = self._p(tmp_path, batch=1)
+        for sc, lb in (('reset', 'success'), ('task', 'success'), ('reset', 'fail'), ('task', 'success')):
+            a.record(sc, lb)
+        b = self._p(tmp_path, batch=2)                  # a NEW process, same file
+        assert (b.done, b.ok, b.started) == (4, 3, a.started)
+        assert b.done_by == {'reset': 2, 'task': 2} and b.ok_by == {'reset': 1, 'task': 2}
+        assert 'trial 5/12' in b.line(1, 'reset') and 'batch 2/3' in b.line(1, 'reset')
+
+    def test_without_a_file_it_counts_within_the_batch(self):
+        p = collect.Progress.load(None, 1, 1, False, 4)
+        p.record('reset', 'success')
+        assert 'trial 2/4' in p.line(2, 'task')
+
+    def test_eta_counts_down_through_a_trial(self, tmp_path):
+        p = self._p(tmp_path)
+        p.started, p.done, p.last = 1000.0, 4, 1000.0 + 4 * 30.0      # 30 s per trial so far
+        etas = [p.eta_s(8, now=p.last + dt) for dt in (0, 10, 20, 29)]
+        assert etas == sorted(etas, reverse=True), f'ETA must fall during a trial: {etas}'
+        assert np.isclose(etas[0], 8 * 30.0)
+
+    def test_rate_is_steady_during_a_trial(self, tmp_path):
+        p = self._p(tmp_path)
+        p.started, p.done, p.last = 1000.0, 4, 1120.0
+        assert p.rate_per_h(now=1121.0) == p.rate_per_h(now=1149.0) == 4 / 120.0 * 3600
+
+    def test_success_rate_and_task_rate(self, tmp_path):
+        p = self._p(tmp_path)
+        for sc, lb in (('reset', 'success'), ('task', 'fail'), ('reset', 'success'), ('task', 'success')):
+            p.record(sc, lb)
+        assert 'ok 3/4 = 75% (task 50%)' in p.line(1, 'reset')
+
+    def test_an_estimated_total_is_marked(self, tmp_path):
+        p = collect.Progress.load(tmp_path / 'p.json', 1, 14, True, 40)
+        line = p.line(1, 'reset')
+        assert 'batch 1/~14' in line and 'trial 1/~560' in line and '(disk)' in line
+
+    def test_open_ended_has_no_total_but_still_a_batch_eta(self, tmp_path):
+        p = collect.Progress.load(tmp_path / 'p.json', 1, None, False, 4)
+        p.started, p.done, p.last, p.batch_done = 0.0, 1, 30.0, 1
+        line = p.line(2, 'task', now=30.0)
+        assert 'trial 2/?' in line and 'ETA --' in line and 'batch ETA 1m30s' in line
+
+    def test_a_torn_progress_file_does_not_crash_the_run(self, tmp_path):
+        (tmp_path / 'p.json').write_text('{"done": 4, "ok"')
+        assert self._p(tmp_path).done == 0
+
+    def test_the_phase_shown_is_the_real_leg(self):
+        from ur5vla.perception.cube import CubePose, Plane
+        from ur5vla.policy.scripted import ScriptedBackend
+        from ur5vla.skills.pickplace import GraspConfig, MotionConfig, PickPlace, Target
+        be = ScriptedBackend(handeye='unused.yaml')   # only read on connect()
+        assert be.phase == '-'
+        look = np.deg2rad([-9.23, -110.53, -37.24, -122.27, 90.0, -9.23])
+        be._skill = PickPlace(GraspConfig(), MotionConfig(), np.array([0, 0, 0.2339]), look,
+                              Target(xy=(0.52, -0.09), z=-0.014))
+        assert be.phase == 'perceive'
+        cube = CubePose(np.array([0.52, -0.2, 0.016]), 0.0, 0.046,
+                        Plane(np.array([0, 0, 1.0]), -0.014, 100, 0.001), 3000, 0.06, 'x', 0.0)
+        be._skill.state.plan = be._skill.plan_from_cube(cube, q_now=look)
+        assert be.phase == 'standoff'
+        be._skill.state.leg = 5
+        assert be.phase == 'carry'
+
+
+class TestTheLoopScriptIsSafeToEditWhileRunning:
+    """bash reads a script from disk AS IT RUNS IT. Rewriting collect_loop.sh in place while a loop
+    was running left that loop set to resume, when it stopped, at its old byte offset in the new
+    text -- a `collect ... -y` line two lines further on. (It happened to be saved by `set -u`
+    tripping on a variable the old script never defined.) The fix: a launcher that execs, and an
+    implementation wrapped in main() so bash has parsed all of it before running any of it."""
+
+    def test_the_launcher_hands_over_before_anything_else_can_run(self):
+        lines = open('scripts/collect_loop.sh').read().splitlines()
+        code = [l for l in lines if l.strip() and not l.lstrip().startswith('#')]
+        assert code[0].startswith('exec bash ') and 'collect_loop_main.sh' in code[0], \
+            'the first executable line must exec the implementation'
+
+    def test_the_implementation_is_one_function_called_then_exit(self):
+        src = open('scripts/collect_loop_main.sh').read().rstrip().splitlines()
+        assert 'main() {' in src
+        assert src[-1].strip() == 'main "$@"; exit $?', \
+            'call and exit on ONE line, so bash never reads past it'

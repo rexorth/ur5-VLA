@@ -36,9 +36,12 @@ needs no operator at the keyboard and `to-lerobot` still trains on successes onl
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
@@ -315,6 +318,130 @@ def schedule(episodes: int, task_prompt: str, reset_prompt: str, place_xy: tuple
         out.append(Scenario('reset', reset_prompt, spots[i], place_z, float(yaws[i])))
         out.append(Scenario('task', task_prompt, place_xy, place_z))
     return out if record_reset else [s for s in out if s.name == 'task']
+
+
+# ---- progress across a whole collection session ----
+
+def _fmt_duration(s: float | None) -> str:
+    if s is None or not np.isfinite(s):
+        return '--'
+    s = int(round(s))
+    h, m = divmod(s // 60, 60)
+    return f'{h}h{m:02d}m' if h else f'{m}m{s % 60:02d}s'
+
+
+@dataclass
+class Progress:
+    """Where a collection session is, and how fast it is going, across ALL its batches.
+
+    Each batch is a separate `collect` process (scripts/collect_loop.sh starts a new one per
+    seed), so anything held in memory would reset every ~20 minutes and the rate and ETA would be
+    meaningless. The counts live in a small JSON file instead, read at start and rewritten after
+    every trial. Without a file (a lone `collect`), it simply counts within the one batch.
+
+    A "trial" is one recorded episode -- a reset or a task -- which is what each batch counts.
+    """
+    path: Path | None = None
+    batch: int = 1                      # 1-based
+    batches: int | None = None          # None: open-ended
+    batches_estimated: bool = False     # True: the total is the disk guard's estimate
+    trials_per_batch: int = 0
+    started: float = field(default_factory=time.time)
+    batch_started: float = field(default_factory=time.time)
+    done: int = 0                       # trials finished in the whole session
+    ok: int = 0
+    done_by: dict = field(default_factory=dict)
+    ok_by: dict = field(default_factory=dict)
+    batch_done: int = 0
+    last: float | None = None           # wall time the last trial FINISHED
+
+    @classmethod
+    def load(cls, path, batch: int = 1, batches: int | None = None,
+             batches_estimated: bool = False, trials_per_batch: int = 0) -> 'Progress':
+        p = cls(Path(path) if path else None, batch, batches, batches_estimated, trials_per_batch)
+        if p.path is not None and p.path.exists():
+            try:
+                d = json.loads(p.path.read_text())
+                p.started = float(d.get('started', p.started))
+                p.done, p.ok = int(d.get('done', 0)), int(d.get('ok', 0))
+                p.done_by, p.ok_by = dict(d.get('done_by', {})), dict(d.get('ok_by', {}))
+                p.last = d.get('last')
+            except (ValueError, OSError) as exc:     # a torn write: start counting afresh
+                log.warning('progress file %s unreadable (%s); counting from zero', p.path, exc)
+        return p
+
+    def record(self, scenario: str, label: str) -> None:
+        self.last = time.time()
+        self.done += 1
+        self.batch_done += 1
+        self.done_by[scenario] = self.done_by.get(scenario, 0) + 1
+        if label == 'success':
+            self.ok += 1
+            self.ok_by[scenario] = self.ok_by.get(scenario, 0) + 1
+        self._save()
+
+    def _save(self) -> None:
+        if self.path is None:
+            return
+        tmp = self.path.with_suffix(self.path.suffix + '.tmp')
+        tmp.write_text(json.dumps({'started': self.started, 'done': self.done, 'ok': self.ok,
+                                   'done_by': self.done_by, 'ok_by': self.ok_by,
+                                   'last': self.last, 'batch': self.batch, 'batches': self.batches,
+                                   'updated': time.time()}))
+        os.replace(tmp, self.path)             # atomic: a reader never sees half a file
+
+    @property
+    def total(self) -> int | None:
+        return None if self.batches is None else self.batches * self.trials_per_batch
+
+    def rate_per_h(self, now: float | None = None) -> float | None:
+        """Trials per hour over the whole session, wall clock, so it includes the moves to the look
+        pose, F/T tares and batch start-up -- what an ETA has to account for.
+
+        Measured up to the last trial that FINISHED, not up to now. Up to now, the rate sags all
+        through every trial (the time grows, the count does not) and jumps back at its end, so the
+        ETA climbed every 10 s and fell every trial: a saw-tooth nobody can read a finish time off.
+        """
+        if not self.done or self.last is None:
+            return None
+        el = self.last - self.started
+        return self.done / el * 3600.0 if el > 0 else None
+
+    def eta_s(self, remaining: int | None, now: float | None = None) -> float | None:
+        """Time left for `remaining` trials, the one running now included: the session's mean
+        time per trial for each, less what the current one has already used. So it counts DOWN
+        through a trial instead of standing still or climbing."""
+        r = self.rate_per_h(now)
+        if remaining is None or not r:
+            return None
+        in_trial = max(0.0, (now or time.time()) - (self.last or self.started))
+        return max(0.0, remaining * 3600.0 / r - in_trial)
+
+    def line(self, trial_in_batch: int, scenario: str, now: float | None = None,
+             phase: str | None = None, ep_elapsed: float | None = None) -> str:
+        """One status line. `trial_in_batch` is 1-based and is the trial running NOW."""
+        now = now or time.time()
+        n_now = self.done + 1 if trial_in_batch > self.batch_done else self.done
+        tot = self.total
+        bt = '?' if self.batches is None else f'{"~" if self.batches_estimated else ""}{self.batches}'
+        tt = '?' if tot is None else f'{"~" if self.batches_estimated else ""}{tot}'
+        r = self.rate_per_h(now)
+        succ = f'{self.ok}/{self.done} = {100.0 * self.ok / self.done:.0f}%' if self.done else '--'
+        task = ''
+        if self.done_by.get('task'):
+            task = f' (task {100.0 * self.ok_by.get("task", 0) / self.done_by["task"]:.0f}%)'
+        batch_left = max(0, self.trials_per_batch - self.batch_done)
+        parts = [f'batch {self.batch}/{bt}',
+                 f'trial {n_now}/{tt}',
+                 f'{trial_in_batch}/{self.trials_per_batch} in batch',
+                 scenario + (f':{phase}' if phase else '') + (f' {ep_elapsed:.0f}s' if ep_elapsed is not None else ''),
+                 f'{r:.0f} trials/h' if r else '--/h',
+                 f'ok {succ}{task}',
+                 f'elapsed {_fmt_duration(now - self.started)}',
+                 f'batch ETA {_fmt_duration(self.eta_s(batch_left, now))}',
+                 f'ETA {_fmt_duration(self.eta_s(None if tot is None else max(0, tot - self.done), now))}'
+                 + (' (disk)' if self.batches_estimated else '')]
+        return '[' + ' | '.join(parts) + ']'
 
 
 def label_for(end_reason: str, outcome: str) -> str:

@@ -1818,6 +1818,35 @@ EXIT_STOPPED = 1            # e-stop, error, quit, or a move the safety layer re
 EXIT_FAILURE_STREAK = 3     # --max-consecutive-failures reached: the scene needs a human
 
 
+@contextlib.contextmanager
+def _heartbeat(every_s: float, make_line: Callable[[], str]):
+    """Print make_line() every `every_s` seconds while the block runs (0 = never).
+
+    So a glance at the terminal mid-trial shows where the run is, not just where the last trial
+    ended. It prints and reads attributes only -- no disk I/O -- so it costs the 125 Hz control
+    loop nothing measurable.
+    """
+    if not every_s or every_s <= 0:
+        yield
+        return
+    stop = threading.Event()
+
+    def run():
+        while not stop.wait(every_s):
+            try:
+                print(f'.. {make_line()}', flush=True)
+            except Exception:                   # a status line must never take the run down
+                pass
+
+    t = threading.Thread(target=run, name='progress', daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(timeout=1.0)
+
+
 def _handeye_record(backend) -> dict | None:
     """The hand-eye calibration the backend is actually using, as plain JSON."""
     he = getattr(backend, 'handeye', None)
@@ -1960,6 +1989,9 @@ def _collect_episodes(args, cfg: config_mod.RunConfig, run_name: str, run_dir: P
         # pixel-identical view.
         jitter = collect_mod.look_jitter(len(plan), args.look_jitter_deg, args.seed)
         print(f'look-pose jitter: +-{args.look_jitter_deg} deg per episode')
+        progress = collect_mod.Progress.load(args.progress_file, args.batch_index,
+                                             args.batch_total, args.batch_total_estimated,
+                                             len(plan))
         counts: dict[str, int] = {}
         # Why the run ended early, if it did. A wrapper running collect in a loop reads the exit
         # code: 0 means every planned episode ran and it is safe to start the next batch; anything
@@ -2002,10 +2034,18 @@ def _collect_episodes(args, cfg: config_mod.RunConfig, run_name: str, run_dir: P
                                       'jitter_deg': args.look_jitter_deg},
                             **prepared})
             print(f'running [{sc.name}] "{sc.prompt}": [space]/[e] e-stop, [d] end', flush=True)
-            with _operator_keys(_episode_keys(loop.estop, loop.end_request), viewer):
+            print(f'>> {progress.line(ep + 1, sc.name)}', flush=True)
+            t_ep = time.monotonic()
+            beat = (lambda ep=ep, sc=sc, t_ep=t_ep: progress.line(
+                ep + 1, sc.name, phase=getattr(backend, 'phase', None),
+                ep_elapsed=time.monotonic() - t_ep))
+            with _operator_keys(_episode_keys(loop.estop, loop.end_request), viewer), \
+                    _heartbeat(args.progress_every, beat):
                 result = loop.run_episode(sc.prompt, recorder, args.max_seconds)
             label = collect_mod.label_for(result.end_reason, backend.outcome.value)
             counts[f'{sc.name}:{label}'] = counts.get(f'{sc.name}:{label}', 0) + 1
+            progress.record(sc.name, label)
+            print(f'<< {progress.line(ep + 1, sc.name)}  {sc.name} -> {label}', flush=True)
             print(f'episode {ep} [{sc.name}]: {result.end_reason} '
                   f'{result.detail or ""} -> {label}  ({result.duration_s:.1f} s, '
                   f'skill {backend.outcome.value} {backend.detail or ""})')
@@ -2359,6 +2399,18 @@ def build_parser() -> argparse.ArgumentParser:
                         'needs. 0 disables it')
     p.add_argument('--max-seconds', type=float, help='overrides control.max_episode_s')
     p.add_argument('--tag', help='appended to the run directory name')
+    p.add_argument('--progress-every', type=float, default=10.0, metavar='S',
+                   help='print the progress line every S seconds during a trial too, not only at '
+                        'its start and end (default 10; 0 = only start and end)')
+    p.add_argument('--progress-file', metavar='PATH',
+                   help='JSON file holding the session\'s counts, so trial numbers, rate and ETA '
+                        'carry across batches. scripts/collect_loop.sh sets it')
+    p.add_argument('--batch-index', type=int, default=1, metavar='N',
+                   help='this batch\'s number in the session, for the progress line (default 1)')
+    p.add_argument('--batch-total', type=int, default=1, metavar='N',
+                   help='how many batches the session will run, for totals and ETA (default 1)')
+    p.add_argument('--batch-total-estimated', action='store_true',
+                   help='--batch-total is an estimate (the disk guard\'s), shown with a ~')
     p.add_argument('--reset-yaw-deg', type=float, default=collect_mod.RESET_YAW_DEG, metavar='DEG',
                    help='resets set the cube down at a random yaw in [-DEG, +DEG) (default 45, every '
                         'distinct cube orientation), so task episodes pick up rotated cubes. 0 '
