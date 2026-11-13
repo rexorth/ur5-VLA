@@ -18,3 +18,7 @@ include_gripper_state: true         # ... as its 7th entry, like the dataset
 image_size: [224, 224]
 action_mode: absolute               # openpi's output transforms return absolute joints
 gripper_index: 6
+# This policy's control (overrides control.yaml) and inference-time compliance (overrides
+# robot.compliance.enabled).
+control: {refill_fraction: 0.5, crossfade_steps: 10, max_episode_s: 120}
+compliance: false

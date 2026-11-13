@@ -1,0 +1,29 @@
+deactivate
+cd ~/abhay_ws/ur5-VLA/
+source .venv-lerobot/bin/activate
+ur5vla run -p configs/policy/lerobot_3cam91_5000.yaml \
+  --prompt "put the black cube in the brown box" --episodes 10 --view --reuse-tare
+  
+ur5vla run -p configs/policy/lerobot_ur5_cubedoor_3cam15_qref_s5000.yaml \
+  --prompt "put the black cube in the brown box" --episodes 10 --view --reuse-tare  
+  
+ur5vla run -p configs/policy/lerobot_ur5_3cam30_exp_s5000.yaml \
+  --prompt "put the black cube in the brown box" --episodes 10 --view --reuse-tare
+  
+ur5vla run -p configs/policy/lerobot_ur5_3cam30_exp_s5000.yaml \
+  --prompt "put the black cube in the brown box" --episodes 10 --view --reuse-tare
+  
+  
+  
+
+deactivate
+cd ~/abhay_ws/lerobot
+source ~/abhay_ws/lerobot/.venv/bin/activate
+python -m lerobot.async_inference.policy_server --host=127.0.0.1 --port=8080 --fps=15 
+
+python -m lerobot.async_inference.policy_server --host=127.0.0.1 --port=8080 --fps=15
+
+lerobot_ur5_2cam15_exp_s5000.yaml
+
+ur5vla demo --prompt "open the door of the 3D printer" --view --episodes 20
+

@@ -1,0 +1,30 @@
+# Model: 3-cam / 15 Hz, HYBRID (train_expert_only), 5000 steps, MULTI-TASK (cube + printer door).
+# Trained on q_ref (the pre-compliance reference) -> MUST be served UNDER ADMITTANCE (compliance: true).
+# Running this in stiff control (compliance: false) is a train/serve mismatch and will behave wrong.
+# Dataset: ur5_cubedoor_3cam15 (143 eps: 91 cube + 52 door; --action-source reference --gripper-source command).
+#
+# Server, from ~/abhay_ws/lerobot (NOTE --fps=15):
+#   .venv/bin/python -m lerobot.async_inference.policy_server --host=127.0.0.1 --port=8080 --fps=15
+#
+# Prompts (must match the training task strings EXACTLY for pi05 language conditioning):
+#   "put the black cube in the brown box"
+#   "open the door of the 3D printer"
+#   "close the door of the 3D printer"
+backend: lerobot
+host: localhost
+port: 8080
+policy_type: pi05
+pretrained_name_or_path: /data/ur5VLA-data/checkpoints/pi05_cubedoor_3cam15_qref_s5000/
+policy_device: cuda
+actions_per_chunk: 40               # <= the policy's chunk_size (50); at 15 Hz that is ~3.3 s of actions
+action_hz: 8                       # = the dataset fps (to-lerobot --fps 15); start the server --fps=15
+camera_map: {base: base, wrist: wrist, base2: base2}   # 3-cam: both OAKs + the wrist RealSense
+image_size: null
+include_gripper_state: true
+include_ft_state: false             # state is [7] = 6 joints + gripper; the admittance spring reads F/T
+                                    # itself in the control loop (not a policy input)
+action_mode: absolute
+# 15 Hz: chunk ~3.3 s. crossfade_steps 10 keeps the blend ~0.67 s (half the 30 Hz step count for the
+# same wall-clock); refill_fraction 0.7 keeps the inference budget above p95 so the arm does not pause.
+control: {refill_fraction: 0.75, crossfade_steps: 10, max_episode_s: 240}
+compliance: true                    # q_ref model: run the admittance spring at inference (robot.compliance params)

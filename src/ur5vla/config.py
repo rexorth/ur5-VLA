@@ -431,6 +431,22 @@ class BaseFrame:
 
 
 @dataclass
+class CameraView:
+    """A saved MuJoCo free-camera viewpoint, shared by the sim scripts: scripts/sim_camera_align.py
+    prints one to paste here, and both it and scripts/leader_mujoco.py start the viewer from it.
+    azimuth/elevation in degrees, distance in metres, lookat the orbit point in the scene frame."""
+    azimuth: float = 90.0
+    elevation: float = -45.0
+    distance: float = 2.0
+    lookat: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+
+    def __post_init__(self):
+        if not isinstance(self.lookat, (list, tuple)) or len(self.lookat) != 3:
+            raise ConfigError('sim.camera.lookat needs 3 values (x y z, metres)')
+        self.lookat = [float(v) for v in self.lookat]
+
+
+@dataclass
 class SimConfig:
     """The MuJoCo dry-run of the leader arm (scripts/leader_mujoco.py): where its scene is and how
     the robot sits in it, so the sim matches the real cell. The arm still starts at
@@ -438,10 +454,27 @@ class SimConfig:
     scene: str | None = None        # path to the UR5 MuJoCo scene XML; null = the script's default
     base: BaseFrame = field(default_factory=BaseFrame)   # the robot base's pose in the scene
     fps: float = 60.0               # viewer update rate
+    # Vertical field of view of the sim camera (degrees); null = MuJoCo's default (45). Set it to the
+    # real camera's VFOV so the sim overlay matches its perspective (sim_camera_align reads the OAK's
+    # intrinsics -> VFOV). Applied by both sim scripts, independent of the saved viewpoint below.
+    fovy: float | None = None
+    # Opacity of the leader-sim window that teleop/demo open (0 < a <= 1), so it can be dragged over
+    # the camera view as a see-through overlay like scripts/sim_camera_align.py. 1.0 = opaque. Needs a
+    # compositor on X11. [ / ] adjust it live in the window.
+    opacity: float = 0.65
+    # Saved camera viewpoint for the sim viewer; null = MuJoCo's default free camera. Set it with
+    # scripts/sim_camera_align.py (it prints the block to paste), then leader_mujoco starts there too.
+    camera: CameraView | None = None
 
     def __post_init__(self):
         if isinstance(self.base, dict):
             self.base = from_dict(BaseFrame, self.base, 'sim.base')
+        if isinstance(self.camera, dict):
+            self.camera = from_dict(CameraView, self.camera, 'sim.camera')
+        if self.fovy is not None and self.fovy <= 0:
+            raise ConfigError('sim.fovy must be > 0 (vertical field of view, degrees)')
+        if not 0.0 < self.opacity <= 1.0:
+            raise ConfigError('sim.opacity must be in (0, 1] (leader-sim window opacity)')
 
 
 @dataclass
@@ -561,15 +594,41 @@ def load(path: str | Path, policy_path: str | Path | None = None,
     """Load a config file, resolving any `include:` of per-section files (see the module docstring).
     `policy_path` names a file holding just a policy block, which replaces the config's `policy:`;
     that way openpi and LeRobot runs share one config and differ in nothing else. `teleop_path`
-    does the same for `teleop:` (e.g. a 4-DoF gamepad mapping)."""
+    does the same for `teleop:` (e.g. a 4-DoF gamepad mapping).
+
+    A policy file may also carry two keys that are not backend parameters and are lifted out here, so
+    each policy is self-contained and does not depend on the shared control.yaml / robot.yaml:
+      control     a mapping of control settings (refill_fraction, crossfade_steps, max_episode_s);
+                  merged over the config's control section, the policy file winning. Lets a 30 Hz and
+                  a 15 Hz policy carry their own chunking without editing a shared file.
+      compliance  a bool: run the admittance spring at inference. Overrides robot.compliance.enabled
+                  (the spring's parameters stay in robot.compliance), so inference-time compliance is
+                  independent of whatever the demos were recorded with."""
     path = Path(path)
     raw, sources = _resolve(path, frozenset())
     source = str(path)
-    for section, block_path in (('policy', policy_path), ('teleop', teleop_path)):
-        if block_path is not None:
-            raw[section] = _read_yaml(Path(block_path))
-            sources[section] = str(block_path)
-            source += f' + {block_path}'
+    if teleop_path is not None:
+        raw['teleop'] = _read_yaml(Path(teleop_path))
+        sources['teleop'] = str(teleop_path)
+        source += f' + {teleop_path}'
+    if policy_path is not None:
+        block = dict(_read_yaml(Path(policy_path)))
+        ctrl = block.pop('control', None)
+        comp = block.pop('compliance', None)
+        if ctrl is not None:
+            if not isinstance(ctrl, dict):
+                raise ConfigError(f'{policy_path}: policy `control` must be a mapping of control settings')
+            raw['control'] = _deep_merge(raw.get('control'), ctrl)
+            sources['control'] = str(policy_path)
+        if comp is not None:
+            if not isinstance(comp, bool):
+                raise ConfigError(f'{policy_path}: policy `compliance` must be true or false')
+            robot = dict(raw.get('robot') or {})
+            robot['compliance'] = {**(robot.get('compliance') or {}), 'enabled': comp}
+            raw['robot'] = robot
+        raw['policy'] = block
+        sources['policy'] = str(policy_path)
+        source += f' + {policy_path}'
     cfg = parse(raw, source=source)
     cfg.sources = sources
     return cfg

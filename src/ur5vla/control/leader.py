@@ -25,6 +25,7 @@ Sources:
 from __future__ import annotations
 
 import logging
+import threading
 
 import numpy as np
 
@@ -160,6 +161,9 @@ class LeaderInput:
         self.error: np.ndarray | None = None    # rad, the leader's target minus the arm's command
         self.notice: str | None = None
         self.reading: LeaderReading | None = None
+        # Serialise the hardware read: the exec loop (poll) and the between-episode sim poller
+        # (refresh) share one source, so their reads must not overlap on the serial device.
+        self._read_lock = threading.Lock()
         self._let_go_why: str | None = None
         self._edges = EdgeDetector(self.mapping) if self.mapping is not None else None
         self._pad = None
@@ -174,8 +178,17 @@ class LeaderInput:
         self._edges = EdgeDetector(self.mapping) if self.mapping is not None else None
         self._held_before, self._done_before = True, True   # no edge on the first look
 
+    def refresh(self) -> None:
+        """Read the leader once and update self.reading, without any deadman/engage logic. For use
+        BETWEEN episodes (the CLI's leader-sim poller) so the leader-sim window stays live during
+        prompts, when the control loop that normally calls poll() is not running. Only one reader may
+        touch the source at a time, so the poller is paused while an episode runs."""
+        with self._read_lock:
+            self.reading = self.source.poll()
+
     def poll(self, rec) -> Controls:
-        r = self.reading = self.source.poll()
+        with self._read_lock:
+            r = self.reading = self.source.poll()
         pad = self._pad = self.pad.snapshot() if self.pad is not None else None
         if self.lcfg.deadman == 'keyboard':
             held = self.keyboard.held()

@@ -49,9 +49,17 @@ from ..robot.ft_sensor import FTSensor, NoFTSensor
 from ..robot.gripper import Gripper
 from ..types import Observation, PolicyInfo, RobotState
 from .chunks import ChunkBuffer
-from .safety import SafetyLayer, Violation, describe
+from .safety import SafetyLayer, Violation, cause, describe
 
 log = logging.getLogger(__name__)
+
+# The SafetyLayer violations that `run --on-violation` can relax in an eval run: our own command
+# and force/torque limits. Everything else -- the e-stop, the robot's own stops, link/data loss,
+# gripper and F/T faults -- is absent here and so always ends the episode, whatever the mode.
+SOFT_VIOLATIONS = frozenset({'force', 'torque', 'torque_estimate', 'invalid_target',
+                             'joint_limit', 'step', 'tcp_speed', 'workspace', 'tracking'})
+# A NaN/inf target can never be sent to servoJ, so 'ignore' cannot drive on it: it holds instead.
+UNSENDABLE = frozenset({'invalid_target'})
 
 
 class Mode(IntEnum):
@@ -77,7 +85,7 @@ class EpisodeResult:
 class ControlLoop:
     def __init__(self, cfg: RunConfig, arm: Arm, gripper: Gripper, cameras: dict[str, CameraSource],
                  backend: PolicyBackend, policy_info: PolicyInfo, ft_sensor: FTSensor | None = None,
-                 compliance=None):
+                 compliance=None, on_violation: str = 'stop'):
         missing = set(policy_info.cameras) - set(cameras)
         if missing:
             raise ValueError(f'policy wants camera(s) {sorted(missing)} that are not configured')
@@ -89,6 +97,12 @@ class ControlLoop:
         # control. When set, the policy's joint target is the reference and this controller adds a
         # force-driven yield offset on top (control/compliance.py), run through the same SafetyLayer.
         self.compliance = compliance
+        if on_violation not in ('stop', 'pause', 'ignore'):
+            raise ValueError(f'on_violation must be stop|pause|ignore, got {on_violation!r}')
+        # 'stop' (default): any safety violation ends the episode. 'pause'/'ignore': our own soft
+        # limits (SOFT_VIOLATIONS) servoStop-and-continue, or drive on through -- see _relax. The
+        # e-stop, the robot's own stops and hardware faults always end it. Eval use only.
+        self.on_violation = on_violation
         self.cameras = cameras
         self.backend = backend
         self.policy_info = policy_info
@@ -193,6 +207,7 @@ class ControlLoop:
         self._holds = 0
         self._overruns = 0
         self._recorder: EpisodeRecorder | None = None
+        self._last_relaxed_cause = None     # de-dupe the per-tick "relaxed a soft violation" log
 
     def _end(self, reason: str, detail: dict[str, Any] | None = None) -> None:
         with self._end_lock:
@@ -230,6 +245,13 @@ class ControlLoop:
                     violation = Violation('gripper', {'fault': gripper_fault})
                 if violation is None and (ft_fault := self.ft.fault()) is not None:
                     violation = Violation('ft_sensor', {'fault': ft_fault})
+                relaxed = False
+                # Relaxed eval modes (run --on-violation): 'ignore' drives on through a soft STATE
+                # limit (force/torque) this tick; 'pause' keeps it set so the command path is skipped
+                # and it becomes a hold below. Hard stops are never soft, so are never relaxed here.
+                if violation is not None and self._relax(violation) == 'drive':
+                    self._log_relaxed(violation)
+                    relaxed, violation = True, None
                 hold_reason = None
                 target = None
                 q_exec = None           # the command to send this tick (reference + any yield offset)
@@ -253,9 +275,19 @@ class ControlLoop:
                             # it (otherwise it is the command we already validated and sent last tick).
                             if target is not None or self.compliance is not None:
                                 ref = q_cmd if mode == Mode.SERVO else state.q
-                                violation = self.safety.check_command(q_exec, ref, state.q)
+                                cmd_violation = self.safety.check_command(q_exec, ref, state.q)
+                                if cmd_violation is not None and self._relax(cmd_violation) == 'drive':
+                                    self._log_relaxed(cmd_violation)    # 'ignore': send q_exec anyway
+                                    relaxed = True
+                                else:
+                                    violation = cmd_violation
 
                 sent = None
+                # 'pause' mode (and 'ignore' of a NaN target): a soft violation servoStops but keeps
+                # the episode -- route it to the hold branch below instead of ending.
+                if violation is not None and self._relax(violation) == 'hold':
+                    self._log_relaxed(violation)
+                    relaxed, hold_reason, violation = True, hold_reason or 'violation', None
                 if violation is not None:
                     if mode == Mode.SERVO:
                         self.arm.servo_stop()
@@ -284,6 +316,9 @@ class ControlLoop:
                         self.gripper.command(g_cmd)
                         mode, sent = Mode.SERVO, q_cmd
 
+                if not relaxed:
+                    self._last_relaxed_cause = None     # re-log a soft violation if it recurs
+
                 rec.log_tick(now, state.q, state.qd, state.tcp_pose, state.wrench, state.gripper,
                              sent, g_cmd if sent is not None else None, int(mode), loop_dt, state.ft,
                              q_ref if sent is not None else None)   # reference behind q_cmd; q_cmd - q_ref = spring
@@ -305,6 +340,32 @@ class ControlLoop:
         self._recorder.log_event('safety', reason=violation.reason, **violation.detail)
         reason = 'estop' if violation.reason == 'estop' else 'safety'
         self._end(reason, {'violation': violation.reason, **violation.detail})
+
+    def _relax(self, v: Violation) -> str:
+        """How to treat violation `v` under self.on_violation:
+          'stop'  end the episode -- a hard violation (not in SOFT_VIOLATIONS), or 'stop' mode;
+          'drive' clear it and carry on -- 'ignore' mode on a soft limit that can still be sent;
+          'hold'  servoStop but keep the episode -- 'pause' mode, or 'ignore' of a NaN target.
+        Hard stops (e-stop, the robot's own stops, link/data loss, gripper/F-T faults) are never in
+        SOFT_VIOLATIONS, so they return 'stop' in every mode."""
+        if v.reason not in SOFT_VIOLATIONS or self.on_violation == 'stop':
+            return 'stop'
+        if self.on_violation == 'ignore' and v.reason not in UNSENDABLE:
+            return 'drive'
+        return 'hold'
+
+    def _log_relaxed(self, v: Violation) -> None:
+        """Record a relaxed soft violation once per cause (not every tick), to the log and the
+        episode events, so a non-default --on-violation leaves a trail of what it let through."""
+        c = cause(v)
+        if c == self._last_relaxed_cause:
+            return
+        self._last_relaxed_cause = c
+        verb = 'driving through' if self.on_violation == 'ignore' else 'pausing on'
+        log.warning('%s a safety limit (run --on-violation=%s): %s', verb, self.on_violation, describe(v))
+        if self._recorder is not None:
+            self._recorder.log_event('violation_relaxed', mode=self.on_violation,
+                                     reason=v.reason, **v.detail)
 
     # ---- inference thread ----
 

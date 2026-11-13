@@ -151,11 +151,20 @@ def test_axia_faults_on_sensor_errors_but_not_overload_then_recovers(axia):
         s.fault()                                                           # any packet already in flight
         time.sleep(0.05)
         assert s.fault() is None                                            # clears once the sensor does
-        axia.status = 1 << 30                                               # F/T out of range (saturation)
+        # Real saturation: the sensor sets the out-of-range bit AND the summary "error" bit (31)
+        # together (the manual's 0xC0000000). Neither may read as a fatal fault, or every saturation
+        # stops the run -- this is the bug behind "sensor reports error" on contact.
+        axia.status = (1 << 30) | (1 << 31)                                 # F/T out of range + error
         time.sleep(0.05)
         s.fault()
         time.sleep(0.05)
         assert s.fault() is None                   # overload is NOT a fatal fault: the limits handle it
+        # A genuine fault still trips its own specific bit even though the summary bit is set with it.
+        axia.status = (1 << 2) | (1 << 31)                                  # broken gage + error
+        time.sleep(0.05)
+        s.fault()
+        time.sleep(0.05)
+        assert s.fault() == 'sensor reports broken gage'
         axia.status = 0
         axia.sending = False                                               # e.g. another client took it
         time.sleep(0.2)

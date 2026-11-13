@@ -1,10 +1,15 @@
 """Recorded episodes -> a LeRobot dataset, for fine-tuning either stack.
 
 One frame every 1/fps s, from the first to the last tick that sent a command:
-    observation.state              joints (6) + gripper, measured in the latest tick at or before t
-                                   (+ with --ft, the F/T sensor's 6 readings, as recorded: from
-                                   its zero at the calibration pose, as a policy gets them)
-    action                         joint targets (6) + gripper command sent in that tick
+    observation.state              joints (6) + gripper, always the MEASURED value in the latest
+                                   tick at or before t -- what the robot actually sensed (+ with
+                                   --ft, the F/T sensor's 6 readings, as recorded: from its zero at
+                                   the calibration pose, as a policy gets them)
+    action                         joint targets (6) + gripper. The 6 joints follow --action-source:
+                                   the executed command q_cmd (default), the pre-compliance
+                                   reference q_ref, or the measured joints (where the arm went). The
+                                   gripper follows --gripper-source (required, chosen independently):
+                                   g_cmd, the trigger command, or the measured gripper.
     observation.images.<camera>    the latest frame captured at or before t, native resolution
     task                           the episode's prompt
 Action k is the target for the frame's own time, the same convention the control loop uses when
@@ -40,11 +45,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import json
 import logging
+import os
 import sys
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -67,6 +75,26 @@ TRIM_PAD_S = 0.3                    # rest kept before the first and after the l
 FLAT_RANGE = 1e-3                   # q99 - q01 below this: a dimension that (almost) never moves
 COVERAGE = 'coverage.csv'
 PI05_MAX_IMAGES = 3                 # pi0.5's pretraining: one fixed camera and two wrist cameras
+
+try:
+    import cv2
+    cv2.setNumThreads(1)            # we parallelize across frames ourselves (avoid oversubscription)
+    _HAVE_CV2 = True
+except Exception:
+    _HAVE_CV2 = False
+
+
+def _decode_rgb(path: Path) -> np.ndarray:
+    """Decode a recorded JPEG to an H x W x 3 uint8 RGB array. Prefers OpenCV (libjpeg-turbo: faster
+    and releases the GIL, so it scales under the read thread pool), converting its BGR output to RGB
+    so the pixels match the Pillow path bit-for-bit (modulo <=1 LSB decoder rounding, which the
+    downstream H.264 re-encode swamps). Falls back to Pillow when OpenCV is absent, so convert.py
+    still runs where only numpy/Pillow exist (e.g. the openpi env)."""
+    if _HAVE_CV2:
+        arr = cv2.imread(str(path), cv2.IMREAD_COLOR)       # BGR, H x W x 3 uint8
+        if arr is not None:
+            return cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)     # contiguous uint8 RGB, like np.asarray(PIL)
+    return np.asarray(Image.open(path).convert('RGB'))
 
 
 @dataclass
@@ -139,16 +167,89 @@ def kept_frames(moving: np.ndarray, start: int, fps: int, trim: bool = True,
     return np.flatnonzero(keep)
 
 
+def deadman_held(ep: Episode, times: np.ndarray) -> np.ndarray | None:
+    """Boolean per frame time: was the deadman held then? Built from events.jsonl `enable` ->
+    `disable` pairs, which are in the same monotonic clock as the ticks (so comparable to `times`).
+    An `enable` with no following `disable` runs to the end (the operator held the deadman through
+    to the episode's end). Returns None if the episode logged no `enable` at all -- there is nothing
+    to go on, so the caller falls back to motion trimming."""
+    path = ep.dir / EVENTS
+    if not path.exists():
+        return None
+    intervals: list[tuple[float, float]] = []
+    open_t: float | None = None
+    for e in read_jsonl(path):
+        kind = e.get('kind')
+        if kind == 'enable':
+            if open_t is None:              # ignore a repeated enable with no disable between
+                open_t = e.get('t')
+        elif kind == 'disable' and open_t is not None:
+            intervals.append((open_t, e.get('t')))
+            open_t = None
+    if open_t is not None:
+        intervals.append((open_t, float('inf')))
+    if not intervals:
+        return None
+    held = np.zeros(len(times), bool)
+    for s, e in intervals:
+        held |= (times >= s) & (times <= e)
+    return held
+
+
+def deadman_kept(ep: Episode, times: np.ndarray, moving: np.ndarray, start: int, fps: int,
+                 squeeze_s: float | None = None) -> np.ndarray:
+    """Indices to keep when --deadman-only is set: the frames where the deadman was held, plus the
+    trailing frames where the arm is still moving after a release (settling through its last
+    command). Everything else -- the pre-reset stretch where the operator resets the scene with the
+    deadman released, and idle pauses between holds -- is cut. Falls back to motion trimming (with a
+    warning) for an episode that logged no deadman events."""
+    held = deadman_held(ep, times)
+    if held is None:
+        log.warning('%s: no deadman (enable) events; keeping motion-trimmed frames instead', ep.dir)
+        return kept_frames(moving, start, fps, True, squeeze_s)
+    active = held.copy()
+    active[:start] = False                  # not before every camera has delivered a frame
+    carry = False                           # extend each held run forward through trailing motion
+    for k in range(len(active)):
+        if active[k]:
+            carry = True
+        elif carry and moving[k]:
+            active[k] = True                # arm still interpolating toward its last command
+        else:
+            carry = False                   # stop at the first still frame after a release
+    if squeeze_s is not None:
+        cap, idle = max(1, int(round(squeeze_s * fps))), 0
+        for k in range(len(active)):
+            if not active[k]:
+                idle = 0
+                continue
+            idle = 0 if moving[k] else idle + 1
+            if idle > cap:
+                active[k] = False
+    return np.flatnonzero(active)
+
+
 def episode_frames(ep: Episode, fps: int, cameras: dict[str, str], include_gripper: bool = True,
                    report: EpisodeReport | None = None, trim: bool = True,
-                   squeeze_s: float | None = None, include_ft: bool = False) -> Iterator[dict]:
-    """Frames of one episode. `cameras` maps recorded camera name -> dataset camera name."""
+                   squeeze_s: float | None = None, include_ft: bool = False,
+                   action_source: str = 'command', gripper_source: str = 'command',
+                   require_deadman: bool = False, read_workers: int = 0) -> Iterator[dict]:
+    """Frames of one episode. `cameras` maps recorded camera name -> dataset camera name.
+    `action_source` selects the action's 6 JOINTS: 'command' (q_cmd), 'reference' (q_ref) or 'state'
+    (the measured joints). `gripper_source` selects the action's GRIPPER, independently: 'command'
+    (g_cmd, the trigger command) or 'state' (the measured gripper). observation.state is always the
+    measured joints+gripper, whatever these are."""
     ticks = np.load(ep.dir / TICKS)
     t, q, g, q_cmd, g_cmd = (ticks[k] for k in ('t', 'q', 'gripper', 'q_cmd', 'g_cmd'))
     sent = ~np.isnan(q_cmd[:, 0]) if q_cmd.ndim == 2 else np.zeros(len(t), bool)
     if not sent.any():
         log.warning('%s: no commands were sent; skipped', ep.dir)
         return
+    q_ref = ticks['q_ref'] if 'q_ref' in ticks.files else None
+    if action_source == 'reference' and q_ref is None:
+        raise ValueError(f'{ep.dir}: --action-source reference needs q_ref (the pre-compliance '
+                         'reference), which this episode did not record; re-record with q_ref, or use '
+                         '--action-source command or state')
     ft = ticks['ft'] if include_ft and 'ft' in ticks.files else None
     if include_ft:
         if ft is None or ft.ndim != 2 or not np.isfinite(ft[0]).all():
@@ -173,32 +274,77 @@ def episode_frames(ep: Episode, fps: int, cameras: dict[str, str], include_gripp
     # Start once every camera has delivered a frame.
     start = max([0] + [int(np.argmax(j >= 0)) if (j >= 0).any() else len(times) for *_, j in cams.values()])
 
+    # Idle/trim detection always runs on the commanded stream (it defines when motion happened),
+    # independent of which signal --action-source writes as the action.
     idx = np.searchsorted(t, times, side='right') - 1
     qc, gc, gm = q_cmd[last_sent[idx]], g_cmd[last_sent[idx]], g[idx]
     moving = np.zeros(len(times), bool)
     moving[1:] = ((np.abs(np.diff(qc, axis=0)).max(axis=1) >= IDLE_Q_RAD)
                   | (np.abs(np.diff(gc)) >= IDLE_G_CMD) | (np.abs(np.diff(gm)) >= IDLE_G_MEASURED))
-    keep = kept_frames(moving, start, fps, trim, squeeze_s)
+    keep = (deadman_kept(ep, times, moving, start, fps, squeeze_s) if require_deadman
+            else kept_frames(moving, start, fps, trim, squeeze_s))
     report = report if report is not None else EpisodeReport()
     report.trimmed = len(times) - start - len(keep)
     if not len(keep):
         log.warning('%s: nothing moved; skipped', ep.dir)
-    for k in keep:
+
+    def build_state_action(k: int):
         i, c = idx[k], last_sent[idx[k]]
         state = np.r_[q[i], [g[i]]] if include_gripper else q[i]
         if ft is not None:
             state = np.r_[state, ft[i]]
-        action = np.r_[q_cmd[c], [g_cmd[c]]] if include_gripper else q_cmd[c]
-        frame = {'observation.state': state.astype(np.float32), 'action': action.astype(np.float32),
-                 'task': ep.prompt}
-        for rec_name, (ds_name, rows, tc, j) in cams.items():
-            row = rows[j[k]]
-            frame[f'observation.images.{ds_name}'] = np.asarray(
-                Image.open(ep.dir / CAMERAS / rec_name / row['rgb']).convert('RGB'))
-            stale = float(times[k] - tc[j[k]])
+        if action_source == 'state':
+            a_joints = q[i]                             # measured: where the arm actually went
+        elif action_source == 'reference':
+            a_joints = q_ref[c]                         # pre-compliance target
+        else:
+            a_joints = q_cmd[c]                         # executed servoJ command (default)
+        # The gripper has no compliance, so g_cmd is the clean trigger command and spans to full
+        # close, while the measured gripper saturates against a grasped object. Chosen independently
+        # of the joints, so --action-source state (measured arm) can still command a full close.
+        a_grip = g[i] if gripper_source == 'state' else g_cmd[c]
+        action = np.r_[a_joints, [a_grip]] if include_gripper else a_joints
+        return state.astype(np.float32), action.astype(np.float32)
+
+    def image_jobs(k: int):   # [(ds_name, path, staleness_s), ...] for frame k, one per camera
+        return [(ds_name, ep.dir / CAMERAS / rec_name / rows[j[k]]['rgb'], float(times[k] - tc[j[k]]))
+                for rec_name, (ds_name, rows, tc, j) in cams.items()]
+
+    def decode(jobs):         # runs in a worker thread; returns [(ds_name, rgb, staleness_s), ...]
+        return [(ds_name, _decode_rgb(path), stale) for ds_name, path, stale in jobs]
+
+    def emit(k: int, decoded):
+        state, action = build_state_action(k)
+        frame = {'observation.state': state, 'action': action, 'task': ep.prompt}
+        for ds_name, img, stale in decoded:
+            frame[f'observation.images.{ds_name}'] = img
             report.max_staleness_s[ds_name] = max(report.max_staleness_s.get(ds_name, 0.0), stale)
         report.frames += 1
-        yield frame
+        return frame
+
+    # Reading + JPEG-decoding the recorded frames is the conversion bottleneck. Decode ahead on a
+    # thread pool (libjpeg releases the GIL) and yield in keep-order, so frame order is unchanged.
+    workers = read_workers if read_workers and read_workers > 0 else (os.cpu_count() or 1)
+    if workers <= 1 or len(keep) <= 1:
+        for k in keep:
+            yield emit(k, decode(image_jobs(k)))
+    else:
+        prefetch = max(2 * workers, 8)                  # frames in flight; bounds memory
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            pending: deque = deque()
+            kit = iter(keep)
+            for _ in range(prefetch):                   # prime the window
+                k = next(kit, None)
+                if k is None:
+                    break
+                pending.append((k, ex.submit(decode, image_jobs(k))))
+            while pending:
+                k, fut = pending.popleft()
+                decoded = fut.result()                  # blocks on the oldest frame -> in-order yield
+                k2 = next(kit, None)                    # refill to keep the window full
+                if k2 is not None:
+                    pending.append((k2, ex.submit(decode, image_jobs(k2))))
+                yield emit(k, decoded)
 
 
 def episode_grasps(ep: Episode) -> list[tuple[str, float, list[float]]]:
@@ -300,23 +446,68 @@ def dataset_class():
     return LeRobotDataset
 
 
+# Probe NVENC in a throwaway SUBPROCESS, never in this process. LeRobot encodes each camera's video
+# in a forked worker (ProcessPoolExecutor), and CUDA/NVENC cannot survive a fork from a parent that
+# already holds a CUDA context: if we opened an NVENC session here to test it, every forked encoder
+# would then fail at avcodec_open2. The subprocess keeps this (parent) process CUDA-free so the
+# workers initialize CUDA cleanly. It encodes what write_dataset asks for: 640x480 (NVENC rejects
+# tiny frames) and GOP 4 (NVENC rejects g < 4).
+_NVENC_PROBE = (
+    "import io, numpy as np, av\n"
+    "buf = io.BytesIO()\n"
+    "with av.open(buf, 'w', format='mp4') as c:\n"
+    "    s = c.add_stream('h264_nvenc', 30, options={'rc':'0','qp':'30','g':'4'})\n"
+    "    s.width, s.height, s.pix_fmt = 640, 480, 'yuv420p'\n"
+    "    for _ in range(3):\n"
+    "        for p in s.encode(av.VideoFrame.from_ndarray(np.zeros((480,640,3), np.uint8), 'rgb24')):\n"
+    "            c.mux(p)\n"
+    "    for p in s.encode():\n"
+    "        c.mux(p)\n"
+)
+
+
+@functools.lru_cache(maxsize=1)
+def hw_h264_encoder_ok() -> bool:
+    """Whether NVIDIA NVENC can encode H.264 here -- the encoder is present AND a working GPU/driver
+    backs it. Probed once, in a subprocess (see _NVENC_PROBE). False on a CPU-only box (or the openpi
+    env without a GPU), so the caller falls back to libx264 rather than NVENC."""
+    import subprocess
+    import sys
+    try:
+        r = subprocess.run([sys.executable, '-c', _NVENC_PROBE], capture_output=True, timeout=60)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def write_dataset(episodes: list[Episode], repo_id: str, root: str | Path, fps: int,
                   cameras: dict[str, str], include_gripper: bool = True, use_videos: bool = True,
-                  trim: bool = True, squeeze_s: float | None = None, include_ft: bool = False):
+                  trim: bool = True, squeeze_s: float | None = None, include_ft: bool = False,
+                  action_source: str = 'command', gripper_source: str = 'command',
+                  require_deadman: bool = False, read_workers: int = 0):
     LeRobotDataset = dataset_class()
     if Path(root).exists():
         raise FileExistsError(f'{root} already exists; pick a new --root')
-    # LeRobot 0.6's default RGB codec is libsvtav1 (SVT-AV1), which fans out across every core and
-    # allocates large per-stream buffers -- enough to hang a workstation encoding two camera streams.
-    # H.264 is light, fast, low-memory and decodes everywhere (torchcodec/PyAV on the GPU node). Cap
-    # the encoder threads too. Guarded: the older lerobot openpi pins (v2.1) has no RGBEncoderConfig,
-    # so there we fall back to its own default codec.
+    # Encode RGB with NVIDIA NVENC (GPU) when a working encoder is present: the hardware encoder is
+    # much faster and barely touches the CPU. LeRobot maps crf -> qp (constant-QP) for nvenc, so the
+    # quality target matches the libx264 path. With no usable GPU, fall back to libx264 (CPU, thread-
+    # capped) -- NOT LeRobot's vcodec='auto', whose fallback is libsvtav1: SVT-AV1 fans out across
+    # every core and allocates large per-stream buffers, enough to hang this workstation encoding
+    # three streams. Both H.264 paths decode everywhere (torchcodec/PyAV on the GPU node). Guarded:
+    # the older lerobot openpi pins (v2.1) have no RGBEncoderConfig, so there we fall back to its own
+    # default codec.
     extra = {}
     if use_videos:
         try:
             from lerobot.datasets.video_utils import RGBEncoderConfig
-            extra['rgb_encoder'] = RGBEncoderConfig(vcodec='h264', pix_fmt='yuv420p', g=2, crf=30)
-            extra['encoder_threads'] = 12
+            if hw_h264_encoder_ok():
+                # NVENC rejects a GOP below 4 (g<=3 -> avcodec_open2 EINVAL). g=4 still keyframes
+                # every 4 frames -- effectively all-intra, so random-frame seeking for the dataloader
+                # stays as fast as the libx264 g=2 path. crf is mapped to constant-QP by LeRobot.
+                extra['rgb_encoder'] = RGBEncoderConfig(vcodec='h264_nvenc', pix_fmt='yuv420p', g=4, crf=30)
+            else:
+                extra['rgb_encoder'] = RGBEncoderConfig(vcodec='h264', pix_fmt='yuv420p', g=2, crf=30)
+                extra['encoder_threads'] = 12
         except Exception:
             pass
     ds = LeRobotDataset.create(repo_id=repo_id, fps=fps, root=root, robot_type='ur5',
@@ -325,7 +516,9 @@ def write_dataset(episodes: list[Episode], repo_id: str, root: str | Path, fps: 
     reports = []
     for ep in episodes:
         report = EpisodeReport(events=count_events(ep), grasps=episode_grasps(ep))
-        for frame in episode_frames(ep, fps, cameras, include_gripper, report, trim, squeeze_s, include_ft):
+        for frame in episode_frames(ep, fps, cameras, include_gripper, report, trim, squeeze_s,
+                                    include_ft, action_source, gripper_source, require_deadman,
+                                    read_workers):
             ds.add_frame(frame)
         if report.frames:
             ds.save_episode()
@@ -452,11 +645,35 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument('--ft', action='store_true',
                    help="add the F/T sensor's 6 readings (from its zero at the calibration pose) to the state; the policy "
                         'file then needs include_ft_state: true')
+    p.add_argument('--action-source', choices=('command', 'reference', 'state'), default='command',
+                   help="what the action's 6 JOINTS are: 'command' (q_cmd, the executed servoJ "
+                        "target; default), 'reference' (q_ref, the pre-compliance target; needs demos "
+                        "that recorded q_ref), or 'state' (the measured joints -- where the arm "
+                        'actually went). The gripper is set separately by --gripper-source.')
+    p.add_argument('--gripper-source', choices=('command', 'state'), required=True,
+                   help="REQUIRED (no default -- you must choose, so the gripper's source is never a "
+                        "silent assumption). The gripper's action column, chosen independently of "
+                        "--action-source: 'command' (g_cmd, the trigger command -- spans to a full "
+                        "close; use this for grasping) or 'state' (the measured gripper, which "
+                        'saturates against a grasped object so it never commands grip force -- the '
+                        "old coupled behavior). observation.state's gripper is always the measured "
+                        'value, whichever this is.')
     p.add_argument('--images', action='store_true', help='store frames as images, not video')
     p.add_argument('--no-trim', action='store_true',
                    help='keep the idle frames before the first and after the last motion')
+    p.add_argument('--deadman-only', action='store_true',
+                   help='keep only the frames where the deadman was held (from events.jsonl, '
+                        'enable->disable), plus the trailing frames where the arm is still moving '
+                        'after a release (settling through its last command). Cuts the pre-reset '
+                        'stretch where the operator resets the scene with the deadman released, and '
+                        'idle pauses between holds. Supersedes --no-trim. An episode that logged no '
+                        'enable event falls back to motion trimming.')
     p.add_argument('--squeeze-pauses', type=float, metavar='S',
                    help='also cut every pause mid-episode down to S seconds (default: pauses kept whole)')
+    p.add_argument('--read-workers', type=int, default=0, metavar='N',
+                   help='threads for reading + JPEG-decoding recorded frames, the conversion '
+                        'bottleneck (0 = auto = CPU count; 1 = serial). Uses OpenCV/libjpeg-turbo '
+                        'when available, else Pillow; identical frames either way.')
     p.add_argument('--allow-config-mismatch', action='store_true',
                    help='convert even if the demos were recorded with different data-collection configs '
                         '(normally an error; the arm/compliance, cameras, gripper and F/T must match)')
@@ -499,10 +716,14 @@ def run(args) -> int:
                         'two wrists)', repo_id, len(cameras), PI05_MAX_IMAGES)
         ds, reports = write_dataset(episodes, repo_id, root, args.fps, cameras,
                                     include_gripper=not args.no_gripper, use_videos=not args.images,
-                                    trim=not args.no_trim, squeeze_s=args.squeeze_pauses, include_ft=args.ft)
+                                    trim=not args.no_trim, squeeze_s=args.squeeze_pauses, include_ft=args.ft,
+                                    action_source=args.action_source, gripper_source=args.gripper_source,
+                                    require_deadman=args.deadman_only, read_workers=args.read_workers)
         if fingerprint:
             schema = {'state': state_names(not args.no_gripper, args.ft),
-                      'action': state_names(not args.no_gripper), 'cameras': sorted(cameras.values())}
+                      'action': state_names(not args.no_gripper), 'cameras': sorted(cameras.values()),
+                      'action_source': args.action_source, 'gripper_source': args.gripper_source,
+                      'deadman_only': args.deadman_only}
             write_config_meta(root, fingerprint, rep_config, episodes, schema)
         written = [r for r in reports if r.frames]
         frames = sum(r.frames for r in written)

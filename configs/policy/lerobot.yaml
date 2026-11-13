@@ -19,3 +19,7 @@ action_mode: absolute
 gripper_open: 0.0
 gripper_closed: 1.0
 gripper_index: 6
+# This policy's control (lifted into the control section at load; overrides control.yaml) and whether
+# the admittance spring runs at inference (overrides robot.compliance.enabled).
+control: {refill_fraction: 0.5, crossfade_steps: 10, max_episode_s: 120}
+compliance: false

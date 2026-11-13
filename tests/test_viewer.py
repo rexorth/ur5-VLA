@@ -57,7 +57,7 @@ def test_drain_without_a_prompt_message_reports_unset():
     w.close()
 
 
-def _reporting_window(frames, keys, names, title, width):
+def _reporting_window(frames, keys, names, title, width, opacity=None):
     """Waits for a whole frame from every camera and the info text, reports each by its initial
     ('i' for the info), then closes."""
     seen, info = {}, None
@@ -93,7 +93,7 @@ def test_frames_reach_the_window_and_its_keys_come_back():
         stop(cams)
 
 
-def _reading_window(frames, keys, names, title, width):
+def _reading_window(frames, keys, names, title, width, opacity=None):
     try:
         while True:
             drain(frames, 8)
@@ -102,7 +102,7 @@ def _reading_window(frames, keys, names, title, width):
         pass
 
 
-def _stuck_window(frames, keys, names, title, width):
+def _stuck_window(frames, keys, names, title, width, opacity=None):
     time.sleep(60)          # never reads: the pipe fills and the sender blocks
 
 
@@ -139,11 +139,11 @@ def _answer_prompt(frames, keys, reply):
     time.sleep(3)
 
 
-def _yes_window(frames, keys, names, title, width):
+def _yes_window(frames, keys, names, title, width, opacity=None):
     _answer_prompt(frames, keys, '\r')          # Enter = yes
 
 
-def _no_window(frames, keys, names, title, width):
+def _no_window(frames, keys, names, title, width, opacity=None):
     _answer_prompt(frames, keys, '\x1b')        # Esc = no
 
 

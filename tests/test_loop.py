@@ -10,6 +10,8 @@ from ur5vla import config as config_mod
 from ur5vla.cameras import build_cameras
 from ur5vla.cameras.base import ThreadedCamera
 from ur5vla.control import ControlLoop, Mode
+from ur5vla.control.loop import SOFT_VIOLATIONS, UNSENDABLE
+from ur5vla.control.safety import Violation
 from ur5vla.policy import build_backend
 from ur5vla.policy.base import PolicyBackend
 from ur5vla.recording import CAMERAS, CHUNKS, EVENTS, TICKS, EpisodeRecorder, read_index, read_jsonl
@@ -21,7 +23,7 @@ SINE = {'backend': 'replay', 'action_hz': 15, 'chunk_len': 15, 'latency_s': 0.05
 
 
 def run(tmp_path, cameras_cfg, policy, *, name='ep', seconds=1.5, cameras=None, gripper=None, arm=None,
-        ft=None, compliance=None, **cfg_over):
+        ft=None, compliance=None, on_violation='stop', **cfg_over):
     raw = {'robot': {'dry_run': True}, 'cameras': cameras_cfg,
            'policy': policy if isinstance(policy, dict) else {}, **cfg_over}
     cfg = config_mod.parse(raw)
@@ -36,7 +38,7 @@ def run(tmp_path, cameras_cfg, policy, *, name='ep', seconds=1.5, cameras=None, 
             from ur5vla.control.compliance import AdmittanceController
             comp = AdmittanceController(compliance, cfg.safety.tcp_offset_m)
         loop = ControlLoop(cfg, arm, gripper or NoGripper(), cams, backend, backend.connect(), ft,
-                           compliance=comp)
+                           compliance=comp, on_violation=on_violation)
         loop.warmup('test')
         rec = EpisodeRecorder(tmp_path / name, cams, cfg.logging)
         rec.start({'test': True})
@@ -306,3 +308,55 @@ def test_compliance_yields_the_command_to_a_steady_force(tmp_path):
     # exactly what a future Option-2 conversion needs to recover the reference.
     assert np.abs(ref_c - ref_c[0]).max() < 1e-9                    # the reference is the held target
     assert np.abs(cmd_c[-1] - ref_c[-1]).max() > 1e-3              # offset = q_cmd - q_ref is nonzero
+
+
+# --- run --on-violation: relaxing our own soft safety limits in an eval run ---
+
+def _loop(on_violation):
+    cfg = config_mod.parse({'robot': {'dry_run': True}, 'cameras': {}, 'policy': {}})
+    backend = HoldBackend()
+    return ControlLoop(cfg, SimArm(cfg.robot), NoGripper(), {}, backend, backend.connect(),
+                       on_violation=on_violation)
+
+
+def test_on_violation_rejects_an_unknown_mode():
+    with pytest.raises(ValueError):
+        _loop('bogus')
+
+
+def test_relax_classifies_every_violation_by_mode():
+    stop, pause, ignore = _loop('stop'), _loop('pause'), _loop('ignore')
+    # Hard stops are never soft, so they end the episode in EVERY mode -- including 'ignore'.
+    for reason in ('estop', 'robot_stopped', 'robot_link', 'robot_data', 'gripper', 'ft_sensor'):
+        v = Violation(reason)
+        assert reason not in SOFT_VIOLATIONS
+        assert stop._relax(v) == pause._relax(v) == ignore._relax(v) == 'stop'
+    # Our own sendable soft limits: 'stop' ends, 'pause' holds, 'ignore' drives on.
+    for reason in ('force', 'torque', 'torque_estimate', 'joint_limit', 'step', 'tcp_speed',
+                   'workspace', 'tracking'):
+        v = Violation(reason)
+        assert stop._relax(v) == 'stop'
+        assert pause._relax(v) == 'hold'
+        assert ignore._relax(v) == 'drive'
+    # A NaN/inf target can never be sent: 'ignore' holds it rather than driving on it.
+    nan = Violation('invalid_target')
+    assert 'invalid_target' in UNSENDABLE
+    assert (stop._relax(nan), pause._relax(nan), ignore._relax(nan)) == ('stop', 'hold', 'hold')
+
+
+def test_jump_pause_keeps_the_episode_running(tmp_path):
+    # The 0.3 rad step that ends the episode by default (test_jump_...) now only pauses the arm.
+    result, ep, arm = run(tmp_path, {}, JumpBackend(), control={'crossfade_steps': 0},
+                          on_violation='pause', seconds=1.0)
+    assert result.end_reason == 'timeout'           # no longer 'safety'
+    assert arm.n_servo == 0                          # the out-of-limit command is still never sent
+    assert 'violation_relaxed' in events(ep)
+
+
+def test_jump_ignore_sends_the_command_anyway(tmp_path):
+    result, ep, arm = run(tmp_path, {}, JumpBackend(), control={'crossfade_steps': 0},
+                          on_violation='ignore', seconds=1.0)
+    assert result.end_reason == 'timeout'
+    assert arm.n_servo > 0                            # driven through our step limit
+    assert np.ptp(np.load(ep / TICKS)['q'][:, 0]) > 0.05      # joint 0 actually jumped
+    assert 'violation_relaxed' in events(ep)

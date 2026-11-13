@@ -12,7 +12,7 @@ policy_type: pi05
 pretrained_name_or_path: /home/omey/abhay_ws/checkpoints/pi05_base_bf16
 policy_device: cuda
 actions_per_chunk: 50
-action_hz: 15
+action_hz: 50
 # pi05_base's camera slots are base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb (224x224); the
 # one not sent is filled with a blank image by the policy. The server stretches frames to 224x224,
 # which distorts 4:3 images; a checkpoint fine-tuned on this cell's data would not.
@@ -20,3 +20,7 @@ camera_map: {base: base_0_rgb, wrist: left_wrist_0_rgb}
 image_size: null
 include_gripper_state: true
 action_mode: absolute
+# Plumbing test only (policy-check / --dry-run); values below barely matter. At 50 Hz, crossfade_steps
+# 33 keeps the blend ~0.66 s. Compliance off.
+control: {refill_fraction: 0.7, crossfade_steps: 33, max_episode_s: 120}
+compliance: false

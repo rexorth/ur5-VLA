@@ -7,11 +7,12 @@ leader:
   port: /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_B0:A6:04:00:DC:80-if00
   channels: [0, 1, 2, 3, 4, 5]          # multiplexer channel of each joint, base to wrist 3
   joint_signs: [-1, -1, 1, -1, -1, -1]      # GELLO's for a UR; check each with `ur5vla leader --arm`
-  joint_offsets_deg: [-115.22, -14.25, -2.90, 126.47, -19.69, 151.08]               # from --calibrate, with the leader in calibration_q_deg
+  joint_offsets_deg: [-113.92, -8.09, 0.94, 119.53, -24.96, -108.75]               # from --calibrate, with the leader in calibration_q_deg
   calibration_q_deg: [0, -90, -90, -90, 90, 0]   # the leader's reference pose = robot pointing down the table (toward the printer)
   gripper_channel: 6                    # the trigger's encoder (null: the gamepad's A/B)
-  gripper_open_deg: 86.6                # from --calibrate
-  gripper_closed_deg: 124.8
+  ## set open and closed to 5 deg inside the physical limits, so there's some deadzone and the model learns to have the gripper fullt opened or closed
+  gripper_open_deg: 100                # from --calibrate
+  gripper_closed_deg: 115
   # Held to move: keyboard (deadman_key, read from the desktop wherever the focus is) | pedal (a USB
   # foot pedal read straight from /dev/input, grabbed so its key stays off the desktop; program it to
   # an inert key like F13 first - docs/procedures.md) | gamepad (teleop.buttons.deadman, LB) |

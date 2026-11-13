@@ -11,14 +11,14 @@ safety:
   # robot.compliance on, these stay as the HARD backstop (the spring keeps normal contact below
   # them); set them above the compliant working force.
   ft_limit_n: 100
-  ft_limit_nm: 4.8           # N·m; set once the sensor is mounted (the estimate's torque is poor)
+  ft_limit_nm: 5           # N·m; set once the sensor is mounted (the estimate's torque is poor)
   # Torque fallback: when the Axia's torque saturates (reads at its rated range, ~5 N·m on the
   # SI-150-8 -- e.g. pulling a stuck part), its torque reading is unreliable. With this set, the
   # torque limit switches to the CB3 joint-current ESTIMATE against this higher cap, so the move
   # continues past the sensor's range while still guarded (the UR protective stop stays the hard
   # backstop). null = off (saturation just trips ft_limit_nm on the clipped reading). Force is
   # unaffected. The estimate's torque is poor, so leave margin.
-  ft_limit_nm_estimate: 15
+  #ft_limit_nm_estimate: 15
   # Watchdog: hold if the next chunk is overdue. After each chunk the next is expected
   # ~(1 - refill_fraction) * chunk duration later (or after one latency, if the server is slower
   # than that); the watchdog allows watchdog_factor times that.

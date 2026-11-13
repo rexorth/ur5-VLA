@@ -10,32 +10,21 @@
 # trained on.
 cameras:
   # Image settings (docs/procedures.md#image-settings). Focus is fixed, autofocus never runs: the
-  # OAK's 107 was measured with `ur5vla cameras --measure` on 2026-10-23. Exposure and white balance
-  # follow the light, which the skylight changes through the day; every recorded frame keeps the
+  # OAK's 107 was measured with `ur5vla cameras --measure` on 2026-10-23.Every recorded frame keeps the
   # values it was taken with. Exposure steps with the 50 Hz mains so the lights don't flicker, and
   # the OAK's stays under 20 ms to limit motion blur (the D415's can't be capped below 33 ms).
-  base:  {type: oak, device_id: "14442C10F10E3BD400", width: 640, height: 480, fps: 30,       # OAK-D
+  base:  {type: oak, device_id: "14442C10F10E3BD400", width: 640, height: 480, fps: 30,       # OAK-D (33: deliver a steady >=30; ~33 is the sustained ceiling)
           # LOCKED to the demo-run averages (58768 frames across 88 demo episodes): auto-exposure sat
           # at the 20 ms cap the whole time, iso floated ~697, white balance ~3370 K. Fixed so the
           # policy sees the same image it was trained on (no auto drift / settle). Was: max_exposure_us 20000.
-          focus: 107, exposure_us: 19989, iso: 697, white_balance_k: 3370, mains_hz: 50}
+          focus: 107, exposure_us: 16666, iso: 1000, white_balance_k: 3370, mains_hz: 50}
   wrist: {type: realsense, serial: "234422064578", width: 640, height: 480, fps: 30,         # D415, fixed focus
           # LOCKED to a 30s live read of its auto values (exposure 16600 us, gain 64, WB 4600 K). The
           # D415 doesn't record its auto choices, so no demo data existed; measured under the current
           # (night) light, which matches when the demos were collected. Fixes the auto-exposure settle.
-          exposure_us: 16600, gain: 64, white_balance_k: 4600, mains_hz: 50}
-  # More scene cameras, to compare placements (docs/procedures.md#74-comparing-camera-sets). Every
-  # camera here is recorded; a policy uses the ones in its camera_map. USB webcams go by their
-  # stable path (ls /dev/v4l/by-id/), never /dev/videoN.
-  # Two webcams in identical bodies, told apart by what they report over USB. Always use the
-  # video-index0 path: index1 is a metadata node with no images.
-  # printer: the printer's front, at table height. Reports itself as "NexiGo N60 FHD Webcam" with
-  # serial 2021030103. Fixed focus; exposure and white balance automatic. Under 50 Hz anti-flicker
-  # it runs at 25 fps (and at 60 Hz it sends no frames at all).
-  #printer: {type: uvc, device: /dev/v4l/by-id/usb-2M_UVC_CAMERA_NexiGo_N60_FHD_Webcam_2021030103-video-index0,
-  #          width: 640, height: 480, fps: 25, mains_hz: 50}
-  # base2: high, looking down over the arm at the table and the printer. Its firmware reports the
-  # generic Linux "USB Webcam gadget" (no serial number, so a second such camera would share this
-  # path: use by-path then). Automatic exposure only, with no focus or white-balance control.
-  #base2: {type: uvc, device: /dev/v4l/by-id/usb-Linux_Foundation_USB_Webcam_gadget-video-index0,
-  #        width: 640, height: 480, fps: 30, mains_hz: 50}
+          exposure_us: 16666, gain: 96, white_balance_k: 4000, mains_hz: 50}
+  # base2 is the SECOND OAK, used ONLY by the 3-cam/30 Hz models (#5-#7). It is commented out while
+  # testing the 2-cam models so only ONE OAK streams (two OAK-Ds on the current USB hubs brown out
+  # and crash). RE-ENABLE this line before testing any 3cam30 model, and first fix the USB power:
+  # put each OAK on its own powered USB3 port (not the Anker/StarTech bus-powered hubs).
+  base2: {type: oak, device_id: "14442C10B19060D700", width: 640, height: 480, fps: 30, focus: 107, exposure_us: 16666, iso: 1000, white_balance_k: 3370, mains_hz: 50}

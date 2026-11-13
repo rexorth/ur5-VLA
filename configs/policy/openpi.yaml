@@ -21,3 +21,7 @@ gripper_index: 6
 timeout_s: 10                 # per inference; on timeout the connection is dropped and reopened
 warmup_timeout_s: 300         # first inference: the server JIT-compiles the model
 wait_for_server_s: 120        # at startup, keep retrying this long while the server loads
+# This policy's control (overrides control.yaml) and inference-time compliance (overrides
+# robot.compliance.enabled).
+control: {refill_fraction: 0.5, crossfade_steps: 10, max_episode_s: 120}
+compliance: false

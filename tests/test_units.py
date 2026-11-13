@@ -235,6 +235,32 @@ def test_shipped_configs_parse(policy):
     assert config_mod.load(CONFIGS / 'dry_run.yaml', policy).robot.dry_run
 
 
+def test_policy_file_control_and_compliance_are_lifted(tmp_path):
+    pol = tmp_path / 'p.yaml'
+    pol.write_text('backend: replay\naction_hz: 15\ncamera_map: {}\n'
+                   'control: {refill_fraction: 0.8, crossfade_steps: 25}\ncompliance: true\n')
+    cfg = config_mod.load(CONFIGS / 'cell.yaml', pol)
+    # control is lifted into the control section (policy file wins); unset keys keep their default.
+    assert cfg.control.refill_fraction == 0.8 and cfg.control.crossfade_steps == 25
+    assert cfg.control.max_episode_s == 120.0
+    # the compliance bool overrides robot.compliance.enabled (which ships false).
+    assert cfg.robot.compliance.enabled is True
+    # neither key leaks into the backend params.
+    assert 'control' not in cfg.policy and 'compliance' not in cfg.policy
+    assert cfg.policy['backend'] == 'replay' and cfg.sources['control'] == str(pol)
+
+
+def test_policy_file_control_and_compliance_reject_bad_types(tmp_path):
+    bad_ctrl = tmp_path / 'c.yaml'
+    bad_ctrl.write_text('backend: replay\ncamera_map: {}\ncontrol: 5\n')
+    with pytest.raises(ConfigError, match='control'):
+        config_mod.load(CONFIGS / 'cell.yaml', bad_ctrl)
+    bad_comp = tmp_path / 'd.yaml'
+    bad_comp.write_text('backend: replay\ncamera_map: {}\ncompliance: maybe\n')
+    with pytest.raises(ConfigError, match='compliance'):
+        config_mod.load(CONFIGS / 'cell.yaml', bad_comp)
+
+
 def test_unknown_keys_are_errors():
     with pytest.raises(ConfigError, match='max_stp_rad'):
         config_mod.parse({'safety': {'max_stp_rad': 0.5}})

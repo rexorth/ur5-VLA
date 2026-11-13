@@ -1,4 +1,6 @@
-control:
-  refill_fraction: 0.5       # ask for a chunk when a quarter is left
-  crossfade_steps: 12         # blend a new chunk in over more steps (was 5) so plan changes ease in, not stab
-  max_episode_s: 120
+# Chunking / episode-length control now lives in each policy file's own `control:` block, so a 30 Hz
+# and a 15 Hz policy can carry different settings without editing this shared file (see
+# configs/policy/*.yaml). `ur5vla run -p <policy>` lifts that block in, the policy file winning.
+# If a policy file omits `control:`, the ControlConfig defaults apply: refill_fraction 0.5,
+# crossfade_steps 5, max_episode_s 120.
+control: {}

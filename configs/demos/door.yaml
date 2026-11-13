@@ -1,0 +1,6 @@
+rounds: 20
+scenarios:
+    - prompt: "open the door of the 3D printer"
+      start: printer_view
+    - prompt: "close the door of the 3D printer"
+      start: printer_view

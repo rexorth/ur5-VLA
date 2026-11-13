@@ -45,6 +45,14 @@ STATUS_ERRORS = {0: 'temperature out of range', 1: 'supply voltage out of range'
 # the ft_limit_nm_estimate fallback. Removing them from fault() is what lets that fallback keep
 # moving past the Axia's torque range instead of pausing on a sensor fault.
 OVERLOAD_BITS = frozenset({27, 30})
+# Bit 31 is the status word's summary "error" flag: the sensor sets it alongside the SPECIFIC bit
+# for any condition (the manual's example 0xC0000000 is "F/T out of range" + "error"), so every
+# saturation sets it together with 27/30. It carries nothing the specific bits don't -- so counting
+# it as a fault made saturation report "sensor reports error" and end the episode (or wedge teleop
+# in a pause) even though the overload bits were being handled. Exclude it too; a genuine fault
+# still trips its own specific bit (temperature, voltage, broken gage, ...), which is reported.
+SUMMARY_BITS = frozenset({31})
+IGNORED_STATUS_BITS = OVERLOAD_BITS | SUMMARY_BITS
 FORCE_UNITS_N, TORQUE_UNITS_NM = ('n', '2'), ('nm', 'n-m', 'n·m', '3')   # XML text, or the unit code
 RESTART_AFTER_S = 1.0           # silent this long: ask for the stream again (a power or cable blip)
 # A tare needs a steady load: over its window, no 20 ms mean may stray further than this from
@@ -153,9 +161,11 @@ class AxiaFTSensor(FTSensor):
         with self._lock:
             status, self._status = self._status, 0
         # Out-of-range (saturation) is not a fatal fault: the force/torque limits catch the clipped
-        # reading, and the torque fallback (ft_limit_nm_estimate) handles the torque axes.
+        # reading, and the torque fallback (ft_limit_nm_estimate) handles the torque axes. The
+        # summary "error" bit (31), which the sensor sets alongside those, is ignored with them so a
+        # saturation does not read as a fault; a real fault still trips its own specific bit.
         errors = [name for bit, name in STATUS_ERRORS.items()
-                  if bit not in OVERLOAD_BITS and status & (1 << bit)]
+                  if bit not in IGNORED_STATUS_BITS and status & (1 << bit)]
         return f"sensor reports {', '.join(errors)}" if errors else None
 
     def status_text(self) -> str:

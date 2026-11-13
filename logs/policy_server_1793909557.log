@@ -1,0 +1,23 @@
+DEBUG 2026-11-05 12:12:37 formatter.py:57 action type: None, Result: , nargs: 0, default metavar: None
+DEBUG 2026-11-05 12:12:37 formatter.py:57 action type: <class 'str'>, Result: str, nargs: None, default metavar: None
+DEBUG 2026-11-05 12:12:37 _wrapper.py:181 wrapped field at host has a default value of localhost
+DEBUG 2026-11-05 12:12:37 _wrapper.py:181 wrapped field at port has a default value of 8080
+DEBUG 2026-11-05 12:12:37 _wrapper.py:181 wrapped field at fps has a default value of 30
+DEBUG 2026-11-05 12:12:37 _wrapper.py:181 wrapped field at inference_latency has a default value of 0.03333333333333333
+DEBUG 2026-11-05 12:12:37 _wrapper.py:181 wrapped field at obs_queue_timeout has a default value of 2
+DEBUG 2026-11-05 12:12:37 ocstring.py:298 Warning: Unable to parse attribute docstring:         default=DEFAULT_INFERENCE_LATENCY, metadata={"help": "Target inference latency in seconds"}
+DEBUG 2026-11-05 12:12:37 ocstring.py:298 Warning: Unable to parse attribute docstring:         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
+DEBUG 2026-11-05 12:12:37 gparsing.py:152 
+POST PROCESSING
+
+DEBUG 2026-11-05 12:12:37 gparsing.py:153 (raw) parsed args: Namespace(host='127.0.0.1', port='8080', fps='15')
+DEBUG 2026-11-05 12:12:37 decoding.py:130 from_dict for <class 'lerobot.async_inference.configs.PolicyServerConfig'>
+DEBUG 2026-11-05 12:12:37 decoding.py:150 Decode name = host, type = <class 'str'>
+DEBUG 2026-11-05 12:12:37 decoding.py:150 Decode name = port, type = <class 'int'>
+DEBUG 2026-11-05 12:12:37 decoding.py:150 Decode name = fps, type = <class 'int'>
+INFO 2026-11-05 12:12:37 y_server.py:444 {'fps': 15,
+ 'host': '127.0.0.1',
+ 'inference_latency': 0.03333333333333333,
+ 'obs_queue_timeout': 2,
+ 'port': 8080}
+INFO 2026-11-05 12:12:37 y_server.py:454 PolicyServer started on 127.0.0.1:8080

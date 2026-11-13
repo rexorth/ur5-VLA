@@ -6,7 +6,18 @@ robot:
   # Named start poses, say one per task: `ur5vla demo ... --start printer` (and run) starts each
   # episode there instead of start_q_deg. Teleop prints the joints to paste when it ends, e.g.
   #   printer: [0.0, -90.0, 90.0, -90.0, -90.0, 0.0]
-  start_poses: {start_curr: [-18.1, -65.7, -86.4, -91.7, 95.4, -15.2], start_close: [-30.58, -98.54, -102.66, -43.86, 104.41, -31.55]}
+  start_poses: {
+                start_curr: [-18.1, -65.7, -86.4, -91.7, 95.4, -15.2], 
+                start_close: [-30.58, -98.54, -102.66, -43.86, 104.41, -31.55],
+                box_cam: [-18.14, -81.67, -70.66, -89.36, 94.93, -6.99],
+                dist1: [  -39.7,  -114.6,  -109.4,     6.2,   128.8,   -21.3],
+                dist2:  [  -11.8 , -115.9,  -118.4,    30.9,   104.5,    -3.8],
+                dist3: [  -23.7,  -100.9,  -147.6,    45.3,   122.3,    -5.6],
+                dist4: [   14.3,  -107.5,  -133.1,    40.2,    83.4,     5.2],
+                dist5: [  -18.2,  -109.5,  -125.2,    26.1,   118.5,    -7.1],
+                printer_view: [-19.49, -42.49, -91.12, -72.28, 93.36, -3.33] 
+          }
+          
   move_speed_deg_s: 20
   move_accel_deg_s2: 40
 

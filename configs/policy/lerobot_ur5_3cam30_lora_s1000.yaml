@@ -1,0 +1,20 @@
+# Model: 3-cam / 30 Hz, LoRA r16 (merged), 1000 steps. See docs/procedures.md 6.2.
+# Server, from ~/abhay_ws/lerobot:
+#   .venv/bin/python -m lerobot.async_inference.policy_server --host=127.0.0.1 --port=8080 --fps=30
+backend: lerobot
+host: localhost
+port: 8080
+policy_type: pi05
+pretrained_name_or_path: /data/ur5VLA-data/checkpoints/pi05_cube56_3cam30_lora_s1000/pretrained_model/
+policy_device: cuda
+actions_per_chunk: 30               # <= the policy's chunk_size (50)
+action_hz: 30                       # = the dataset fps (to-lerobot --fps); start the server --fps=30
+camera_map: {base: base, wrist: wrist, base2: base2}   # 3-cam: both OAKs + the wrist RealSense
+image_size: null
+include_gripper_state: true
+include_ft_state: false             # ur5_cube state is [7] = 6 joints + gripper (no F/T)
+action_mode: absolute
+# 30 Hz: chunk ~1.0 s; crossfade_steps 20 keeps the blend ~0.67 s, refill_fraction 0.7 keeps the
+# inference budget above p95 so the arm does not pause between chunks.
+control: {refill_fraction: 0.7, crossfade_steps: 20, max_episode_s: 120}
+compliance: false                   # demos were rigid; keep rigid at inference

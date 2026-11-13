@@ -138,6 +138,10 @@ hf download lerobot/pi05_base        # 14.5 GB, into ~/.cache/huggingface
   on first use (a few MB, not the PaliGemma weights).
 - **Driver:** PyPI's torch is built for CUDA 13, which needs NVIDIA driver ≥ 580 (this PC has
   580.178.04). On an older driver, add `--torch-backend cu126` to the install.
+- **Patches (re-apply after any `(re)install` of this env):** the server file is edited in place
+  for policy reuse and graceful CUDA shutdown; a reinstall reverts it. Copy the tracked snapshot
+  back — `cp third_party/lerobot_patches/policy_server.py .venv/lib/python3.12/site-packages/lerobot/async_inference/policy_server.py`
+  (details in `third_party/lerobot_patches/README.md`).
 
 **bfloat16 copy for the 12 GB GPU.** The server builds the model from the checkpoint's
 `config.json`, and for `pi05_base` that says float32: 14.5 GB of weights. Make a copy that says
@@ -1038,8 +1042,9 @@ Converts recordings to a LeRobot dataset in format v3.0, for LeRobot training.
 ```bash
 .venv-lerobot/bin/ur5vla to-lerobot runs/<run>_demo [more runs or episodes …] \
     --repo-id <hf-user>/ur5_pick --root $HOME/abhay_ws/datasets/ur5_pick --fps 15 \
+    --gripper-source command|state \
     [--labels success] [--kinds demo] [--camera base --camera wrist] [--no-gripper] [--images] \
-    [--no-trim] [--squeeze-pauses S]
+    [--action-source command|reference|state] [--no-trim] [--squeeze-pauses S]
 ```
 
 | Option | Meaning |
@@ -1053,11 +1058,35 @@ Converts recordings to a LeRobot dataset in format v3.0, for LeRobot training.
 | `--camera NAME[=NEW]` | Cameras to include, optionally renamed (default: all, same names). Policy files' `camera_map` must use these names. |
 | `--camera-set SET=CAM,CAM,…` | Instead of `--camera`: one dataset per set, from the same episodes and frames, at `<root>/<SET>` named `<repo-id>_<SET>`. Repeat it for each set; it prints each set's `camera_map`. For comparing camera placements: [7.4](#74-comparing-camera-sets) |
 | `--no-gripper` | State and action are the 6 joints only (default: 7, with the gripper) |
+| `--action-source command\|reference\|state` | What the action's **6 joints** are: `command` (`q_cmd`, the executed servoJ target — **default**), `reference` (`q_ref`, the pre-compliance target — needs demos that recorded `q_ref`), or `state` (the **measured** joints, where the arm actually went). Use `state` when demos were recorded under compliance, so `q_cmd`/`q_ref` carry an F/T spring correction a vision-only policy can't reproduce. Does **not** affect the gripper. |
+| `--gripper-source command\|state` **(required)** | What the action's **gripper** is, chosen independently of `--action-source`, with **no default — you must pass it**, so the gripper's source is never a silent assumption: `command` (`g_cmd`, the trigger command — spans to a full close) or `state` (the **measured** gripper). Use `command` for grasping: the measured gripper saturates against a held object (a large cube caps it well below closed), and the 2F-85 is position-controlled, so a `state` gripper action commands no grip force. Use `state` only to reproduce the pre-fix (coupled) behavior. |
 | `--ft` | Add the F/T sensor's 6 readings to the state as recorded, from its zero at the calibration pose (`ft.fx` … `ft.tz`, N and N·m). The action is unchanged. The policy file then needs `include_ft_state: true`. Fails on episodes recorded without the sensor, or without that zero (before `ur5vla prepare`) |
 | `--images` | Store frames as images instead of AV1 video |
 | `--no-trim` | Keep the idle frames before the first and after the last motion (default: trimmed, keeping 0.3 s of rest at each end) |
 | `--squeeze-pauses S` | Also cut every pause mid-episode down to S seconds (default: pauses kept whole) |
 | `--allow-config-mismatch` | Convert even when the demos were recorded with different data-collection configs (normally an error — see below) |
+
+**What `observation.state` and `action` are sourced from.** The state and the action are sourced
+differently, on purpose:
+
+- **`observation.state`** is **always the measured** value — the joints and gripper the robot
+  actually sensed at that tick (plus the measured F/T wrench with `--ft`). It is what the policy is
+  given at inference, so it must be a real sensor reading, never a command; it is **not configurable**.
+- **The action's 6 joints** come from `--action-source` — `command` (`q_cmd`), `reference` (`q_ref`)
+  or `state` (measured).
+- **The action's gripper** comes from `--gripper-source` — `command` (`g_cmd`) or `state` (measured)
+  — chosen **independently** of the joints.
+
+The two halves of the action want opposite sources for a compliant-but-grasping task. With compliance
+on, the arm's `q_cmd`/`q_ref` carry an F/T spring correction a vision policy can't reproduce, so you
+want the **measured** arm (`--action-source state`). But the gripper has no compliance, and its
+measured position saturates against the held object, so you want the **commanded** gripper
+(`--gripper-source command`). `--gripper-source` is **required** (no default — you must choose, so the
+gripper's source is never assumed), so the clean-grasp recipe is `--action-source state
+--gripper-source command` (measured arm + commanded gripper); `--gripper-source state` reproduces the
+older coupled behavior where `--action-source state` also made the gripper measured. The chosen
+`action_source` and `gripper_source` are recorded in
+`<root>/ur5vla_config.json` so a dataset's provenance is unambiguous.
 
 How frames are built, trimmed, named and written: [architecture.md](architecture.md#dataset-conversion).
 
@@ -1111,7 +1140,8 @@ openpi trains from dataset format v2.1, so run the same converter inside openpi'
 ```bash
 cd ~/abhay_ws/openpi
 PYTHONPATH=$HOME/abhay_ws/ur5-VLA/src uv run python -m ur5vla.convert $HOME/abhay_ws/ur5-VLA/runs/<run>_demo \
-    --repo-id <hf-user>/ur5_pick --root $HOME/.cache/huggingface/lerobot/<hf-user>/ur5_pick --fps 15
+    --repo-id <hf-user>/ur5_pick --root $HOME/.cache/huggingface/lerobot/<hf-user>/ur5_pick --fps 15 \
+    --gripper-source command
 ```
 
 - **Options:** the same as [5.1](#51-ur5vla-to-lerobot).
@@ -1143,6 +1173,10 @@ python -m lerobot.async_inference.policy_server --host=127.0.0.1 --port=8080 --f
 
 It starts with no model: each run's policy file chooses one, and the server loads it when the run
 connects ([how](architecture.md#policy-backends)).
+
+Ctrl-C (or SIGTERM) now shuts it down gracefully: it drains in-flight inference and releases the
+CUDA context cleanly, so the open driver isn't left faulted. That lives in the vendored
+`policy_server.py` patch — if a `lerobot` reinstall wiped it, re-apply per §2.2.
 
 **Restart it between `ur5vla` commands** on the 12 GB GPU. Each command makes the server load its
 model again, and two copies of π₀.₅ don't fit. To switch models, change the policy file.
@@ -1612,7 +1646,7 @@ stable device ID ([3.3](#33-cameras)). Every configured camera is recorded in ev
 
 ```bash
 .venv-lerobot/bin/ur5vla to-lerobot runs/<run>_demo --repo-id <hf-user>/cube --fps 15 \
-    --root $HOME/abhay_ws/datasets/cube_cams \
+    --root $HOME/abhay_ws/datasets/cube_cams --gripper-source command \
     --camera-set front=base,wrist --camera-set side=side,wrist --camera-set both=base,wrist,side
 ```
 

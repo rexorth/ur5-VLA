@@ -8,3 +8,6 @@ action_hz: 15
 chunk_len: 15                 # 1 s of motion per chunk
 latency_s: 0.1                # pretend inference takes this long, to exercise the async path
 camera_map: {}                # cameras that must be fresh; none, so it runs with no cameras
+# Control (overrides control.yaml); compliance off for this no-sensor replay test.
+control: {refill_fraction: 0.5, crossfade_steps: 10, max_episode_s: 120}
+compliance: false

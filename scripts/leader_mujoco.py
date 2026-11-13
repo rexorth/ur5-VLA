@@ -67,6 +67,17 @@ def rpy_to_quat(rpy_rad):
     return out
 
 
+def apply_camera(cam, view) -> None:
+    """Point a MuJoCo free camera (viewer.cam or a MjvCamera) at a saved config.CameraView; a None
+    view leaves the camera as it is (its default framing)."""
+    if view is None:
+        return
+    cam.azimuth = view.azimuth
+    cam.elevation = view.elevation
+    cam.distance = view.distance
+    cam.lookat[:] = view.lookat
+
+
 def resolve(model, obj: int, names) -> list[int]:
     import mujoco
 
@@ -145,6 +156,8 @@ def main() -> int:
     except Exception as exc:
         raise SystemExit(f"{scene}: MuJoCo could not load it: {exc}") from None
     data = mujoco.MjData(model)
+    if cfg.sim.fovy is not None:
+        model.vis.global_.fovy = cfg.sim.fovy      # match the real camera's vertical FOV (sim.fovy)
 
     arm_q = np.array([model.jnt_qposadr[i] for i in resolve(model, mujoco.mjtObj.mjOBJ_JOINT, UR_JOINTS)])
     arm_act = np.array(resolve(model, mujoco.mjtObj.mjOBJ_ACTUATOR, UR_ACTUATORS))
@@ -201,6 +214,9 @@ def main() -> int:
     last_print = 0.0
     try:
         with mujoco.viewer.launch_passive(model, data) as viewer:
+            # Start from the saved viewpoint (sim.camera) if there is one, else MuJoCo's default.
+            mujoco.mjv_defaultFreeCamera(model, viewer.cam)
+            apply_camera(viewer.cam, cfg.sim.camera)
             while viewer.is_running():
                 tick = time.monotonic()
                 r = leader.read()

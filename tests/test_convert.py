@@ -236,6 +236,42 @@ def test_grasps_coverage_and_events(tmp_path):
     assert path.read_text().splitlines()[1].startswith('run/ep_000,grasp,')
 
 
+def test_action_source_selects_command_reference_or_state(tmp_path):
+    ep = scripted_episode(tmp_path / 'ep_000')
+    ticks = dict(np.load(ep.dir / 'ticks.npz'))
+    n = len(ticks['t'])
+    # Make the three joint signals distinguishable on joint 0, and the gripper measured != commanded.
+    for key, val in (('q_cmd', 0.30), ('q_ref', 0.20), ('q', 0.10)):
+        a = ticks[key].copy()
+        a[:, 0] = val
+        ticks[key] = a
+    ticks['g_cmd'] = np.full(n, 1.0)        # commanded: closed
+    ticks['gripper'] = np.full(n, 0.4)      # measured: partway
+    np.savez(ep.dir / 'ticks.npz', **ticks)
+
+    def mid(src, grip='command'):
+        frames = list(episode_frames(ep, FPS, {'base': 'base'}, trim=False,
+                                     action_source=src, gripper_source=grip))
+        f = frames[len(frames) // 2]
+        return float(f['action'][0]), float(f['action'][6])
+
+    # --action-source selects the 6 joints; the gripper defaults to the commanded g_cmd.
+    assert mid('command') == pytest.approx((0.30, 1.0))     # q_cmd + g_cmd
+    assert mid('reference') == pytest.approx((0.20, 1.0))    # q_ref + g_cmd
+    assert mid('state') == pytest.approx((0.10, 1.0))        # measured joints + commanded gripper
+    # --gripper-source is chosen independently of the joints.
+    assert mid('state', 'state') == pytest.approx((0.10, 0.4))      # measured joints + measured gripper
+    assert mid('command', 'state') == pytest.approx((0.30, 0.4))    # commanded joints + measured gripper
+    # observation.state is always the measured signal, regardless of the action source.
+    s = list(episode_frames(ep, FPS, {'base': 'base'}, trim=False, action_source='command'))[0]
+    assert s['observation.state'][0] == pytest.approx(0.10) and s['observation.state'][6] == pytest.approx(0.4)
+
+    # An episode that never recorded q_ref -> --action-source reference errors clearly.
+    np.savez(ep.dir / 'ticks.npz', **{k: v for k, v in ticks.items() if k != 'q_ref'})
+    with pytest.raises(ValueError, match='q_ref'):
+        list(episode_frames(ep, FPS, {'base': 'base'}, trim=False, action_source='reference'))
+
+
 def test_the_dataset_carries_the_quantiles_pi05_needs_and_flat_dimensions_are_flagged(tmp_path):
     pytest.importorskip('lerobot.datasets.lerobot_dataset')
     ep = scripted_episode(tmp_path / 'run' / 'ep_000')

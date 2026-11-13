@@ -52,14 +52,18 @@ _CLOSED = object()      # the window closed while ask() was waiting for an answe
 
 class CameraViewer:
     def __init__(self, cameras: dict[str, CameraSource], title: str = 'ur5vla', fps: float = 30.0,
-                 width: int = 640, window: Callable[..., None] | None = None):
+                 width: int = 640, window: Callable[..., None] | None = None,
+                 opacity: float | None = None):
         """`fps`: at most this many frames a second per camera. `width`: each camera starts at
-        most this wide; resizing the window then scales them. `window` replaces the Tk window
-        (tests); it is called in the child process as window(frames, keys, names, title, width)."""
+        most this wide; resizing the window then scales them. `opacity`: whole-window alpha in (0, 1]
+        for a see-through window (None = opaque); [ / ] adjust it live. `window` replaces the Tk
+        window (tests); it is called in the child process as
+        window(frames, keys, names, title, width, opacity)."""
         self.cameras = cameras
         self.title = title
         self.period = 1.0 / fps
         self.width = width
+        self.opacity = opacity
         self._window = window or _window
         self._bindings: dict[str, Callable[[], None]] | None = None
         self._info: tuple[str, ...] | None = None
@@ -82,7 +86,8 @@ class CameraViewer:
         frames_r, self._frames = ctx.Pipe(duplex=False)
         self._keys, keys_w = ctx.Pipe(duplex=False)
         self._proc = ctx.Process(target=self._window, name='ur5vla-viewer', daemon=True,
-                                 args=(frames_r, keys_w, list(self.cameras), self.title, self.width))
+                                 args=(frames_r, keys_w, list(self.cameras), self.title, self.width,
+                                       self.opacity))
         self._proc.start()
         frames_r.close()
         keys_w.close()
@@ -242,8 +247,9 @@ def drain(conn, limit: int) -> tuple[dict[str, tuple[tuple[int, ...], float, byt
     return fresh, info, prompt
 
 
-def _window(frames, keys, names: list[str], title: str, width: int) -> None:
-    """The viewer process: one Tk window, a caption and an image per camera."""
+def _window(frames, keys, names: list[str], title: str, width: int, opacity: float | None = None) -> None:
+    """The viewer process: one Tk window, a caption and an image per camera. `opacity` (0, 1] makes
+    the whole window see-through (None = opaque); [ / ] adjust it live."""
     # Ctrl-C in the terminal reaches the whole process group. It is the run's e-stop; the parent
     # then closes this window itself.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -254,6 +260,10 @@ def _window(frames, keys, names: list[str], title: str, width: int) -> None:
     root = tk.Tk()
     root.title(title)
     root.configure(bg='black')
+    alpha = [opacity]
+    if opacity is not None:
+        with contextlib.suppress(tk.TclError):      # needs a compositor on X11; harmless if ignored
+            root.attributes('-alpha', opacity)
     captions, views, items, photos = {}, {}, {}, {}
     latest = {}                                 # name: the last frame, to redraw on a resize
     drawn: dict[str, tuple[int, int]] = {}      # name: the view size it was drawn for
@@ -323,6 +333,11 @@ def _window(frames, keys, names: list[str], title: str, width: int) -> None:
         modal['frame'] = frame
 
     def on_key(event) -> None:
+        if event.char in ('[', ']') and alpha[0] is not None:    # adjust window opacity locally
+            alpha[0] = min(1.0, max(0.1, alpha[0] + (0.05 if event.char == ']' else -0.05)))
+            with contextlib.suppress(tk.TclError):
+                root.attributes('-alpha', alpha[0])
+            return
         if event.char:
             with contextlib.suppress(OSError):
                 keys.send(event.char.lower())

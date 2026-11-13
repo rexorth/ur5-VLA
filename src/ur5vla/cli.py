@@ -29,6 +29,7 @@ import json
 import logging
 import math
 import queue
+import signal
 import sys
 import termios
 import threading
@@ -78,6 +79,8 @@ def _start_cameras(cfg: config_mod.RunConfig, names: list[str] | None = None,
     one's first frame, then for automatic exposure to settle. `automatic`: they choose focus,
     exposure and white balance themselves."""
     cameras = build_cameras({name: cfg.cameras[name] for name in names} if names else cfg.cameras)
+    log.info('opening cameras: %s (waiting for first frames, up to %.0f s)...',
+             ', '.join(cameras), timeout_s)      # the OAK can re-enumerate for a few seconds after an unclean quit
     try:
         for cam in cameras.values():
             cam.automatic = automatic
@@ -92,6 +95,7 @@ def _start_cameras(cfg: config_mod.RunConfig, names: list[str] | None = None,
         _stop_cameras(cameras)      # one camera failed: stop the ones that started, or their
         raise                       # background threads abort the process on the way out
     time.sleep(max((getattr(c, 'settle_s', 0.0) for c in cameras.values()), default=0.0))
+    log.info('cameras ready: %s', ', '.join(cameras))
     return cameras
 
 
@@ -99,8 +103,44 @@ def _stop_cameras(cameras: dict[str, CameraSource]) -> None:
     for cam in cameras.values():
         try:
             cam.stop()
-        except Exception:
+        except BaseException:           # noqa: BLE001 -- one camera (even a Ctrl-C) must not skip the rest
             log.exception('stopping camera %s', cam.name)
+
+
+@contextlib.contextmanager
+def _ignore_sigint(reason: str):
+    """Ignore Ctrl-C while critical teardown runs (device/arm/GPU release must complete).
+    The hardware e-stop, not Ctrl-C, is the safety path; the closes here are all time-bounded,
+    so masking SIGINT can't hang the process. Only arms on the main thread (signal.signal is a
+    no-op elsewhere); restores the previous handler on exit."""
+    if threading.current_thread() is threading.main_thread():
+        prev = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            yield
+        finally:
+            signal.signal(signal.SIGINT, prev)
+    else:
+        yield
+
+
+def _run_closers(*closers: tuple[str, object]) -> None:
+    """Run each teardown step even if an earlier one raises; log and continue. Pairs with
+    _ignore_sigint so neither an exception nor a second Ctrl-C can skip a later close.
+
+    Each closer is a (label, fn) pair. We log 'closing <label>...' before and 'closed <label>'
+    after, so a user watching teardown can tell which step is running (several closes join threads
+    or disconnect sockets and take a second or two) from a frozen process. A None fn is skipped, so
+    optional closers pass as `(label, x if x is not None else None)`."""
+    for label, close in closers:
+        if close is None:
+            continue
+        log.info('closing %s...', label)
+        try:
+            close()
+        except BaseException:           # noqa: BLE001 -- a failing close must not skip the others
+            log.exception('closing %s failed', label)
+        else:
+            log.info('closed %s', label)
 
 
 def _ask(prompt: str, assume_yes: bool, default: str = '') -> str:
@@ -495,10 +535,11 @@ def _close_viewer(viewer) -> None:
 
 
 def _start_leader_sim(cfg: config_mod.RunConfig, get_q):
-    """A second --view window showing the leader's pose on a UR5 in MuJoCo (leadersim.py), from a
-    base-like viewpoint, as an alignment reference. Optional and non-fatal, like _start_viewer: a
-    warning (not a crash) if mujoco, the scene or a display is missing. Returns a close() callable,
-    or None."""
+    """A transparent, always-on-top window showing ONLY the arm at the leader's pose, from the saved
+    sim.camera viewpoint -- the exact same window scripts/sim_camera_align.py uses (ur5vla.simviewer),
+    so it can be dragged over the camera view as an overlay. It renders in its own process, so it adds
+    no rendering load to the teleop/demo control loop. Optional and non-fatal: a warning (not a crash)
+    if mujoco, the scene or a display is missing. Returns a close() callable, or None."""
     if not cfg.sim.scene:
         return None
     scene = Path(cfg.sim.scene)
@@ -508,41 +549,94 @@ def _start_leader_sim(cfg: config_mod.RunConfig, get_q):
         log.warning('leader sim window off: scene %s not found (sim.scene)', scene)
         return None
     try:
-        from .leadersim import LeaderSimView
+        from .simviewer import SimWindow
     except ImportError as exc:
         log.warning('leader sim window off: mujoco not available (%s)', exc)
         return None
-    from .viewer import CameraViewer
-    view = viewer = None
     try:
-        view = LeaderSimView(scene, cfg.sim.base, cfg.robot.start_q_deg, get_q,
-                             fps=min(cfg.sim.fps, 30.0)).start()
-        viewer = CameraViewer({view.name: view}, title='ur5vla leader (sim)').start()
+        win = SimWindow(scene, cfg.sim.base, get_q=get_q, start_q_deg=cfg.robot.start_q_deg,
+                        fovy=cfg.sim.fovy, camera=cfg.sim.camera, arm_only=True,
+                        opacity=cfg.sim.opacity, fps=min(cfg.sim.fps, 30.0)).start()
     except Exception as exc:
         log.warning('leader sim window off: %s', exc)
-        if viewer is not None:
-            viewer.close()
-        if view is not None:
-            view.stop()
         return None
+    return win.close
 
-    def close() -> None:
-        viewer.close()
-        view.stop()
-    return close
+
+class _LeaderSimPoller:
+    """Keeps the leader-sim window live between episodes. A daemon thread refreshes the leader
+    reading (session.input.reading -- what the sim draws) at ~fps whenever no episode is running, so
+    the sim tracks the leader while the CLI is blocked on a prompt / moving to start / taring. It is
+    paused around run_episode, where the control loop reads the leader itself (the serial port has a
+    single reader). A no-op if the input has no refresh() (e.g. a gamepad, which has no sim window)."""
+
+    def __init__(self, session, fps: float = 30.0):
+        self._refresh = getattr(session.input, 'refresh', None)
+        self._period = 1.0 / max(1.0, fps)
+        self._pause = threading.Event()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name='leader-sim-poll', daemon=True)
+
+    def start(self) -> '_LeaderSimPoller':
+        if self._refresh is not None:
+            self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._period):
+            if self._pause.is_set():
+                continue
+            try:
+                self._refresh()
+            except Exception:
+                log.debug('leader-sim poll: leader read failed', exc_info=True)
+
+    @contextlib.contextmanager
+    def paused(self):
+        """Pause polling (the control loop owns the leader here); resume on exit."""
+        self._pause.set()
+        try:
+            yield
+        finally:
+            self._pause.clear()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
 
 
 def _episode_keys(estop: threading.Event, end: threading.Event, resume: threading.Event | None = None,
-                  deadman_key: str | None = None) -> dict:
+                  deadman_key: str | None = None, pose: Callable[[], None] | None = None,
+                  enter_ends: bool = False) -> dict:
     """deadman_key: an X keysym name held as the deadman (keys.HeldKey). If that is the space
-    bar, space stops being an e-stop key: releasing it stops the arm anyway."""
+    bar, space stops being an e-stop key: releasing it stops the arm anyway. `pose`, if given, is
+    bound to [p]: a tap prints the arm's current joints (to capture a start pose while teleoperating).
+    enter_ends: also bind Enter to "episode done", alongside [d] (cbreak leaves ICRNL on, so the key
+    arrives as '\\n'; '\\r' is bound too in case it does not)."""
     # '\x03' is Ctrl-C pressed in the camera window; in the terminal, Ctrl-C raises SIGINT instead.
     keys = {' ': estop.set, 'e': estop.set, '\x03': estop.set, 'd': end.set}
+    if enter_ends:
+        keys['\n'] = keys['\r'] = end.set
     if resume is not None:
         keys['r'] = resume.set
+    if pose is not None:
+        keys['p'] = pose
     char = {'space': ' '}.get(deadman_key, deadman_key.lower() if deadman_key and len(deadman_key) == 1 else None)
     keys.pop(char, None)
     return keys
+
+
+def _print_pose(state, tcp_offset_m) -> None:
+    """Print the arm's current joints, ready to paste under robot.start_poses. Reads the control
+    loop's cached state (session.state), not the RTDE socket, so it is safe from the key thread."""
+    if state is None:
+        print('\n[p] no robot state yet', flush=True)
+        return
+    q_text = np.round(np.rad2deg(state.q), 2).tolist()
+    # Leading newline: the live display leaves the cursor at the start of its line (\r).
+    print(f'\n{_pose_text(state.q, tcp_offset_m)}\n  paste under robot.start_poses:  NAME: {q_text}',
+          flush=True)
 
 
 def _keys_text(devices) -> str:
@@ -744,10 +838,13 @@ def cmd_cameras(args) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        if args.measure:
-            chosen = {name: cam.settings() for name, cam in cameras.items()}
-        _close_viewer(viewer)
-        _stop_cameras(cameras)
+        with _ignore_sigint('ur5vla cameras cleanup'):
+            if args.measure:
+                chosen = {name: cam.settings() for name, cam in cameras.items()}
+            _run_closers(
+                ('viewer', lambda: _close_viewer(viewer)),
+                ('cameras', lambda: _stop_cameras(cameras)),
+            )
     if chosen is not None:
         _print_measured(chosen)
     return 0
@@ -793,11 +890,14 @@ def cmd_policy_check(args) -> int:
                   f'|step0 - q| max {dev[0].max():6.2f} deg  |chunk - q| max {dev.max():6.2f} deg  '
                   f'gripper {chunk.gripper.min():.2f}..{chunk.gripper.max():.2f}')
     finally:
-        backend.close()
-        ft.close()
-        gripper.close()
-        arm.close()
-        _stop_cameras(cameras)
+        with _ignore_sigint('ur5vla policy-check cleanup'):
+            _run_closers(
+                ('policy backend', backend.close),
+                ('F/T sensor', ft.close),
+                ('gripper', gripper.close),
+                ('arm', arm.close),
+                ('cameras', lambda: _stop_cameras(cameras)),
+            )
     return 0
 
 
@@ -829,12 +929,25 @@ def _run_episodes(args, cfg: config_mod.RunConfig, prompt: str, run_name: str, r
         gripper.connect()
         ft.connect()
         compliance = _open_compliance(cfg)      # the same spring teleop/demos used, if enabled
-        loop = ControlLoop(cfg, arm, gripper, cameras, backend, info, ft, compliance=compliance)
+        loop = ControlLoop(cfg, arm, gripper, cameras, backend, info, ft, compliance=compliance,
+                           on_violation=args.on_violation)
         if compliance is not None:
             print(f'COMPLIANCE on: the arm yields to force like a spring (stiffness '
                   f'{cfg.robot.compliance.stiffness_n_m:.0f} N/m), as it did while the demos were '
                   f'recorded. safety.ft_limit_n {cfg.safety.ft_limit_n} N stays the hard limit.',
                   flush=True)
+        if args.on_violation == 'pause':
+            print('--on-violation=pause: a SOFTWARE safety limit (workspace, joint, step, TCP speed, '
+                  'force/torque) servoStops the arm but KEEPS the episode running; it resumes once the '
+                  "policy commands something in-limit. The e-stop, the robot's own stops and "
+                  'gripper/F-T faults still end the episode.', flush=True)
+        elif args.on_violation == 'ignore':
+            print('!! --on-violation=ignore: SOFTWARE safety limits will NOT stop the arm -- commands '
+                  "are sent anyway (a NaN target is still skipped) and only the robot's own pendant "
+                  'safety config is the backstop. Keep a hand on the e-stop.', flush=True)
+        print('warm-up inference: one query now (before moving to the start pose) to compile the '
+              'policy on the server. Its observation and result are DISCARDED -- not part of any '
+              'episode.', flush=True)
         log.info('warm-up inference: %.2f s', loop.warmup(prompt))
 
         for ep in range(args.episodes):
@@ -849,6 +962,7 @@ def _run_episodes(args, cfg: config_mod.RunConfig, prompt: str, run_name: str, r
             recorder.start({'run': run_name, 'episode': ep, 'kind': 'rollout', 'prompt': prompt,
                             'config_path': cfg.source,
                             'config': cfg.raw, 'dry_run': cfg.robot.dry_run,
+                            'on_violation': args.on_violation,
                             'policy_info': dataclasses.asdict(info), 'start': _start_meta(cfg, args),
                             **prepared})
             print('running: [space] or [e] = e-stop, [d] = episode done, Ctrl-C = e-stop', flush=True)
@@ -868,12 +982,15 @@ def _run_episodes(args, cfg: config_mod.RunConfig, prompt: str, run_name: str, r
             if result.end_reason == 'safety':
                 _wait_until_ready(cfg, arm)
     finally:
-        _stop_cameras(cameras)          # close the OAK first, while the process is still responsive:
-        backend.close()                 # a clean close shuts its watchdog down, so it doesn't reset
-        ft.close()                      # (and leave USB re-enumerating for the next session)
-        gripper.close()
-        arm.close()
-        _close_viewer(viewer)
+        with _ignore_sigint('ur5vla run cleanup'):
+            _run_closers(
+                ('cameras', lambda: _stop_cameras(cameras)),  # close the OAK first, while the process is still responsive:
+                ('policy backend', backend.close),            # a clean close shuts its watchdog down, so it doesn't reset
+                ('F/T sensor', ft.close),                     # (and leave USB re-enumerating for the next session)
+                ('gripper', gripper.close),
+                ('arm', arm.close),
+                ('viewer', lambda: _close_viewer(viewer)),
+            )
     return 0
 
 
@@ -1089,11 +1206,12 @@ def _teleop(args, cfg: config_mod.RunConfig) -> int:
             print(f'COMPLIANCE on: the arm yields to force like a spring (stiffness '
                   f'{cfg.robot.compliance.stiffness_n_m:.0f} N/m). safety.ft_limit_n '
                   f'{cfg.safety.ft_limit_n} N stays the hard limit.', flush=True)
-        print(f'{session.input.legend()}\n{_keys_text(devices)}, [r] resume\n'
+        print(f'{session.input.legend()}\n{_keys_text(devices)}, [r] resume, [p] print pose\n'
               f'If the robot stops itself the arm pauses: clear the stop on the pendant, then '
               f'{session.input.resume_hint().replace(" to resume", "")}.', flush=True)
         keys = _episode_keys(session.estop, session.end_request, session.resume_request,
-                             devices.keyboard.name if devices.keyboard else None)
+                             devices.keyboard.name if devices.keyboard else None,
+                             pose=lambda: _print_pose(session.state, tcp_offset))
         with _operator_keys(keys, viewer), \
                 _teleop_display(session, tcp_offset, viewer, terminal=True):
             result = session.run_episode(pause_on_stop=True)
@@ -1108,14 +1226,16 @@ def _teleop(args, cfg: config_mod.RunConfig) -> int:
             print(f'or to zero the F/T sensor here before each demo (still, touching nothing), under ft_sensor:\n'
                   f'  tare_q_deg: {q_text}')
     finally:
-        _stop_cameras(cameras)          # close the OAK first, before the slower closes below, so it
-        ft.close()                      # gets a clean watchdog shutdown and doesn't reset on quit
-        gripper.close()
-        arm.close()
-        devices.close()
-        _close_viewer(viewer)
-        if leader_sim is not None:
-            leader_sim()
+        with _ignore_sigint('ur5vla teleop cleanup'):
+            _run_closers(
+                ('cameras', lambda: _stop_cameras(cameras)),  # close the OAK first, before the slower closes below, so it
+                ('F/T sensor', ft.close),                     # gets a clean watchdog shutdown and doesn't reset on quit
+                ('gripper', gripper.close),
+                ('arm', arm.close),
+                ('input devices', devices.close),
+                ('viewer', lambda: _close_viewer(viewer)),
+                ('leader sim', leader_sim if leader_sim is not None else None),
+            )
     return 0
 
 
@@ -1278,12 +1398,15 @@ def _flange_demo(args, cfg: config_mod.RunConfig) -> int:
         print(f'flange demo ended: {result.end_reason} {result.detail or ""} ({result.duration_s:.0f} s)')
         print(f'arm at {_pose_text(arm.read_state().q, cfg.safety.tcp_offset_m)}')
     finally:
-        ft.close()
-        arm.close()
-        driver.close()
-        devices.close()
-        _close_viewer(viewer)
-        _stop_cameras(cameras)
+        with _ignore_sigint('ur5vla flange-demo cleanup'):
+            _run_closers(
+                ('F/T sensor', ft.close),
+                ('arm', arm.close),
+                ('flange driver', driver.close),
+                ('input devices', devices.close),
+                ('viewer', lambda: _close_viewer(viewer)),
+                ('cameras', lambda: _stop_cameras(cameras)),
+            )
     return 0
 
 
@@ -1359,6 +1482,7 @@ def _demos(args, cfg: config_mod.RunConfig, scenarios, rounds: int, scheduled: b
     ft = make_ft_sensor(cfg.ft_sensor, cfg.robot.dry_run)
     viewer = None
     leader_sim = None
+    sim_poller = None
     try:
         viewer = _start_viewer(args, cameras, f'ur5vla demo {run_name}')
         _connect_arm(cfg, arm)
@@ -1366,10 +1490,12 @@ def _demos(args, cfg: config_mod.RunConfig, scenarios, rounds: int, scheduled: b
         ft.connect()
         session = TeleopSession(cfg, arm, gripper, devices.pad, ft, input=_session_input(cfg, devices),
                                 nudge_key=devices.nudge_key, compliance=_open_compliance(cfg))
+        sim_poller = _LeaderSimPoller(session)      # keeps the leader-sim live between episodes
         if args.view is not None and leader is not None:
             # The leader mirrored on a UR5 in MuJoCo (a second window), as in `ur5vla teleop`: an
             # alignment reference, reusing the session's own leader reading (no second serial open).
             leader_sim = _start_leader_sim(cfg, lambda: getattr(getattr(session.input, 'reading', None), 'q', None))
+            sim_poller.start()
         if session.compliance is not None:
             print(f'COMPLIANCE on: the arm yields to force like a spring (stiffness '
                   f'{cfg.robot.compliance.stiffness_n_m:.0f} N/m). safety.ft_limit_n '
@@ -1412,13 +1538,16 @@ def _demos(args, cfg: config_mod.RunConfig, scenarios, rounds: int, scheduled: b
                             'teleop_input': 'leader' if leader else 'gamepad', **prepared})
             mode = 'leader arm' if leader is not None else f'{session.frame} frame'
             resume = session.input.resume_hint().replace(' to resume', '')
-            print(f'recording{where}, {mode} | {_keys_text(devices)}, [r] resume\n'
+            print(f'recording{where}, {mode} | {_keys_text(devices)}, [r] resume, [p] print pose\n'
                   f'  a force/torque stop PAUSES (recording continues): back the arm off and {resume} '
-                  f'to continue this demo, or [d] to end it', flush=True)
+                  f'to continue this demo, or [d]/Enter to end it', flush=True)
             keys = _episode_keys(session.estop, session.end_request, session.resume_request,
-                                 deadman_key=devices.keyboard.name if devices.keyboard else None)
+                                 deadman_key=devices.keyboard.name if devices.keyboard else None,
+                                 pose=lambda: _print_pose(session.state, cfg.safety.tcp_offset_m),
+                                 enter_ends=True)
             with _operator_keys(keys, viewer), \
-                    _teleop_display(session, cfg.safety.tcp_offset_m, viewer, terminal=False):
+                    _teleop_display(session, cfg.safety.tcp_offset_m, viewer, terminal=False), \
+                    sim_poller.paused():     # the control loop reads the leader during the episode
                 result = session.run_episode(recorder, args.max_seconds or cfg.control.max_episode_s,
                                              pause_on_stop=True)
             print(f'demo {ep} ended: {result.end_reason} {result.detail or ""} ({result.duration_s:.1f} s)')
@@ -1433,14 +1562,17 @@ def _demos(args, cfg: config_mod.RunConfig, scenarios, rounds: int, scheduled: b
             elif result.end_reason not in ('operator', 'timeout'):
                 break
     finally:
-        _stop_cameras(cameras)          # close the OAK first, before the slower closes below, so it
-        ft.close()                      # gets a clean watchdog shutdown and doesn't reset on quit
-        gripper.close()
-        arm.close()
-        devices.close()
-        _close_viewer(viewer)
-        if leader_sim is not None:
-            leader_sim()
+        with _ignore_sigint('ur5vla demo cleanup'):
+            _run_closers(
+                ('cameras', lambda: _stop_cameras(cameras)),  # close the OAK first, before the slower closes below, so it
+                ('F/T sensor', ft.close),                     # gets a clean watchdog shutdown and doesn't reset on quit
+                ('gripper', gripper.close),
+                ('arm', arm.close),
+                ('input devices', devices.close),
+                ('viewer', lambda: _close_viewer(viewer)),
+                ('leader sim poller', sim_poller.stop if sim_poller is not None else None),
+                ('leader sim', leader_sim if leader_sim is not None else None),
+            )
     return 0
 
 
@@ -1605,6 +1737,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument('-n', type=int, default=5, help='number of inferences')
     p = add('run', cmd_run, policy=True, dry=True, view=True)
     p.add_argument('--episodes', type=int, default=1)
+    p.add_argument('--on-violation', choices=('stop', 'pause', 'ignore'), default='stop',
+                   help="what a SOFTWARE safety limit (workspace, joint, step, TCP speed, "
+                        "force/torque, NaN target) does: 'stop' (default) ends the episode; 'pause' "
+                        "servoStops the arm but keeps the episode and resumes when the policy is back "
+                        "in-limit; 'ignore' sends the command anyway (NaN still skipped), leaving only "
+                        "the robot's own pendant limits as the backstop. The e-stop, the robot's own "
+                        "stops, link/data loss and gripper/F-T faults always end the episode.")
     p.add_argument('--max-seconds', type=float, help='overrides control.max_episode_s')
     p.add_argument('--tag', help='appended to the run directory name')
     p.add_argument('--start', metavar='NAME', help='start each episode at robot.start_poses[NAME] instead of robot.start_q_deg')

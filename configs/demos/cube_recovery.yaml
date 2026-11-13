@@ -1,0 +1,12 @@
+rounds: 10
+scenarios:
+  - prompt: "put the black cube in the brown box"
+    start: dist1
+  - prompt: "put the black cube in the brown box"
+    start: dist2
+  - prompt: "put the black cube in the brown box"
+    start: dist3
+  - prompt: "put the black cube in the brown box"
+    start: dist4
+  - prompt: "put the black cube in the brown box"
+    start: dist5

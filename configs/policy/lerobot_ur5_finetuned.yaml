@@ -9,11 +9,11 @@ host: localhost
 port: 8080
 policy_type: pi05                   # what you trained: pi05, pi0, smolvla, act, ...
 # lerobot-train's output: <output_dir>/checkpoints/last/pretrained_model (merge LoRA first).
-pretrained_name_or_path: /home/omey/abhay_ws/checkpoints/ckpt_cube_12000_merged/pretrained_model
+pretrained_name_or_path: 
 policy_device: cuda
-actions_per_chunk: 50               # <= the policy's chunk_size
-action_hz: 15                       # = the dataset fps (to-lerobot --fps)
-camera_map: {base: base, wrist: wrist}   # logical camera -> dataset camera name
+actions_per_chunk: 30               # <= the policy's chunk_size
+action_hz: 30                       # = the dataset fps (to-lerobot --fps)
+camera_map: {base: base, wrist: wrist, base2: base2}   # logical camera -> dataset camera name
 image_size: null                    # native: the dataset stores native resolution
 include_gripper_state: true         # the dataset's state is 6 joints + gripper
 # Force in the state: set true ONLY if you converted with `to-lerobot --ft` (recommended for
@@ -21,3 +21,11 @@ include_gripper_state: true         # the dataset's state is 6 joints + gripper
 # this MUST match the dataset the checkpoint was trained on. Leave false for a vision-only dataset.
 include_ft_state: false              # ur5_cube checkpoint: state is [7] = 6 joints + gripper (no F/T)
 action_mode: absolute
+
+# This policy's own control (lifted into the control section at load; overrides control.yaml). At
+# 30 Hz the chunk is ~1.7 s, so crossfade_steps 20 keeps the blend ~0.67 s (10 would be ~0.33 s), and
+# refill_fraction 0.7 keeps the inference budget above measured p95 latency so the arm does not pause.
+control: {refill_fraction: 0.7, crossfade_steps: 20, max_episode_s: 120}
+# Run the admittance spring at inference? Overrides robot.compliance.enabled. false = rigid, matching
+# demos recorded compliance-off; set true only for a policy trained on compliant (q_ref) demos.
+compliance: false

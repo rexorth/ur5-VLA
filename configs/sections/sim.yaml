@@ -5,4 +5,7 @@ sim:
   base:                                  # the robot base's pose in the sim, matching the real mounting
     xyz_mm:  [0.0, 0.0, 0.0]             # nudge the base in the scene (x y z, mm)
     rpy_deg: [0.0, 0.0, 90.0]            # roll, pitch, yaw about scene x y z (deg); 90 faces the arm down the table to the printer, matching the real mounting (base_match view). -90 faces it back at the operator (reversed).
-  fps: 60                                 # viewer update rate
+  fps: 60                                # viewer update rate
+  fovy: 50.0                             # vertical FOV (deg) = base OAK-D CAM_A @640x480 (fx~515, fy~515; HFOV 63.7, VFOV 50.0), so the sim overlay matches the real camera's perspective
+  camera: {azimuth: 108.90, elevation: -37.80, distance: 1.428, lookat: [-0.007, -0.391, 0.193]}
+

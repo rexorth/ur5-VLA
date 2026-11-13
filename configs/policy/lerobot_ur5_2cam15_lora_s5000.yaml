@@ -1,0 +1,19 @@
+# Model: 2-cam / 15 Hz, LoRA r16 (merged), 5000 steps. See docs/procedures.md 6.2.
+# Server, from ~/abhay_ws/lerobot:
+#   .venv/bin/python -m lerobot.async_inference.policy_server --host=127.0.0.1 --port=8080 --fps=15
+backend: lerobot
+host: localhost
+port: 8080
+policy_type: pi05
+pretrained_name_or_path: /data/ur5VLA-data/checkpoints/pi05_cube56_2cam15_lora_s5000/pretrained_model/
+policy_device: cuda
+actions_per_chunk: 30               # <= the policy's chunk_size (50)
+action_hz: 15                       # = the dataset fps (to-lerobot --fps); start the server --fps=15
+camera_map: {base: base, wrist: wrist}   # 2-cam: only the base OAK + the wrist RealSense
+image_size: null
+include_gripper_state: true
+include_ft_state: false             # ur5_cube state is [7] = 6 joints + gripper (no F/T)
+action_mode: absolute
+# 15 Hz: chunk ~2.0 s; crossfade_steps 8 blends ~0.53 s, refill_fraction 0.5 keeps the budget above p95.
+control: {refill_fraction: 0.75, crossfade_steps: 10, max_episode_s: 120}
+compliance: false                   # demos were rigid; keep rigid at inference
