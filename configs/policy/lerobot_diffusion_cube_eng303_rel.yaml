@@ -1,0 +1,35 @@
+# Model: LeRobot Diffusion Policy (UNet, 274M), 2 cams (base OAK + wrist D415), 15 Hz.
+# Dataset: ur5_cube_eng303_2cam15_rel (episodes CUT 0.5 s after the gripper release: --end-at-release 0.5) -- the 303 successful engineered `task` episodes of 2026-11-13
+#   (scripted top-down pick of the 60 mm black cube from a random spot, place on the target),
+#   --action-source command --gripper-source command --squeeze-pauses 0.3.
+# Trained by scripts/train_diffusion_local.sh: n_obs_steps=1, horizon 32, n_action_steps 16, DDIM x10.
+#
+# NO LANGUAGE INPUT: it does one thing -- cube to target. It was only shown the cube at a random
+# spot, never on the target, so start each episode with the cube OFF the target.
+#
+# Start where the data started (the skill's look pose, +-3 deg jitter):
+#   ur5vla run ... -p configs/policy/lerobot_diffusion_cube_eng303.yaml --start cube_look
+#
+# Server: the STOCK lerobot server cannot run a diffusion checkpoint (observation.state shape bug),
+# so use the wrapper, from this repo:
+#   ~/abhay_ws/lerobot/.venv/bin/python scripts/diffusion_policy_server.py --host=127.0.0.1 --port=8080 --fps=15
+backend: lerobot
+host: localhost
+port: 8080
+policy_type: diffusion
+pretrained_name_or_path: /home/omey/abhay_ws/checkpoints/diffusion_ur5_cube_eng303_2cam15_rel_s60000/checkpoints/last/pretrained_model
+policy_device: cuda
+actions_per_chunk: 16               # = n_action_steps: the server returns at most this many
+action_hz: 15                       # = the dataset fps
+camera_map: {base: base, wrist: wrist}
+image_size: null                    # server resizes to 480x640; the model resizes to 240x320 itself
+include_gripper_state: true         # observation.state = 6 joints + gripper (measured)
+include_ft_state: false
+rename_map: {}
+action_mode: absolute
+gripper_open: 0.0
+gripper_closed: 1.0
+gripper_index: 6
+# 16-step chunks (1.07 s): ask for the next one at half-way; DDIM x10 on the 3060 is well under that.
+control: {refill_fraction: 0.5, crossfade_steps: 8, max_episode_s: 60}   # crossfade 8: smoother chunk joins
+compliance: false                   # recorded rigid (engineered collection refuses compliance)

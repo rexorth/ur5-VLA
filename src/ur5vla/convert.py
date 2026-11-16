@@ -229,11 +229,35 @@ def deadman_kept(ep: Episode, times: np.ndarray, moving: np.ndarray, start: int,
     return np.flatnonzero(active)
 
 
+def release_cut(g_cmd: np.ndarray, fps: int, after_s: float, ep=None) -> int:
+    """Last frame to keep when an episode should end `after_s` seconds after the gripper first
+    opens again following its first grasp (the place). Grasp = the commanded gripper above half of
+    its episode maximum; release = the first frame back below that after a grasp. An episode with no
+    grasp, or no release, is kept whole.
+
+    Why: a scripted pick-and-place then returns to its look pose with the gripper open, and to a
+    policy that sees one frame, "open gripper, in the air, heading home" looks like "open gripper,
+    in the air, heading for the cube" -- it learns both and dithers between them."""
+    g = np.nan_to_num(np.asarray(g_cmd, float))
+    if not len(g) or g.max() <= 0:
+        return len(g)
+    closed = g > 0.5 * g.max()
+    if not closed.any():
+        return len(g)
+    first_close = int(np.argmax(closed))
+    reopened = np.flatnonzero(~closed[first_close:])
+    if not len(reopened):
+        log.warning('%s: gripper never reopened; kept whole', getattr(ep, 'dir', '?'))
+        return len(g)
+    return first_close + int(reopened[0]) + int(round(after_s * fps))
+
+
 def episode_frames(ep: Episode, fps: int, cameras: dict[str, str], include_gripper: bool = True,
                    report: EpisodeReport | None = None, trim: bool = True,
                    squeeze_s: float | None = None, include_ft: bool = False,
                    action_source: str = 'command', gripper_source: str = 'command',
-                   require_deadman: bool = False, read_workers: int = 0) -> Iterator[dict]:
+                   require_deadman: bool = False, read_workers: int = 0,
+                   end_at_release_s: float | None = None) -> Iterator[dict]:
     """Frames of one episode. `cameras` maps recorded camera name -> dataset camera name.
     `action_source` selects the action's 6 JOINTS: 'command' (q_cmd), 'reference' (q_ref) or 'state'
     (the measured joints). `gripper_source` selects the action's GRIPPER, independently: 'command'
@@ -283,6 +307,8 @@ def episode_frames(ep: Episode, fps: int, cameras: dict[str, str], include_gripp
                   | (np.abs(np.diff(gc)) >= IDLE_G_CMD) | (np.abs(np.diff(gm)) >= IDLE_G_MEASURED))
     keep = (deadman_kept(ep, times, moving, start, fps, squeeze_s) if require_deadman
             else kept_frames(moving, start, fps, trim, squeeze_s))
+    if end_at_release_s is not None:
+        keep = keep[keep <= release_cut(gc, fps, end_at_release_s, ep)]
     report = report if report is not None else EpisodeReport()
     report.trimmed = len(times) - start - len(keep)
     if not len(keep):
@@ -484,7 +510,8 @@ def write_dataset(episodes: list[Episode], repo_id: str, root: str | Path, fps: 
                   cameras: dict[str, str], include_gripper: bool = True, use_videos: bool = True,
                   trim: bool = True, squeeze_s: float | None = None, include_ft: bool = False,
                   action_source: str = 'command', gripper_source: str = 'command',
-                  require_deadman: bool = False, read_workers: int = 0):
+                  require_deadman: bool = False, read_workers: int = 0,
+                  end_at_release_s: float | None = None):
     LeRobotDataset = dataset_class()
     if Path(root).exists():
         raise FileExistsError(f'{root} already exists; pick a new --root')
@@ -518,7 +545,7 @@ def write_dataset(episodes: list[Episode], repo_id: str, root: str | Path, fps: 
         report = EpisodeReport(events=count_events(ep), grasps=episode_grasps(ep))
         for frame in episode_frames(ep, fps, cameras, include_gripper, report, trim, squeeze_s,
                                     include_ft, action_source, gripper_source, require_deadman,
-                                    read_workers):
+                                    read_workers, end_at_release_s):
             ds.add_frame(frame)
         if report.frames:
             ds.save_episode()
@@ -670,6 +697,10 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
                         'enable event falls back to motion trimming.')
     p.add_argument('--squeeze-pauses', type=float, metavar='S',
                    help='also cut every pause mid-episode down to S seconds (default: pauses kept whole)')
+    p.add_argument('--end-at-release', type=float, metavar='S',
+                   help='end each episode S seconds after the gripper first reopens after a grasp (the '
+                        'place), dropping the open-gripper return to the start pose -- which a '
+                        'one-frame policy cannot tell apart from the approach (default: keep it)')
     p.add_argument('--read-workers', type=int, default=0, metavar='N',
                    help='threads for reading + JPEG-decoding recorded frames, the conversion '
                         'bottleneck (0 = auto = CPU count; 1 = serial). Uses OpenCV/libjpeg-turbo '
@@ -718,12 +749,13 @@ def run(args) -> int:
                                     include_gripper=not args.no_gripper, use_videos=not args.images,
                                     trim=not args.no_trim, squeeze_s=args.squeeze_pauses, include_ft=args.ft,
                                     action_source=args.action_source, gripper_source=args.gripper_source,
-                                    require_deadman=args.deadman_only, read_workers=args.read_workers)
+                                    require_deadman=args.deadman_only, read_workers=args.read_workers,
+                                    end_at_release_s=args.end_at_release)
         if fingerprint:
             schema = {'state': state_names(not args.no_gripper, args.ft),
                       'action': state_names(not args.no_gripper), 'cameras': sorted(cameras.values()),
                       'action_source': args.action_source, 'gripper_source': args.gripper_source,
-                      'deadman_only': args.deadman_only}
+                      'deadman_only': args.deadman_only, 'end_at_release_s': args.end_at_release}
             write_config_meta(root, fingerprint, rep_config, episodes, schema)
         written = [r for r in reports if r.frames]
         frames = sum(r.frames for r in written)

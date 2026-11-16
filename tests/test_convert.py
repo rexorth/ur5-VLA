@@ -283,3 +283,14 @@ def test_the_dataset_carries_the_quantiles_pi05_needs_and_flat_dimensions_are_fl
     flat = {w.split(':')[0]: w.split(':')[1].split('(')[0].strip().split(', ') for w in warnings}
     # Joint 0 and the gripper move; joints 1-5 never do in this episode.
     assert flat['action'] == flat['observation.state'] == state_names()[1:6]
+
+
+def test_release_cut_ends_after_the_place_and_keeps_grasp_free_episodes_whole():
+    from ur5vla.convert import release_cut
+    #          approach      grasp+carry          release ... return home
+    g = np.r_[np.zeros(10), np.full(20, 0.75), np.zeros(30)]
+    assert release_cut(g, fps=15, after_s=0.0) == 30            # first open frame after the grasp
+    assert release_cut(g, fps=15, after_s=1.0) == 45            # + 15 frames
+    assert release_cut(np.zeros(40), fps=15, after_s=0.5) == 40   # never grasped: whole
+    assert release_cut(np.r_[np.zeros(5), np.full(10, 0.8)], 15, 0.5) == 15   # never released: whole
+    assert release_cut(np.r_[np.full(3, np.nan), np.zeros(5), np.ones(4), np.zeros(9)], 15, 0.0) == 12
